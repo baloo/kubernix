@@ -7,13 +7,16 @@ edition = "2024"
 async-nats = "0.50.0"
 aws-config = "1.10.1"
 aws-sdk-s3 = "1.140.0"
-capnp = { version = "0.26.2", features = ["alloc", "std"] }
+capnp = { version = "0.27", features = ["alloc", "std"] }
 futures-util = "0.3.33"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots"] }
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.24.0", features = ["v4"] }
+zstd = "0.13.3"
 
 [build-dependencies]
-capnpc = "0.26.0"
+capnpc = "0.27"

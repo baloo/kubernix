@@ -1,0 +1,5 @@
+option('lix-source',
+  type : 'string',
+  value : '',
+  description : 'Path to the Lix source tree matching the Lix being linked. Needed only because Lix does not install its generated libstore capnp headers; see NOTES.md.',
+)

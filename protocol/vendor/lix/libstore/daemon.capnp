@@ -1,0 +1,237 @@
+@0xd8aa4d286ba6797b;
+
+# IMPORTANT NOTICE
+#
+# these definitions are EXPERIMENTAL and come with NO stability guarantees
+
+using Cxx = import "/capnp/c++.capnp";
+$Cxx.namespace("nix::rpc::daemon");
+$Cxx.allowCancellation;
+
+using T = import "/lix/libutil/types.capnp";
+using Log = import "/lix/libutil/logging.capnp";
+using Libstore = import "/lix/libstore/types.capnp";
+
+struct ProtocolDescription {
+  id @0 :Text;
+  description @1 :Text;
+}
+
+interface Bootstrap {
+  supported @0 () -> (protocols :List(ProtocolDescription));
+  request @1 (
+    clientInfo :Text,
+    protocol :Text,
+  ) -> (result :Protocol);
+}
+
+interface Protocol {
+  # TODO maybe add information or something
+}
+
+# Bootstrap protocol for the legacy protocol implementation
+interface LegacyBoot extends(Protocol) $T.throws(T.v1Errors) {
+  enum Trust {
+    unknown @0;
+    untrusted @1;
+    trusted @2;
+  }
+
+  init @0 (logger :Log.LogStream) -> (
+    protocol :LegacyProtocol,
+    trust :Trust,
+    version :Text,
+  );
+}
+
+# The RPC'd version of the legacy protocol, with only minimal adjustments
+interface LegacyProtocol $T.throws(T.v1Errors) {
+  enum HashType {
+    md5 @0;
+    sha1 @1;
+    sha256 @2;
+    sha512 @3;
+  }
+  struct Hash {
+    hash @0 :Data;
+    hashType @1 :HashType;
+  }
+  enum ContentAddressMethod {
+    textIngestion @0;
+    flatFileIngestion @1;
+    recursiveFileIngestion @2;
+  }
+  struct ContentAddress {
+    method @0 :ContentAddressMethod;
+    hash @1 :Hash;
+  }
+  struct UnkeyedValidPathInfo {
+    deriver @0 :T.Option(Libstore.StorePath);
+    narHash @1 :Hash;
+    references @2 :List(Libstore.StorePath);
+    registrationTime @3 :T.Time;
+    narSize @4 :UInt64;
+    ultimate @5 :Bool;
+    sigs @6 :List(T.String);
+    ca @7 :T.Option(ContentAddress);
+  }
+  struct ValidPathInfo {
+    unkeyedValidPathInfo @0 :UnkeyedValidPathInfo;
+    path @1 :Libstore.StorePath;
+  }
+  enum GCAction {
+    returnLive @0;
+    returnDead @1;
+    deleteDead @2;
+    deleteSpecific @3;
+    tryDeleteSpecific @4;
+  }
+  struct QueryMissingResult {
+    willBuild @0 :List(Libstore.StorePath);
+    willSubstitute @1 :List(Libstore.StorePath);
+    unknown @2 :List(Libstore.StorePath);
+    downloadSize @3 :UInt64;
+    narSize @4 :UInt64;
+  }
+  struct DerivedPathOpaque {
+    path @0 :Libstore.StorePath;
+  }
+  struct DerivedPathBuilt {
+    drvPath @0 :DerivedPathOpaque;
+    outputs :union {
+      all @1 :Void;
+      names @2 :List(T.String);
+    }
+  }
+  struct DerivedPath {
+    raw :union {
+      opaque @0 :DerivedPathOpaque;
+      built @1 :DerivedPathBuilt;
+    }
+  }
+  enum BuildMode {
+    bmNormal @0;
+    bmRepair @1;
+    bmCheck @2;
+  }
+  struct DrvOutput {
+    drvHash @0 :Hash;
+    outputName @1 :T.String;
+  }
+  struct Realisation {
+    id @0 :DrvOutput;
+    outPath @1 :Libstore.StorePath;
+    signatures @2 :List(T.String);
+    dependentRealisations @3 :T.Map(DrvOutput, Libstore.StorePath);
+  }
+  struct BuildResult {
+    enum Status {
+        built @0;
+        substituted @1;
+        alreadyValid @2;
+        permanentFailure @3;
+        inputRejected @4;
+        outputRejected @5;
+        transientFailure @6; # possibly transient
+        cachedFailure @7; # no longer used
+        timedOut @8;
+        miscFailure @9;
+        dependencyFailed @10;
+        logLimitExceeded @11;
+        notDeterministic @12;
+        resolvesToAlreadyValid @13;
+        noSubstituters @14;
+    }
+
+    status @0 :Status;
+    errorMsg @1 :T.String;
+    timesBuilt @2 :UInt32;
+    isNonDeterministic @3 :Bool;
+    buildOutputs @4 :T.Map(T.String, Realisation);
+    startTime @5 :Int64;
+    stopTime @6 :Int64;
+    cpuUser @7 :T.OptionInt64;
+    cpuSystem @8 :T.OptionInt64;
+  }
+  struct KeyedBuildResult {
+    result @0 :BuildResult;
+    path @1 :DerivedPath;
+  }
+
+  interface AddToStoreStream {
+    feed @0 (raw :Data) -> stream;
+    finalize @1 () -> (result :ValidPathInfo);
+  }
+  interface Stream {
+    feed @0 (raw :Data) -> stream;
+    finalize @1 ();
+  }
+
+  addBuildLog @20 (path :Libstore.StorePath) -> (stream :Stream);
+  addIndirectRoot @11 (path :T.String);
+  addSignatures @17 (path :Libstore.StorePath, signatures :List(T.String));
+  addTempRoot @10 (path :Libstore.StorePath);
+  addToStore @9 (
+    name :T.String,
+    contentAddressMethod :T.String,
+    references :List(Libstore.StorePath),
+    repair :Bool
+  ) -> (result :AddToStoreStream);
+  addToStoreNar @18 (
+    info: ValidPathInfo,
+    repair :Bool,
+    dontCheckSigs :Bool
+  ) -> (
+    result :Stream
+  );
+  buildDerivation @24 (
+    path :Libstore.StorePath,
+    drv :Data,
+    mode :BuildMode,
+  ) -> (
+    result :BuildResult
+  );
+  buildPaths @22 (mode :BuildMode, paths :List(DerivedPath));
+  buildPathsWithResult @23 (mode :BuildMode, paths :List(DerivedPath)) -> (result :List(KeyedBuildResult));
+  collectGarbage @13 (
+    action :GCAction,
+    pathsToDelete :List(Libstore.StorePath),
+    ignoreLiveness :Bool,
+    maxFreed :UInt64
+  ) -> (
+    paths :List(T.String),
+    bytesFreed :UInt64
+  );
+  ensurePath @1 (path :Libstore.StorePath);
+  findRoots @12 () -> (result :T.Map(Libstore.StorePath, List(T.String)));
+  isValidPath @2 (path :Libstore.StorePath) -> (result :Bool);
+  narFromPath @21 (path :Libstore.StorePath, into :Stream);
+  optimiseStore @0 ();
+  queryAllValidPaths @25 () -> (result :List(Libstore.StorePath));
+  queryValidPaths @3 (
+    paths :List(Libstore.StorePath),
+    substitute :Bool
+  ) -> (
+    result :List(Libstore.StorePath)
+  );
+  querySubstitutablePaths @4 (paths :List(Libstore.StorePath)) -> (result :List(Libstore.StorePath));
+  queryReferrers @5 (path :Libstore.StorePath) -> (result :List(Libstore.StorePath));
+  queryValidDerivers @6 (path :Libstore.StorePath) -> (result :List(Libstore.StorePath));
+  queryDerivationOutputMap @7 (path :Libstore.StorePath) -> (result :T.Map(Text, Libstore.StorePath));
+  queryMissing @19 (targets :List(DerivedPath)) -> (result :QueryMissingResult);
+  queryPathFromHashPart @8 (hashPart :T.String) -> (result :T.Option(Libstore.StorePath));
+  queryPathInfo @15 (path :Libstore.StorePath) -> (result :T.Option(ValidPathInfo));
+  setOptions @14 (
+    keepFailed :Bool,
+    keepGoing :Bool,
+    tryFallback :Bool,
+    verbosity :T.Verbosity,
+    maxBuildJobs :UInt32,
+    maxSilentTime :UInt64,
+    verboseBuild :Bool,
+    buildCores :UInt32,
+    useSubstitutes :Bool,
+    settingsOverrides :T.Settings
+  );
+  verifyStore @16 (checkContents :Bool, repair :Bool) -> (result :Bool);
+}
