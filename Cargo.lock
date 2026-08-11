@@ -96,7 +96,7 @@ version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83a251fa1a4c9d0fe6e816b7acd60549e473e08d14f27a1d992c2675abff05f"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "memchr",
@@ -724,6 +724,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64-simd"
@@ -2032,7 +2038,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2310,17 +2316,22 @@ name = "kubernix-server"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "async-trait",
  "aws-config",
  "aws-sdk-s3",
  "axum",
+ "base64 0.23.1",
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "ed25519-dalek 3.0.0",
  "futures-util",
+ "kubernix-signing",
  "rand 0.10.2",
  "russh",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tokio-stream",
@@ -2328,6 +2339,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "kubernix-signing"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "crypto-common 0.2.2",
+ "ed25519-dalek 3.0.0",
+ "tokio",
 ]
 
 [[package]]
@@ -2342,8 +2365,10 @@ dependencies = [
  "futures-util",
  "reqwest",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2371,6 +2396,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -3111,9 +3142,10 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04e9018c9d814e5f30cc16a0f03271aeab3571e609612d9fe78c1aa8d11c2f62"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
@@ -3131,12 +3163,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.9",
 ]
@@ -3304,6 +3338,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3848,7 +3895,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05b44e85bf579a8eeb4ceaa77a3a523baf2bf0e9bac7e40f405d537b5d2d5ccb"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "cfg-if",
  "crc",
@@ -3952,7 +3999,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a2bdd6e83f6b3ea525ca9fee568030508b58355a43d0b2c1674d5f79dcd65e"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags",
  "byteorder",
  "crc",
@@ -4128,6 +4175,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4315,7 +4375,7 @@ version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f591660438b3038dd04d16c938271c79e7e06260ad2ea2885a4861bfb238605d"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-sink",
@@ -4647,6 +4707,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

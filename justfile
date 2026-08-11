@@ -1,19 +1,37 @@
 # Kubernix development commands.
-#
+
 # The pieces:
 #   plugin          Lix client plugin, registers the `kubernix://` store scheme
 #   kubernix-sshd   SSH frontend: terminates SSH, serves the daemon protocol
 #   kubernix-stdio  same protocol on stdin/stdout, for testing without SSH
 #   kubernix-worker dequeues jobs, builds, streams logs back
-#   kubernix-server legacy HTTP/S3 server (predates the SSH frontend)
+#   kubernix-server binary cache: narinfo, NARs and logs over HTTP
 #
-# A full local stack is: a NATS server, then `just worker` and `just sshd` in
-# separate shells. `just demo` drives a build through the whole thing.
+# A full local stack, one per shell:
+#
+#   just nats        message queue
+#   just run-db      PostgreSQL   (prints the DATABASE_URL it serves)
+#   just s3-mock     object store
+#   just sshd        SSH frontend  — needs all three of the above
+#   just worker      builder       — needs nats and s3-mock
+#   just cache       binary cache  — optional, needs the db and s3-mock
+#
+# Then `just demo` drives a build through the whole thing.
 
 lix_source := env_var_or_default("KUBERNIX_LIX_SOURCE", "/home/baloo/dev/lix")
 nats_url := env_var_or_default("NATS_URL", "nats://127.0.0.1:4222")
 ssh_port := env_var_or_default("KUBERNIX_SSH_PORT", "2222")
 host_key := env_var_or_default("TMPDIR", "/tmp") / "kubernix_host_ed25519"
+
+# Matches what `just run-db` serves. Override to point at another database.
+database_url := env_var_or_default("DATABASE_URL", "postgres://postgres@127.0.0.1:5433/kubernix")
+
+# Matches what `just s3-mock` serves. The frontend and the cache hold these;
+# workers never do -- they get pre-signed URLs instead.
+s3_endpoint := env_var_or_default("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")
+s3_key := env_var_or_default("AWS_ACCESS_KEY_ID", "my-dev-key")
+s3_secret := env_var_or_default("AWS_SECRET_ACCESS_KEY", "my-dev-secret")
+s3_bucket := env_var_or_default("S3_BUCKET", "kubernix")
 
 # List available commands.
 default:
@@ -28,9 +46,15 @@ build: build-rust plugin
 build-rust:
     cargo build --workspace
 
-# Run the test suite.
+# Run the test suite. The database-backed tests skip unless a DB is reachable.
 test:
     cargo test --workspace
+
+# Run the test suite including the PostgreSQL-backed store tests.
+# Needs `just run-db` in another shell.
+test-db port="5433" db_name="kubernix":
+    KUBERNIX_TEST_DATABASE_URL="postgres://postgres@127.0.0.1:{{port}}/{{db_name}}" \
+      cargo test --workspace
 
 # Lint and format check.
 check:
@@ -41,15 +65,16 @@ check:
 plugin lix_src=lix_source:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Needs the Lix *source* tree, not just the package: Lix does not install its
-    # generated libstore capnp headers, so we regenerate them. See NOTES.md item 1.
+    # Only the *package* is needed now — the Lix source tree was required solely
+    # to regenerate headers Lix did not install, which it now does (NOTES.md
+    # items 1-3). `lix_src` here just locates the pkgconfig of a locally built
+    # Lix; a system-installed one needs no override at all.
     export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}:{{lix_src}}/outputs/out/lib/pkgconfig"
     # Test for build.ninja, not the directory: a failed `meson setup` leaves the
-    # directory behind, and ninja then re-runs setup without -Dlix-source and
-    # fails with a confusing "lix-source is unset".
+    # directory behind, and ninja then silently re-runs a broken setup.
     if [ ! -f plugin/build/build.ninja ]; then
         rm -rf plugin/build
-        CXX=clang++ meson setup plugin/build plugin -Dlix-source={{lix_src}}
+        CXX=clang++ meson setup plugin/build plugin
     fi
     ninja -C plugin/build
 
@@ -72,31 +97,64 @@ clean:
 sshd port=ssh_port:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Dispatches builds to the queue when NATS is reachable; without it, builds
-    # are refused rather than faked. Auth is permissive unless
-    # KUBERNIX_SSH_AUTHORIZED_KEYS points at a keys file.
-    cargo build -p kubernix-server --bin kubernix-sshd
+    # Needs all three dependencies:
+    #   nats     - without it builds are refused rather than faked
+    #   s3-mock  - the uploader is configured inside the NATS branch, so without
+    #              S3 there is nowhere to stage inputs and workers get no upload
+    #              URLs; builds then fail at artifact upload
+    #   run-db   - startup fails outright if DATABASE_URL is set but unreachable,
+    #              which is deliberate: silently forgetting every path on restart
+    #              is worse than refusing to start
+    #
+    # Auth is permissive unless KUBERNIX_SSH_AUTHORIZED_KEYS points at a keys
+    # file, so every tenant here is derived from the username.
+    export AWS_ACCESS_KEY_ID="{{s3_key}}"
+    export AWS_SECRET_ACCESS_KEY="{{s3_secret}}"
+    export AWS_ENDPOINT_URL="{{s3_endpoint}}"
+    export AWS_REGION=us-east-1
+    export S3_BUCKET="{{s3_bucket}}"
+    export DATABASE_URL="{{database_url}}"
     NATS_URL="{{nats_url}}" \
     KUBERNIX_SSH_LISTEN="127.0.0.1:{{port}}" \
     KUBERNIX_SSH_HOST_KEY="{{host_key}}" \
-      ./target/debug/kubernix-sshd
+    cargo run -p kubernix-server --bin kubernix-sshd
 
-# Worker: dequeues one job at a time and builds it against the local Nix store.
-worker system="x86_64-linux":
+# Worker: dequeues one job at a time and builds it into its own chroot store.
+worker system="x86_64-linux" store="local?root=/tmp/kubernix-worker":
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build -p kubernix-worker
-    NATS_URL="{{nats_url}}" NIX_SYSTEM="{{system}}" ./target/debug/kubernix-worker
+    # A store of its own, not the host's /nix/store, for two reasons.
+    #
+    # It makes a demo mean something: an output appearing there can only have
+    # been built there, and an input can only have arrived through kubernix.
+    #
+    # And it is what lets builds work at all as a non-root user. Builds go
+    # through `nix-store --serve`'s BuildDerivation, which a Nix *daemon*
+    # refuses for input-addressed derivations unless you are a trusted user:
+    #
+    #   error: you are not privileged to build input-addressed derivations
+    #
+    # Opening a store directly makes the worker the authority rather than a
+    # client of one. Pass store="" to use the host store, which then needs the
+    # worker to be a trusted user.
+    export NATS_URL="{{nats_url}}" NIX_SYSTEM="{{system}}"
+    if [ -n "{{store}}" ]; then
+        export KUBERNIX_NIX_STORE="{{store}}"
+    fi
+    cargo run -p kubernix-worker
 
-# Legacy HTTP/S3 server (predates the SSH frontend).
-http-server:
+# Binary cache: serves narinfo, NARs and logs under a /<tenant>/ prefix.
+cache port="3000":
     #!/usr/bin/env bash
     set -euo pipefail
-    # Kept until the narinfo endpoint moves onto it -- see DESIGN.md "HTTP surface".
+    # Reads only. Needs the same database and bucket the frontend writes to;
+    export DATABASE_URL="{{database_url}}"
     export AWS_ACCESS_KEY_ID=my-dev-key
     export AWS_SECRET_ACCESS_KEY=my-dev-secret
     export AWS_ENDPOINT_URL="http://localhost:9000"
+    export AWS_REGION=us-east-1
     export S3_BUCKET=kubernix
+    export KUBERNIX_HTTP_LISTEN="127.0.0.1:{{port}}"
     cargo run -p kubernix-server --bin kubernix-server
 
 # ------------------------------------------------------------------- exercises
@@ -145,23 +203,47 @@ copy-roundtrip port=ssh_port user=`whoami`: plugin
 demo port=ssh_port user=`whoami`: plugin
     #!/usr/bin/env bash
     set -euo pipefail
-    # Requires `just worker` and `just sshd` running, and a reachable NATS.
+    # Needs `just nats`, `just run-db`, `just s3-mock`, `just sshd` and
+    # `just worker` running.
     export NIX_SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"
 
+    # A fresh client store each run, so the build actually happens instead of
+    # being reported already-valid from a previous run.
     tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+    # Two derivations, not one: the consumer depends on the *output* of the
+    # other, so what reaches the worker is a resolved derivation. That is the
+    # case that used to fail, and a single leaf derivation would not exercise it.
     cat > "$tmp/example.nix" <<'NIX'
-    derivation {
+    let dep = derivation {
+          name = "kubernix-dep";
+          system = "x86_64-linux";
+          builder = "/bin/sh";
+          args = [ "-c" "echo building the dependency; echo depvalue > $out" ];
+        };
+    in derivation {
       name = "kubernix-hello";
       system = "x86_64-linux";
       builder = "/bin/sh";
-      args = [ "-c" "echo building on the kubernix worker; echo hi > $out" ];
+      args = [ "-c" "echo building on the kubernix worker; read l < ${dep}; echo got $l > $out" ];
     }
     NIX
 
-    drv=$(nix-instantiate "$tmp/example.nix")
-    echo "==> $drv"
-    nix -L --plugin-files "$PWD/plugin/build/kubernix.so" \
-        build --store "kubernix://{{user}}@127.0.0.1?port={{port}}" "$drv^out" --no-link
+    # `--max-jobs 0` is what makes this a real test: nothing may be built
+    # locally, so if the remote builder does not work, nothing is built at all.
+    # `--offline` stops a substituter quietly supplying the answer instead.
+    #
+    # NB `--builders`, not `--store`: the frontend refuses to realise a
+    # derivation graph, deliberately. See PLAN.md Phase 7b.
+    out=$(nix -L --plugin-files "$PWD/plugin/build/kubernix.so" \
+        build \
+        --store "local?root=$tmp/store" --max-jobs 0 \
+        --builders 'kubernix://{{user}}@127.0.0.1?port={{port}} x86_64-linux' \
+        -f "$tmp/example.nix" --no-link --offline --print-out-paths)
+
+    echo
+    echo "==> built $out"
+    echo "==> contents: $(cat "$tmp/store$out")"
 
 # ------------------------------------------------------------ local dependencies
 
@@ -185,33 +267,42 @@ s3-mock:
     mkdir -p /dev/shm/rustfs_data
     rustfs server --address :9000 /dev/shm/rustfs_data
 
-# Temporary PostgreSQL instance with the schema applied. Torn down on Ctrl-C.
-run-db db_name="kubernix" sql_script="server/migrations/20260728_create_jobs_table.sql":
+# Ephemeral PostgreSQL on 127.0.0.1:5433. Torn down on Ctrl-C.
+run-db db_name="kubernix" port="5433":
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # No schema is applied here: kubernix-sshd runs the migrations in
+    # `server/migrations/` itself on connect, so a fresh deployment needs no
+    # separate provisioning step and there is only one place the schema lives.
+    #
+    # TCP rather than a unix socket, so DATABASE_URL is an ordinary URL.
     dir=$(mktemp -d)
     trap 'echo "Cleaning up $dir..."; rm -rf "$dir"' EXIT
-    cp "{{sql_script}}" "$dir/init.sql"
 
     echo "Initializing database in $dir..."
     nix-shell -p postgresql --run "
-        set -x
-        initdb -D \"$dir/db\" -U postgres
+        set -euo pipefail
+        initdb -D \"$dir/db\" -U postgres >/dev/null
 
-        postgres -D \"$dir/db\" -k \"$dir/db\" >/dev/null 2>&1 &
+        postgres -D \"$dir/db\" -k \"$dir\" \
+            -c listen_addresses=127.0.0.1 -p {{port}} >\"$dir/log\" 2>&1 &
         PID=\$!
 
-        echo \"Waiting for database to start...\"
-        until [ -S \"$dir\"/db/.s.PGSQL.5432 ]; do sleep 0.1; done
+        echo 'Waiting for database to start...'
+        until pg_isready -h 127.0.0.1 -p {{port}} -q; do sleep 0.2; done
 
-        echo \"Creating database: {{db_name}}\"
-        createdb -h \"$dir/db\" -U postgres \"{{db_name}}\"
+        createdb -h 127.0.0.1 -p {{port}} -U postgres '{{db_name}}'
 
-        echo \"Applying schema...\"
-        psql -h \"$dir/db\" -U postgres -d \"{{db_name}}\" -f \"$dir/init.sql\"
-
-        echo \"Database is ready! psql -h $dir/db -U postgres {{db_name}}\"
+        echo ''
+        echo 'Database ready:'
+        echo '  export DATABASE_URL=postgres://postgres@127.0.0.1:{{port}}/{{db_name}}'
+        echo '  psql -h 127.0.0.1 -p {{port}} -U postgres {{db_name}}'
+        echo ''
 
         wait \"\$PID\"
     "
+
+# NATS with JetStream, which the job and result streams both need.
+nats:
+    nats-server --jetstream

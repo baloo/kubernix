@@ -10,6 +10,20 @@ enum JobStatus {
   failed @3;
 }
 
+# An input the client staged to the object store for this build. The worker
+# fetches it and imports it before building.
+struct InputRef {
+  storePath @0 :Text;
+  # Object key, holding a zstd-compressed bare NAR -- the same format every
+  # other artifact uses. The worker wraps it into a Nix `--export` stream
+  # locally, which is why the two fields below travel with it: importing a path
+  # needs its references and deriver, and a bare NAR carries neither.
+  key       @1 :Text;
+  references @2 :List(Text);
+  # Empty when unknown.
+  deriver    @3 :Text;
+}
+
 # Published to kubernix.jobs.<system>.
 struct BuildRequest {
   jobId          @0 :Text;
@@ -18,6 +32,11 @@ struct BuildRequest {
   requiredInputs @3 :List(Text);
   # The serialized derivation, so the worker need not already have it.
   drv            @4 :Data;
+  inputs         @5 :List(InputRef);
+  # Whose build this is. Every object key the worker reads or writes for this
+  # job lives under this prefix, and the frontend refuses to sign anything
+  # outside it.
+  tenant         @6 :Text;
 }
 
 struct BuildResponse {
@@ -66,6 +85,13 @@ struct JobResult {
 struct UploadUrlRequest {
   jobId @0 :Text;
   keys  @1 :List(Text);
+  # When set, sign GETs instead of PUTs -- the same capability model in the
+  # other direction, used to fetch staged inputs.
+  download @2 :Bool;
+  # The tenant of the job being run. Every requested key must sit under this
+  # prefix or the whole request is refused, so a worker cannot reach another
+  # tenant's artifacts even though it holds no credentials of its own.
+  tenant @3 :Text;
 }
 
 struct UploadUrlResponse {

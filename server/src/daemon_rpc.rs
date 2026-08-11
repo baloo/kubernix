@@ -21,7 +21,11 @@ use capnp::capability::Rc;
 use crate::daemon_capnp::{bootstrap, legacy_boot, legacy_protocol, protocol};
 use crate::logging_capnp::log_stream;
 use crate::jobs::{BuildJob, JobOutcome, JobQueue};
-use crate::store::{ClientOptions, Hash, HashType, MemoryStore, PathInfo, Store, StoreError};
+use crate::rpc_error;
+use crate::uploads::UploadSigner;
+use crate::store::{ClientOptions, Hash, HashType, MemoryStore, PathInfo, Store, StoreError, Tier};
+use crate::store_path::{CaMethod, ContentAddress};
+use crate::tenant::{Tenant, TenantId};
 use futures_util::StreamExt;
 use uuid::Uuid;
 
@@ -54,6 +58,13 @@ pub struct Config {
     pub queue: Option<Arc<JobQueue>>,
     /// System workers are asked to build for.
     pub system: String,
+    /// Object store writer. Inputs are staged here for workers to fetch.
+    pub uploader: Option<Arc<UploadSigner>>,
+    /// Who this connection belongs to.
+    ///
+    /// Set per connection in [`crate::ssh`] from the identity the client
+    /// presented, so a `Config` clone is one client's view of the frontend.
+    pub tenant: Tenant,
 }
 
 impl Default for Config {
@@ -65,6 +76,10 @@ impl Default for Config {
             store: MemoryStore::new(),
             queue: None,
             system: default_system(),
+            uploader: None,
+            // Overwritten per connection. A default that is nobody in particular
+            // keeps a misconfigured caller out of a real tenant's data.
+            tenant: Tenant::from_ssh("anonymous", None, false),
         }
     }
 }
@@ -90,60 +105,56 @@ fn read_derived_path(
 /// Realise one derived path.
 ///
 /// An *opaque* path is only a request that the path already exist — no build, no
-/// worker. A *built* path names a derivation and is dispatched to the job queue.
+/// worker. That is the call `nix copy --from` makes, and it is the only variant
+/// the frontend can serve.
+///
+/// A *built* path names a **derivation to realise**, which the frontend cannot
+/// do. Realising a derivation means walking its `inputDrvs`, building each, and
+/// substituting their outputs to reach a resolved derivation; that requires
+/// holding the derivation graph. The frontend holds NAR bytes and metadata, not
+/// derivations — it never receives the `.drv` on this path, so there is nothing
+/// to walk.
+///
+/// The client already does that walk. `buildDerivation` receives the *resolved*
+/// `BasicDerivation`, which is why building through `--builders` works: local Nix
+/// resolves, then hands us something buildable. Refusing here points at that,
+/// rather than dispatching a job with no derivation in it and failing inside the
+/// worker with a parse error.
 async fn realise(
     store: &dyn Store,
-    queue: &Option<Arc<JobQueue>>,
-    logger: &log_stream::Client,
-    system: &str,
+    tenant: &TenantId,
     path: &str,
     built: bool,
-) -> Result<Option<JobOutcome>, capnp::Error> {
-    if !built {
-        return if store.is_valid_path(path) {
-            Ok(None)
-        } else {
-            Err(capnp::Error::failed(format!(
-                "kubernix: path not in store and cannot be substituted: {path}"
-            )))
-        };
+) -> Result<(), capnp::Error> {
+    if built {
+        tracing::warn!(%path, "refusing buildPaths for a derivation");
+        return Err(rpc_error::failed_with_traces(
+            format!("kubernix: cannot realise the derivation {path}"),
+            &[
+                "the kubernix frontend builds resolved derivations, not derivation graphs"
+                    .to_string(),
+                "use it as a remote builder (--builders 'kubernix://…') rather than as a \
+                 store (--store kubernix://…)"
+                    .to_string(),
+            ],
+        ));
     }
 
-    let Some(queue) = queue else {
-        tracing::warn!(%path, "build requested but no job queue is configured");
-        return Err(capnp::Error::unimplemented(format!(
-            "kubernix: cannot build {path} - no NATS job queue configured"
-        )));
-    };
-
-    let job = BuildJob {
-        job_id: Uuid::new_v4(),
-        derivation_path: path.to_string(),
-        system: system.to_string(),
-        drv: Vec::new(),
-    };
-
-    let outcome = dispatch(queue, job, logger)
-        .await
-        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-    match &outcome {
-        JobOutcome::Failed { message, .. } => Err(capnp::Error::failed(format!(
-            "kubernix: build of {path} failed: {message}"
-        ))),
-        JobOutcome::Completed { infos, .. } => {
-            record_outputs(store, infos);
-            Ok(Some(outcome))
-        }
+    if store.is_valid_path(tenant, path).await {
+        Ok(())
+    } else {
+        Err(rpc_error::failed(format!(
+            "kubernix: path not in store and cannot be substituted: {path}"
+        )))
     }
 }
 
 /// Register built outputs so subsequent `queryPathInfo` / `narFromPath` calls
 /// resolve. The worker uploaded the NARs; what it reported is the metadata the
 /// frontend could not compute for itself.
-fn record_outputs(store: &dyn Store, infos: &[crate::jobs::OutputInfo]) {
+async fn record_outputs(store: &dyn Store, tenant: &TenantId, infos: &[crate::jobs::OutputInfo]) {
     for info in infos {
-        let path_info = PathInfo {
+        let mut path_info = PathInfo {
             path: info.store_path.clone(),
             deriver: info.deriver.clone(),
             nar_hash: Hash {
@@ -156,16 +167,77 @@ fn record_outputs(store: &dyn Store, infos: &[crate::jobs::OutputInfo]) {
             ultimate: true,
             sigs: Vec::new(),
         };
-        if let Err(e) = store.register_output(path_info, info.key.clone(), info.file_size) {
+        // A worker we dispatched produced this, so it is `Built` and we are
+        // willing to say so.
+        sign_if_vouchable(store, tenant, &mut path_info, Tier::Built).await;
+
+        if let Err(e) = store
+            .record_path(
+                tenant,
+                path_info,
+                crate::store::RemoteObject {
+                    key: info.key.clone(),
+                    file_size: info.file_size,
+                    file_hash: info.file_hash.clone(),
+                },
+                Tier::Built,
+            )
+            .await
+        {
             tracing::error!(path = %info.store_path, error = %e, "could not record built output");
         }
     }
 }
 
+/// Sign a path, if the frontend is willing to vouch for it.
+///
+/// Signing happens **here, when the path is first recorded**, rather than when a
+/// narinfo is served: the signature becomes part of the row, so it is written
+/// once and deleted with the path it describes instead of needing a lifecycle of
+/// its own.
+///
+/// A quarantined path is left unsigned, which is the enforcement rather than a
+/// label — `require-sigs` defaults to true, so an unsigned path is inert to any
+/// client that obtains it.
+///
+/// Failing to sign is not failing to store. An unsigned path is merely unusable
+/// by strict clients; refusing the write would lose data the client already
+/// sent.
+async fn sign_if_vouchable(
+    store: &dyn Store,
+    tenant: &TenantId,
+    info: &mut PathInfo,
+    tier: Tier,
+) {
+    if !tier.is_vouchable() {
+        tracing::debug!(path = %info.path, tier = tier.as_str(), "not signing");
+        return;
+    }
+    let Some(signer) = store.signer(tenant).await else {
+        tracing::error!(path = %info.path, %tenant, "no signing key; storing unsigned");
+        return;
+    };
+
+    let fingerprint = kubernix_signing::Fingerprint {
+        path: &info.path,
+        nar_hash: &info.nar_hash.bytes,
+        nar_size: info.nar_size,
+        references: &info.references,
+    };
+    match signer.sign_path(&fingerprint).await {
+        Ok(signature) => {
+            if !info.sigs.contains(&signature) {
+                info.sigs.push(signature);
+            }
+        }
+        Err(e) => tracing::error!(path = %info.path, error = %e, "signing failed; storing unsigned"),
+    }
+}
+
 fn store_err(e: StoreError) -> capnp::Error {
     match e {
-        StoreError::Unsupported(op) => capnp::Error::unimplemented(op.to_string()),
-        other => capnp::Error::failed(other.to_string()),
+        StoreError::Unsupported(op) => rpc_error::unimplemented(op.to_string()),
+        other => rpc_error::failed(other.to_string()),
     }
 }
 
@@ -241,6 +313,41 @@ fn read_path_info(reader: legacy_protocol::valid_path_info::Reader<'_>) -> capnp
         ultimate: unkeyed.get_ultimate(),
         sigs,
     })
+}
+
+/// The content address a client attached to a path, if any.
+///
+/// Its absence is the interesting case: a path with no content address is
+/// input-addressed, so nothing about its name follows from its bytes and the
+/// frontend has no way to check the client's claim. See [`crate::store::Tier`].
+fn read_content_address(
+    unkeyed: legacy_protocol::unkeyed_valid_path_info::Reader<'_>,
+) -> capnp::Result<Option<ContentAddress>> {
+    use crate::types_capnp::option;
+
+    let ca = match unkeyed.get_ca()?.which()? {
+        option::Which::None(()) => return Ok(None),
+        option::Which::Some(ca) => ca?,
+    };
+
+    let method = match ca.get_method()? {
+        legacy_protocol::ContentAddressMethod::TextIngestion => CaMethod::Text,
+        legacy_protocol::ContentAddressMethod::FlatFileIngestion => CaMethod::Flat,
+        legacy_protocol::ContentAddressMethod::RecursiveFileIngestion => CaMethod::Recursive,
+    };
+    let hash = ca.get_hash()?;
+
+    Ok(Some(ContentAddress {
+        method,
+        algo: match hash_type_from(hash.get_hash_type()?) {
+            HashType::Md5 => "md5",
+            HashType::Sha1 => "sha1",
+            HashType::Sha256 => "sha256",
+            HashType::Sha512 => "sha512",
+        }
+        .to_string(),
+        hash: hash.get_hash()?.to_vec(),
+    }))
 }
 
 /// Write a `ValidPathInfo` to the wire.
@@ -330,6 +437,8 @@ impl bootstrap::Server for BootstrapImpl {
                 store: config.store,
                 queue: config.queue,
                 system: config.system,
+                uploader: config.uploader,
+                tenant: config.tenant,
             });
 
             // LegacyBoot extends Protocol, so it is a valid Protocol capability.
@@ -347,6 +456,8 @@ pub struct LegacyBootImpl {
     store: Arc<dyn Store>,
     queue: Option<Arc<JobQueue>>,
     system: String,
+    uploader: Option<Arc<UploadSigner>>,
+    tenant: Tenant,
 }
 
 /// `LegacyBoot extends Protocol`, so the generated `legacy_boot::Server` trait
@@ -364,14 +475,28 @@ impl legacy_boot::Server for LegacyBootImpl {
         let store = self.store.clone();
         let queue = self.queue.clone();
         let system = self.system.clone();
+        let uploader = self.uploader.clone();
+        let tenant = self.tenant.clone();
         async move {
             // The client hands us a logger capability. Everything a remote build
             // prints goes back through this, which is why build logs need no side
             // channel: the frontend will pump `kubernix.logs.<job_id>` into it.
             let logger = params.get()?.get_logger()?;
 
+            if let Err(e) = store.register_tenant(&tenant).await {
+                tracing::error!(tenant = %tenant.id, error = %e, "could not register tenant");
+            }
+
             let proto: legacy_protocol::Client =
-                capnp_rpc::new_client(LegacyProtocolImpl { logger, store, queue, system });
+                capnp_rpc::new_client(LegacyProtocolImpl {
+                    logger,
+                    store,
+                    queue,
+                    system,
+                    uploader,
+                    tenant,
+                    staged: RefCell::new(Vec::new()),
+                });
 
             let mut results = results.get();
             results.set_protocol(proto);
@@ -393,6 +518,16 @@ pub struct LegacyProtocolImpl {
     store: Arc<dyn Store>,
     queue: Option<Arc<JobQueue>>,
     system: String,
+    uploader: Option<Arc<UploadSigner>>,
+    /// Who this connection belongs to. Every store lookup is scoped by it.
+    tenant: Tenant,
+    /// Paths this client staged on this connection, in order.
+    ///
+    /// Nix copies precisely the paths the builder lacks and then asks it to
+    /// build, so what arrived on this connection *is* the input set for the
+    /// builds that follow. Tracking it per connection avoids shipping every
+    /// path the frontend has ever seen.
+    staged: RefCell<Vec<crate::jobs::InputRef>>,
 }
 
 /// Submit a job, relay its log into the client's `LogStream`, and return the
@@ -515,6 +650,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         _results: legacy_protocol::SetOptionsResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let params = params.get()?;
             let overrides = params
@@ -529,7 +665,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 })
                 .collect::<capnp::Result<Vec<_>>>()?;
 
-            store.set_options(ClientOptions {
+            store.set_options(&tenant, ClientOptions {
                 keep_failed: params.get_keep_failed(),
                 keep_going: params.get_keep_going(),
                 try_fallback: params.get_try_fallback(),
@@ -538,7 +674,8 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 build_cores: params.get_build_cores(),
                 use_substitutes: params.get_use_substitutes(),
                 overrides,
-            });
+            })
+            .await;
             Ok(())
         }
     }
@@ -549,9 +686,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::IsValidPathResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let path = read_store_path(params.get()?.get_path()?)?;
-            results.get().set_result(store.is_valid_path(&path));
+            results.get().set_result(store.is_valid_path(&tenant, &path).await);
             Ok(())
         }
     }
@@ -562,9 +700,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::QueryValidPathsResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let paths = read_store_paths(params.get()?.get_paths()?)?;
-            let valid = store.query_valid_paths(&paths);
+            let valid = store.query_valid_paths(&tenant, &paths).await;
             write_store_paths(results.get().init_result(valid.len() as u32), &valid);
             Ok(())
         }
@@ -576,8 +715,9 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::QueryAllValidPathsResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
-            let paths = store.query_all_valid_paths();
+            let paths = store.query_all_valid_paths(&tenant).await;
             write_store_paths(results.get().init_result(paths.len() as u32), &paths);
             Ok(())
         }
@@ -589,10 +729,11 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::QueryPathInfoResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let path = read_store_path(params.get()?.get_path()?)?;
             let mut result = results.get().init_result();
-            match store.query_path_info(&path) {
+            match store.query_path_info(&tenant, &path).await {
                 Some(info) => write_path_info(result.init_some(), &info),
                 None => result.set_none(()),
             }
@@ -606,11 +747,12 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::QueryPathFromHashPartResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let hash_part =
                 String::from_utf8_lossy(params.get()?.get_hash_part()?).into_owned();
             let mut result = results.get().init_result();
-            match store.query_path_from_hash_part(&hash_part) {
+            match store.query_path_from_hash_part(&tenant, &hash_part).await {
                 Some(path) => result.init_some().set_raw(path.as_bytes()),
                 None => result.set_none(()),
             }
@@ -624,9 +766,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::QueryReferrersResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let path = read_store_path(params.get()?.get_path()?)?;
-            let referrers = store.query_referrers(&path);
+            let referrers = store.query_referrers(&tenant, &path).await;
             write_store_paths(results.get().init_result(referrers.len() as u32), &referrers);
             Ok(())
         }
@@ -638,9 +781,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::QuerySubstitutablePathsResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let paths = read_store_paths(params.get()?.get_paths()?)?;
-            let subs = store.query_substitutable_paths(&paths);
+            let subs = store.query_substitutable_paths(&tenant, &paths).await;
             write_store_paths(results.get().init_result(subs.len() as u32), &subs);
             Ok(())
         }
@@ -664,6 +808,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::QueryMissingResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             // DerivedPath is a union of opaque/built; both name a store path.
             let mut targets = Vec::new();
@@ -679,7 +824,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 }
             }
 
-            let missing = store.query_missing(&targets);
+            let missing = store.query_missing(&tenant, &targets).await;
             let mut result = results.get().init_result();
             write_store_paths(
                 result
@@ -709,6 +854,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         _results: legacy_protocol::AddSignaturesResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let params = params.get()?;
             let path = read_store_path(params.get_path()?)?;
@@ -717,7 +863,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 .iter()
                 .map(|s| Ok(String::from_utf8_lossy(s?).into_owned()))
                 .collect::<capnp::Result<Vec<_>>>()?;
-            store.add_signatures(&path, sigs).map_err(store_err)?;
+            store.add_signatures(&tenant, &path, sigs).await.map_err(store_err)?;
             Ok(())
         }
     }
@@ -749,11 +895,15 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::AddToStoreNarResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let uploader = self.uploader.clone();
+        let staged = self.clone();
         async move {
-            let info = read_path_info(params.get()?.get_info()?)?;
-            tracing::debug!(path = %info.path, "receiving nar");
+            let wire_info = params.get()?.get_info()?;
+            let info = read_path_info(wire_info)?;
+            let ca = read_content_address(wire_info.get_unkeyed_valid_path_info()?)?;
+            tracing::debug!(path = %info.path, content_addressed = ca.is_some(), "receiving nar");
             let sink: legacy_protocol::stream::Client =
-                capnp_rpc::new_client(NarSink::new(store, info));
+                capnp_rpc::new_client(NarSink::new(store, uploader, info, ca, staged));
             results.get().set_result(sink);
             Ok(())
         }
@@ -766,21 +916,75 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         _results: legacy_protocol::NarFromPathResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
+        let uploader = self.uploader.clone();
         async move {
             let params = params.get()?;
             let path = read_store_path(params.get_path()?)?;
             let into = params.get_into()?;
 
-            let nar = store.nar_from_path(&path).map_err(store_err)?;
-            tracing::debug!(%path, size = nar.len(), "sending nar");
+            // Every path's bytes are in the object store, whichever route it
+            // arrived by, so there is one way to serve them.
+            let Some(remote) = store.output_object(&tenant, &path).await else {
+                return Err(store_err(StoreError::NotFound(path)));
+            };
+            let uploader = uploader.as_ref().ok_or_else(|| {
+                rpc_error::failed(format!(
+                    "kubernix: {path} is in the object store but no S3 client is configured"
+                ))
+            })?;
 
-            // Chunked so a large NAR does not become one enormous message.
+            tracing::debug!(%path, key = %remote.key, "streaming from the object store");
+            let mut reader = uploader
+                .get_object_reader(&remote.key)
+                .await
+                .map_err(|e| rpc_error::failed(format!("fetching {}: {e}", remote.key)))?;
+
+            // Fetched, decompressed and forwarded a chunk at a time. Nothing
+            // here scales with the size of the NAR — the old version held the
+            // compressed object *and* the whole NAR in memory at once.
+            //
+            // `feed` is a capnp streaming method, so awaiting each send gives
+            // real backpressure rather than a queue that grows to fit the file.
+            // The capnp capability is `!Send` and the S3 reader is `Send`;
+            // awaiting a `Send` future from a `!Send` task is fine (NOTES.md
+            // item 7), so this needs no extra threading.
             const CHUNK: usize = 64 * 1024;
-            for chunk in nar.chunks(CHUNK) {
+            let mut decoder = zstd::stream::write::Decoder::new(Vec::new())
+                .map_err(|e| rpc_error::failed(format!("decompressing {}: {e}", remote.key)))?;
+            let mut buf = vec![0u8; CHUNK];
+            let mut sent: u64 = 0;
+
+            loop {
+                let read = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+                    .await
+                    .map_err(|e| rpc_error::failed(format!("reading {}: {e}", remote.key)))?;
+                if read == 0 {
+                    break;
+                }
+                std::io::Write::write_all(&mut decoder, &buf[..read]).map_err(|e| {
+                    rpc_error::failed(format!("decompressing {}: {e}", remote.key))
+                })?;
+                let decoded = std::mem::take(decoder.get_mut());
+                if !decoded.is_empty() {
+                    sent += decoded.len() as u64;
+                    let mut request = into.feed_request();
+                    request.get().set_raw(&decoded);
+                    request.send().await?;
+                }
+            }
+
+            std::io::Write::flush(&mut decoder)
+                .map_err(|e| rpc_error::failed(format!("decompressing {}: {e}", remote.key)))?;
+            let decoded = std::mem::take(decoder.get_mut());
+            if !decoded.is_empty() {
+                sent += decoded.len() as u64;
                 let mut request = into.feed_request();
-                request.get().set_raw(chunk);
+                request.get().set_raw(&decoded);
                 request.send().await?;
             }
+
+            tracing::debug!(%path, size = sent, "sent nar");
             into.finalize_request().send().promise.await?;
             Ok(())
         }
@@ -788,21 +992,19 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
 
     /// Realise paths. A `DerivedPath::Opaque` is just "ensure this path exists",
     /// which for anything already in the store needs no worker — this is the path
-    /// `nix copy --from` takes. A `DerivedPath::Built` names a derivation and does
-    /// need one, so it fails until the job queue is wired.
+    /// `nix copy --from` takes. A `DerivedPath::Built` names a derivation, which
+    /// the frontend cannot realise; see [`realise`].
     fn build_paths(
         self: Rc<Self>,
         params: legacy_protocol::BuildPathsParams,
         _results: legacy_protocol::BuildPathsResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
-        let queue = self.queue.clone();
-        let logger = self.logger.clone();
-        let system = self.system.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             for target in params.get()?.get_paths()?.iter() {
                 let (path, built) = read_derived_path(target)?;
-                realise(&*store, &queue, &logger, &system, &path, built).await?;
+                realise(&*store, &tenant, &path, built).await?;
             }
             Ok(())
         }
@@ -814,20 +1016,18 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         mut results: legacy_protocol::BuildPathsWithResultResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
-        let queue = self.queue.clone();
-        let logger = self.logger.clone();
-        let system = self.system.clone();
+        let tenant = self.tenant.id.clone();
         async move {
             let targets = params.get()?.get_paths()?;
             let mut resolved = Vec::new();
             for target in targets.iter() {
                 let (path, built) = read_derived_path(target)?;
-                let outcome = realise(&*store, &queue, &logger, &system, &path, built).await?;
-                resolved.push((path, outcome.is_some()));
+                realise(&*store, &tenant, &path, built).await?;
+                resolved.push(path);
             }
 
             let mut out = results.get().init_result(resolved.len() as u32);
-            for (i, (path, was_built)) in resolved.iter().enumerate() {
+            for (i, path) in resolved.iter().enumerate() {
                 let mut keyed = out.reborrow().get(i as u32);
                 keyed
                     .reborrow()
@@ -837,11 +1037,9 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     .init_path()
                     .set_raw(path.as_bytes());
                 let mut result = keyed.init_result();
-                result.set_status(if *was_built {
-                    legacy_protocol::build_result::Status::Built
-                } else {
-                    legacy_protocol::build_result::Status::AlreadyValid
-                });
+                // Only opaque paths reach here, and `realise` has already
+                // confirmed each one is valid — so nothing was built.
+                result.set_status(legacy_protocol::build_result::Status::AlreadyValid);
                 result.set_times_built(0);
                 result.set_is_non_deterministic(false);
             }
@@ -853,8 +1051,6 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     //
     //   add_to_store           - needs Nix content-addressed path computation
     //   query_derivation_output_map
-    //   build_paths / build_paths_with_result / build_derivation
-    //                          - no worker pool yet; see build_derivation below
     //   ensure_path, optimise_store, verify_store, collect_garbage, find_roots
     //                          - GC and store maintenance are not the frontend's job
     //   add_build_log          - logs are archived by the worker, not pushed here
@@ -869,6 +1065,8 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         let logger = self.logger.clone();
         let system = self.system.clone();
         let store = self.store.clone();
+        let tenant = self.tenant.id.clone();
+        let staged = self.staged.borrow().clone();
         async move {
             let params = params.get()?;
             let path = read_store_path(params.get_path()?)?;
@@ -876,7 +1074,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
 
             let Some(queue) = queue else {
                 tracing::warn!(%path, "build requested but no job queue is configured");
-                return Err(capnp::Error::unimplemented(format!(
+                return Err(rpc_error::unimplemented(format!(
                     "kubernix: build of {path} not dispatched - no NATS job queue configured"
                 )));
             };
@@ -886,11 +1084,13 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 derivation_path: path.clone(),
                 system,
                 drv,
+                inputs: staged,
+                tenant: tenant.clone(),
             };
 
             let outcome = dispatch(&queue, job, &logger)
                 .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                .map_err(|e| rpc_error::failed(e.to_string()))?;
 
             let mut result = results.get().init_result();
             match outcome {
@@ -900,7 +1100,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     log_key,
                 } => {
                     tracing::info!(%path, ?outputs, %log_key, "build succeeded");
-                    record_outputs(&*store, &infos);
+                    record_outputs(&*store, &tenant, &infos).await;
                     result.set_status(legacy_protocol::build_result::Status::Built);
                 }
                 JobOutcome::Failed { message, log_key } => {
@@ -916,19 +1116,39 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     }
 }
 
-/// Accumulates a streamed NAR, committing it to the store on `finalize`.
+/// Accumulates a streamed NAR, committing it on `finalize`.
+///
+/// A path arriving here is an *input*: the client is staging its closure so a
+/// worker can build against it. It is therefore also pushed to the object store
+/// in Nix export format, which is what a worker can `nix-store --import`.
 struct NarSink {
     store: Arc<dyn Store>,
+    uploader: Option<Arc<UploadSigner>>,
     info: PathInfo,
+    /// The content address the client attached, if any. `None` means the path is
+    /// input-addressed and therefore unverifiable.
+    ca: Option<ContentAddress>,
     buffer: RefCell<Vec<u8>>,
+    /// The connection that received this path, so the staged input is attached
+    /// to the builds that follow on it.
+    connection: Rc<LegacyProtocolImpl>,
 }
 
 impl NarSink {
-    fn new(store: Arc<dyn Store>, info: PathInfo) -> Self {
+    fn new(
+        store: Arc<dyn Store>,
+        uploader: Option<Arc<UploadSigner>>,
+        info: PathInfo,
+        ca: Option<ContentAddress>,
+        connection: Rc<LegacyProtocolImpl>,
+    ) -> Self {
         Self {
             store,
+            uploader,
             info,
+            ca,
             buffer: RefCell::new(Vec::new()),
+            connection,
         }
     }
 }
@@ -952,10 +1172,228 @@ impl legacy_protocol::stream::Server for NarSink {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         async move {
             let nar = std::mem::take(&mut *self.buffer.borrow_mut());
+
+            // Decide what the frontend is willing to say about this path before
+            // recording it. A content address can be checked against the bytes;
+            // anything else is the client's word, and is quarantined rather than
+            // refused so that ordinary `nix copy` of a build closure keeps
+            // working. See PLAN.md Phase 9.
+            let tier = match &self.ca {
+                Some(ca) => {
+                    match crate::store_path::verify(&self.info.path, ca, &self.info.references, &nar)
+                    {
+                        Ok(()) => Tier::Verified,
+                        // A *failed* check is different from an absent one: the
+                        // client asserted something checkable and it was false,
+                        // which is either corruption or an attempt to register
+                        // content at a path that is not its own.
+                        Err(rejection) => {
+                            tracing::warn!(
+                                path = %self.info.path,
+                                tenant = %self.connection.tenant.id,
+                                %rejection,
+                                "refusing a push whose content address does not check out"
+                            );
+                            return Err(rpc_error::failed_with_traces(
+                                format!("kubernix: refusing {}: {rejection}", self.info.path),
+                                &["the frontend verifies content-addressed paths against their \
+                                   bytes"
+                                    .to_string()],
+                            ));
+                        }
+                    }
+                }
+                None => Tier::Quarantined,
+            };
+
+            // A path we already vouch for must not be demoted by someone pushing
+            // it back at us. Nix does exactly that: it builds a dependency
+            // remotely, copies it home, then pushes it up again as an input for
+            // the next build. Taking the push at face value would replace a
+            // `built` path with a `quarantined` one, discard its signature, and
+            // make the cache start 404ing something it had been serving — while
+            // storing a second copy of identical bytes.
+            //
+            // Keeping what we have is safe precisely because the existing tier
+            // is the *stronger* claim: we derived or produced that path, so a
+            // client's assertion about it adds nothing.
+            let tenant = &self.connection.tenant.id;
+            if let Some(existing) = self.store.tier(tenant, &self.info.path).await
+                && existing.is_vouchable()
+                && !matches!(tier, Tier::Verified)
+            {
+                tracing::debug!(
+                    path = %self.info.path,
+                    tier = existing.as_str(),
+                    "already vouched for; keeping it rather than accepting the push"
+                );
+                self.connection
+                    .staged
+                    .borrow_mut()
+                    .push(crate::jobs::InputRef {
+                        store_path: self.info.path.clone(),
+                        key: self
+                            .store
+                            .output_object(tenant, &self.info.path)
+                            .await
+                            .map(|o| o.key)
+                            .unwrap_or_default(),
+                        references: self.info.references.clone(),
+                        deriver: self.info.deriver.clone().unwrap_or_default(),
+                    });
+                return Ok(());
+            }
+
+            // The bytes go to the object store, never into the database. One
+            // representation of a path exists — a compressed bare NAR — and it
+            // is the same one a worker fetches, `narFromPath` streams, and the
+            // binary cache serves. See PLAN.md Phase 10b.
+            let Some(uploader) = self.uploader.clone() else {
+                return Err(rpc_error::failed(
+                    "kubernix: no object store configured; cannot accept a path",
+                ));
+            };
+            let Some(key) = crate::store::nar_key(&self.connection.tenant.id, tier, &self.info.path)
+            else {
+                return Err(rpc_error::failed(format!(
+                    "kubernix: not a store path: {}",
+                    self.info.path
+                )));
+            };
+
+            let compressed = zstd::stream::encode_all(nar.as_slice(), 3)
+                .map_err(|e| rpc_error::failed(format!("compressing {}: {e}", self.info.path)))?;
+            let file_size = compressed.len() as u64;
+            let file_hash = <sha2::Sha256 as sha2::Digest>::digest(&compressed).to_vec();
+
+            tracing::debug!(
+                path = %self.info.path,
+                %key,
+                nar_bytes = nar.len(),
+                object_bytes = file_size,
+                "storing pushed path in the object store"
+            );
+
+            // Uploaded before the row is written, so a failure here cannot leave
+            // a path registered with no bytes behind it.
+            uploader
+                .put_object(&key, compressed)
+                .await
+                .map_err(|e| rpc_error::failed(format!("uploading {}: {e}", self.info.path)))?;
+
+            // Signed here, on the way in, so the signature lands in the same row
+            // as the path. A verified push is one we derived ourselves, so it is
+            // ours to vouch for; a quarantined one is left unsigned.
+            let mut info = self.info.clone();
+            sign_if_vouchable(&*self.store, &self.connection.tenant.id, &mut info, tier).await;
+
+            let references = info.references.clone();
+            let deriver = info.deriver.clone().unwrap_or_default();
+
             self.store
-                .add_to_store_nar(self.info.clone(), nar)
+                .record_path(
+                    &self.connection.tenant.id,
+                    info,
+                    crate::store::RemoteObject {
+                        key: key.clone(),
+                        file_size,
+                        file_hash,
+                    },
+                    tier,
+                )
+                .await
                 .map_err(store_err)?;
+
+            // A bare NAR cannot be imported on its own, so the references and
+            // deriver travel with the key rather than being stored a second time
+            // in export form.
+            self.connection
+                .staged
+                .borrow_mut()
+                .push(crate::jobs::InputRef {
+                    store_path: self.info.path.clone(),
+                    key,
+                    references,
+                    deriver,
+                });
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Hash, HashType, MemoryStore, PathInfo};
+
+    const DRV: &str = "/nix/store/00000000000000000000000000000000-thing.drv";
+    const OUT: &str = "/nix/store/11111111111111111111111111111111-thing";
+
+    fn info(path: &str) -> PathInfo {
+        PathInfo {
+            path: path.to_string(),
+            deriver: None,
+            nar_hash: Hash {
+                hash_type: HashType::Sha256,
+                bytes: vec![0; 32],
+            },
+            nar_size: 0,
+            references: Vec::new(),
+            registration_time: 0,
+            ultimate: false,
+            sigs: Vec::new(),
+        }
+    }
+
+    fn tenant() -> crate::tenant::TenantId {
+        crate::tenant::Tenant::from_ssh("alice", None, false).id
+    }
+
+    fn object(key: &str) -> crate::store::RemoteObject {
+        crate::store::RemoteObject {
+            key: key.to_string(),
+            file_size: 0,
+            file_hash: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_opaque_path_in_the_store_needs_no_build() {
+        let store = MemoryStore::new();
+        let t = tenant();
+        store
+            .record_path(&t, info(OUT), object("k"), Tier::Verified)
+            .await
+            .unwrap();
+        assert!(realise(&*store, &t, OUT, false).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_opaque_path_that_is_missing_is_an_error() {
+        let store = MemoryStore::new();
+        let error = realise(&*store, &tenant(), OUT, false)
+            .await
+            .expect_err("should refuse");
+        assert!(error.extra.contains("path not in store"));
+    }
+
+    #[tokio::test]
+    async fn a_derivation_is_refused_rather_than_dispatched() {
+        // Regression: this used to dispatch a job with an empty `drv`, which
+        // reached the worker and died there with a parse error. The frontend has
+        // no derivation to send, so it must say so here.
+        let store = MemoryStore::new();
+        let error = realise(&*store, &tenant(), DRV, true)
+            .await
+            .expect_err("should refuse");
+
+        // Decode rather than string-match: the hint lives in a trace, which the
+        // client only sees after unpacking the payload.
+        let (_, message, traces) = rpc_error::decode(error.extra.as_str()).expect("should decode");
+        assert!(message.contains(DRV), "the message should name the path");
+        assert!(
+            traces.iter().any(|t| t.contains("--builders")),
+            "the traces should point at the form that works, got {traces:?}"
+        );
     }
 }

@@ -1,0 +1,204 @@
+//! Who a connection belongs to.
+//!
+//! Tenancy is **attribution**, and it is deliberately separate from
+//! authentication, which is **verification** (PLAN.md Phase 9). The frontend
+//! already knows the SSH username and public-key fingerprint a client presented;
+//! that is a real, specific identity even while `AuthPolicy::AcceptAll` means
+//! nobody has checked it. Recording it now means the history is attributed when
+//! auth arrives, rather than a pile of rows owned by `default`.
+//!
+//! [`Tenant::verified`] carries that distinction so no caller can lose it by
+//! accident: it is set from the auth policy that admitted the connection, and it
+//! is what any decision stronger than attribution must consult.
+
+use sha2::{Digest, Sha256};
+
+/// A tenant's stable identifier.
+///
+/// Used verbatim as an object-store key prefix and as the scoping key in the
+/// store, so it must be safe in both: no `/`, no `..`, no surprises. Rather than
+/// trusting the identity to be well-formed, the id is built from a sanitised
+/// prefix (so logs stay readable) plus a hash of the *full* identity (so two
+/// identities cannot sanitise down to the same tenant).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TenantId(String);
+
+impl TenantId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Accept an id that arrived over the wire, e.g. from a worker asking for
+    /// pre-signed URLs.
+    ///
+    /// Ids reach object keys by concatenation, so a value carrying `/` or `..`
+    /// would break out of its own prefix and defeat the scoping it is supposed
+    /// to provide. Rather than escaping it at every use, refuse anything that is
+    /// not in the shape [`derive_id`] produces.
+    pub fn from_wire(id: impl Into<String>) -> Option<Self> {
+        let id = id.into();
+        let well_formed = !id.is_empty()
+            && id.len() <= 128
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        well_formed.then_some(TenantId(id))
+    }
+}
+
+impl std::fmt::Display for TenantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Tenant {
+    pub id: TenantId,
+    /// What the id was derived from, kept for the record: a key fingerprint, or
+    /// a username when the client offered no key.
+    pub identity: String,
+    /// Whether anything actually checked that identity.
+    ///
+    /// False under `AuthPolicy::AcceptAll`, where a client may claim any user
+    /// and any key. Attribution is still useful — a client has no reason to lie
+    /// to itself, and consistent liars stay consistently separated — but this
+    /// must be true before the id is treated as a permission.
+    pub verified: bool,
+}
+
+/// How much of the identity hash goes into the id. 16 hex chars is 64 bits,
+/// which is far beyond collision range for a tenant list and keeps keys short.
+const HASH_CHARS: usize = 16;
+
+/// Longest readable prefix kept from the identity.
+const SLUG_CHARS: usize = 24;
+
+impl Tenant {
+    /// Derive a tenant from what an SSH client presented.
+    ///
+    /// The fingerprint is preferred over the username: it is the thing auth will
+    /// eventually verify, so deriving from it means enabling auth does not
+    /// renumber every existing tenant.
+    pub fn from_ssh(user: &str, fingerprint: Option<&str>, verified: bool) -> Self {
+        let identity = match fingerprint {
+            Some(fingerprint) => format!("key:{fingerprint}"),
+            None => format!("user:{user}"),
+        };
+        Self {
+            id: derive_id(&identity),
+            identity,
+            verified,
+        }
+    }
+}
+
+fn derive_id(identity: &str) -> TenantId {
+    let digest = Sha256::digest(identity.as_bytes());
+    let hash: String = digest
+        .iter()
+        .take(HASH_CHARS.div_ceil(2))
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let slug: String = identity
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(SLUG_CHARS)
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+
+    TenantId(format!("{slug}-{}", &hash[..HASH_CHARS]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FP: &str = "SHA256:abc+def/ghi=";
+
+    #[test]
+    fn derives_from_the_fingerprint_when_there_is_one() {
+        let with_key = Tenant::from_ssh("alice", Some(FP), true);
+        let without = Tenant::from_ssh("alice", None, false);
+
+        assert_ne!(
+            with_key.id, without.id,
+            "a key identifies a client; a username is only a claim about one"
+        );
+        assert!(with_key.verified);
+        assert!(!without.verified);
+    }
+
+    #[test]
+    fn the_same_client_is_the_same_tenant() {
+        assert_eq!(
+            Tenant::from_ssh("alice", Some(FP), true).id,
+            // A different username with the same key: the key is what counts, so
+            // enabling auth later must not renumber anyone.
+            Tenant::from_ssh("bob", Some(FP), true).id
+        );
+    }
+
+    #[test]
+    fn ids_are_safe_as_object_key_prefixes() {
+        // Fingerprints are base64 and contain `/` and `+`; usernames are
+        // arbitrary. Neither may reach a key unescaped.
+        for identity in [FP, "../../etc/passwd", "a/b", "", "üñïçø∂é"] {
+            let id = Tenant::from_ssh(identity, None, false).id;
+            let id = id.as_str();
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "unsafe id {id:?} from {identity:?}"
+            );
+            assert!(!id.contains(".."), "unsafe id {id:?}");
+        }
+    }
+
+    #[test]
+    fn identities_that_sanitise_alike_stay_distinct() {
+        // Both slugify to `user-a-b`; only the hash keeps them apart, and
+        // merging them would merge two tenants' stores.
+        let one = Tenant::from_ssh("a/b", None, false).id;
+        let two = Tenant::from_ssh("a+b", None, false).id;
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn wire_ids_that_could_escape_a_key_prefix_are_refused() {
+        // A worker supplies this string, and it is concatenated into an object
+        // key. Anything that can leave its own prefix defeats the point.
+        for bad in ["../other", "a/b", "", "UPPER", "with space", "dot.dot"] {
+            assert!(TenantId::from_wire(bad).is_none(), "accepted {bad:?}");
+        }
+        assert!(TenantId::from_wire("user-alice-dabd1db8d35ab131").is_some());
+    }
+
+    #[test]
+    fn derived_ids_survive_the_wire_check() {
+        // The two must agree, or a worker could never present a real tenant.
+        for identity in ["alice", "a/b", "üñïçø∂é", "SHA256:abc+def/ghi="] {
+            let id = Tenant::from_ssh(identity, None, false).id;
+            assert!(
+                TenantId::from_wire(id.as_str()).is_some(),
+                "derived id {id} would be refused off the wire"
+            );
+        }
+    }
+
+    #[test]
+    fn ids_are_stable() {
+        // The id ends up in object keys and (from Phase 10) in a primary key, so
+        // a change here is a migration, not a refactor.
+        assert_eq!(
+            Tenant::from_ssh("alice", None, false).id.as_str(),
+            "user-alice-dabd1db8d35ab131"
+        );
+    }
+}

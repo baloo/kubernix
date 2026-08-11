@@ -3,35 +3,115 @@
 with lib;
 
 let
-  cfg_server = config.services.kubernix-server;
+  cfg_sshd = config.services.kubernix-sshd;
+  cfg_cache = config.services.kubernix-cache;
   cfg_worker = config.services.kubernix-worker;
+
+  # Credentials for the object store. Only the frontend and the cache hold
+  # these; workers receive pre-signed URLs instead, which is the whole point of
+  # the upload service.
+  s3Env = cfg: {
+    S3_BUCKET = cfg.s3Bucket;
+    AWS_ACCESS_KEY_ID = cfg.s3AccessKey;
+    AWS_SECRET_ACCESS_KEY = cfg.s3SecretKey;
+    AWS_REGION = "us-east-1";
+    AWS_ENDPOINT_URL = cfg.s3Endpoint;
+  };
+
+  s3Options = {
+    s3Bucket = mkOption {
+      type = types.str;
+      default = "kubernix";
+      description = "Object store bucket. Created on startup if absent.";
+    };
+    s3Endpoint = mkOption {
+      type = types.str;
+      default = "http://127.0.0.1:9000";
+      description = "S3 endpoint. Setting this selects path-style addressing.";
+    };
+    s3AccessKey = mkOption {
+      type = types.str;
+      default = "minioadmin";
+      description = "Object store access key.";
+    };
+    s3SecretKey = mkOption {
+      type = types.str;
+      default = "minioadmin";
+      description = "Object store secret key. Use a credentials file in anger.";
+    };
+  };
 in {
-  options.services.kubernix-server = {
-    enable = mkEnableOption "Kubernix HTTP Server";
+  # The SSH frontend: terminates SSH and serves the Cap'n Proto daemon protocol.
+  # This is what clients submit builds to.
+  options.services.kubernix-sshd = {
+    enable = mkEnableOption "Kubernix SSH frontend";
 
     package = mkOption {
       type = types.package;
-      description = "The kubernix-server package to use.";
+      description = "The kubernix-server package (provides kubernix-sshd).";
+    };
+
+    listen = mkOption {
+      type = types.str;
+      default = "0.0.0.0:2222";
+      description = "Address to serve the daemon protocol on.";
+    };
+
+    hostKey = mkOption {
+      type = types.str;
+      default = "/var/lib/kubernix-sshd/host_ed25519";
+      description = ''
+        SSH host key. Generated on first start if absent.
+
+        Stability matters: clients pin it in known_hosts, so a key that changes
+        on every restart trips host-key verification.
+      '';
+    };
+
+    authorizedKeys = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = ''
+        `authorized_keys` file. When null the frontend accepts **any** client,
+        and derives each tenant from the username rather than the key — see
+        PLAN.md "Deferred deliberately".
+      '';
     };
 
     databaseUrl = mkOption {
       type = types.str;
-      default = "postgres://postgres:postgres@localhost:5432/kubernix";
-      description = "PostgreSQL connection string.";
+      default = "postgres://postgres@localhost:5432/kubernix";
+      description = "PostgreSQL connection string. Migrations run on startup.";
     };
 
     natsUrl = mkOption {
       type = types.str;
       default = "nats://localhost:4222";
-      description = "NATS connection string.";
+      description = "NATS connection string. Without it, builds are refused.";
+    };
+  } // s3Options;
+
+  # The binary cache: narinfo, NARs and logs, under a /<tenant>/ prefix.
+  options.services.kubernix-cache = {
+    enable = mkEnableOption "Kubernix binary cache";
+
+    package = mkOption {
+      type = types.package;
+      description = "The kubernix-server package (provides kubernix-server).";
     };
 
-    s3Bucket = mkOption {
+    listen = mkOption {
       type = types.str;
-      default = "kubernix-cache";
-      description = "S3 bucket name.";
+      default = "0.0.0.0:3000";
+      description = "Address to serve the cache on.";
     };
-  };
+
+    databaseUrl = mkOption {
+      type = types.str;
+      default = "postgres://postgres@localhost:5432/kubernix";
+      description = "PostgreSQL connection string. Read-only in practice.";
+    };
+  } // s3Options;
 
   options.services.kubernix-worker = {
     enable = mkEnableOption "Kubernix Worker";
@@ -50,52 +130,98 @@ in {
     system = mkOption {
       type = types.str;
       default = "x86_64-linux";
-      description = "The nix system architecture to build for.";
+      description = "The Nix system this worker builds for.";
+    };
+
+    store = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "local?root=/var/lib/kubernix-worker/store";
+      description = ''
+        Store URI to build into. A chroot store keeps a worker's builds out of
+        the host store, which matters because a worker imports quarantined
+        inputs on a tenant's behalf — see PLAN.md Phase 9.
+
+        It is also what lets the worker build at all as a non-root user. Builds
+        go through `nix-store --serve`'s `BuildDerivation`, and a Nix *daemon*
+        refuses that for input-addressed derivations unless the caller is
+        trusted ("you are not privileged to build input-addressed
+        derivations"). Opening a store directly makes the worker the authority
+        rather than a client of one.
+      '';
     };
   };
 
   config = mkMerge [
-    (mkIf cfg_server.enable {
-      systemd.services.kubernix-server = {
-        description = "Kubernix HTTP Server";
+    (mkIf cfg_sshd.enable {
+      systemd.services.kubernix-sshd = {
+        description = "Kubernix SSH frontend";
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" "postgresql.service" "nats.service" "rustfs.service" ];
 
         environment = {
-          DATABASE_URL = cfg_server.databaseUrl;
-          NATS_URL = cfg_server.natsUrl;
-          S3_BUCKET = cfg_server.s3Bucket;
+          DATABASE_URL = cfg_sshd.databaseUrl;
+          NATS_URL = cfg_sshd.natsUrl;
+          KUBERNIX_SSH_LISTEN = cfg_sshd.listen;
+          KUBERNIX_SSH_HOST_KEY = cfg_sshd.hostKey;
           RUST_LOG = "debug";
-          AWS_ACCESS_KEY_ID = "minioadmin";
-          AWS_SECRET_ACCESS_KEY = "minioadmin";
-          AWS_REGION = "us-east-1";
-          AWS_ENDPOINT_URL = "http://127.0.0.1:9000";
-        };
+        } // s3Env cfg_sshd
+          // optionalAttrs (cfg_sshd.authorizedKeys != null) {
+            KUBERNIX_SSH_AUTHORIZED_KEYS = toString cfg_sshd.authorizedKeys;
+          };
 
         serviceConfig = {
-          ExecStart = "${cfg_server.package}/bin/kubernix-server";
+          ExecStart = "${cfg_sshd.package}/bin/kubernix-sshd";
+          Restart = "always";
+          DynamicUser = true;
+          # For the generated host key, which must outlive a restart.
+          StateDirectory = "kubernix-sshd";
+        };
+      };
+    })
+
+    (mkIf cfg_cache.enable {
+      systemd.services.kubernix-cache = {
+        description = "Kubernix binary cache";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" "postgresql.service" "rustfs.service" ];
+
+        environment = {
+          DATABASE_URL = cfg_cache.databaseUrl;
+          KUBERNIX_HTTP_LISTEN = cfg_cache.listen;
+          RUST_LOG = "debug";
+        } // s3Env cfg_cache;
+
+        serviceConfig = {
+          ExecStart = "${cfg_cache.package}/bin/kubernix-server";
           Restart = "always";
           DynamicUser = true;
         };
       };
     })
+
     (mkIf cfg_worker.enable {
       systemd.services.kubernix-worker = {
         description = "Kubernix Worker";
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" "nats.service" ];
+        # The worker shells out to `nix-store` and `nix store dump-path`.
         path = [ pkgs.lix ];
 
         environment = {
           NATS_URL = cfg_worker.natsUrl;
           NIX_SYSTEM = cfg_worker.system;
           RUST_LOG = "debug";
+        } // optionalAttrs (cfg_worker.store != null) {
+          KUBERNIX_NIX_STORE = cfg_worker.store;
         };
 
         serviceConfig = {
           ExecStart = "${cfg_worker.package}/bin/kubernix-worker";
           Restart = "always";
-          DynamicUser = true;
+          StateDirectory = "kubernix-worker";
+          # Not DynamicUser: building needs a stable store root, and a chroot
+          # store must be created and reused across restarts.
         };
       };
     })

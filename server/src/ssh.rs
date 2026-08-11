@@ -17,6 +17,7 @@ use russh::{Channel, ChannelId};
 
 use crate::daemon_capnp::bootstrap;
 use crate::daemon_rpc::{BootstrapImpl, Config as RpcConfig};
+use crate::tenant::Tenant;
 
 /// Which public keys may connect.
 #[derive(Clone, Default)]
@@ -49,7 +50,14 @@ impl AuthPolicy {
     fn permits(&self, key: &PublicKey) -> bool {
         match self {
             AuthPolicy::AcceptAll => true,
-            AuthPolicy::AuthorizedKeys(keys) => keys.iter().any(|k| k == key),
+            // Compare the *key data*, not the `PublicKey`. `PublicKey` equality
+            // includes the trailing comment, which an `authorized_keys` line
+            // carries (`ssh-ed25519 AAAA… user@host`) and the key a client
+            // offers over the wire does not — so comparing whole values rejects
+            // every legitimate key.
+            AuthPolicy::AuthorizedKeys(keys) => {
+                keys.iter().any(|k| k.key_data() == key.key_data())
+            }
         }
     }
 }
@@ -76,6 +84,7 @@ impl Server for SshServer {
             auth: self.auth.clone(),
             peer_addr,
             user: None,
+            tenant: None,
             channels: HashMap::new(),
         }
     }
@@ -86,6 +95,13 @@ pub struct SshHandler {
     auth: AuthPolicy,
     peer_addr: Option<SocketAddr>,
     user: Option<String>,
+    /// Who this connection is attributed to, once it has authenticated.
+    ///
+    /// Derived from the identity the client presented rather than assigned, so
+    /// the same client is the same tenant across connections. `verified` records
+    /// whether the [`AuthPolicy`] actually checked it — under `AcceptAll` it did
+    /// not, and the attribution is a claim rather than a fact.
+    tenant: Option<Tenant>,
     /// Channels opened but not yet claimed by an `exec` request.
     channels: HashMap<ChannelId, Channel<Msg>>,
 }
@@ -99,8 +115,18 @@ impl Handler for SshHandler {
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         match self.auth {
             AuthPolicy::AcceptAll => {
-                tracing::warn!(user, "accepting unauthenticated client (no auth configured)");
+                // No key at all, so the username is the only identity on offer —
+                // and it is pure assertion. Everything this connection does is
+                // attributed to it anyway; `verified: false` is what says the
+                // attribution must not be mistaken for a permission.
+                let tenant = Tenant::from_ssh(user, None, false);
+                tracing::warn!(
+                    user,
+                    tenant = %tenant.id,
+                    "accepting unauthenticated client (no auth configured)"
+                );
                 self.user = Some(user.to_string());
+                self.tenant = Some(tenant);
                 Ok(Auth::Accept)
             }
             AuthPolicy::AuthorizedKeys(_) => Ok(Auth::reject()),
@@ -113,14 +139,22 @@ impl Handler for SshHandler {
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
         let fingerprint = public_key.fingerprint(Default::default()).to_string();
-        if self.auth.permits(public_key) {
-            tracing::info!(user, %fingerprint, "authenticated");
-            self.user = Some(user.to_string());
-            Ok(Auth::Accept)
-        } else {
+        let permitted = self.auth.permits(public_key);
+        if !permitted {
             tracing::warn!(user, %fingerprint, "rejected: key not authorized");
-            Ok(Auth::reject())
+            return Ok(Auth::reject());
         }
+
+        // The tenant follows the key, not the username: the key is what auth
+        // verifies, so deriving from it means enabling auth does not renumber
+        // anyone. Under `AcceptAll` the key was accepted without being checked,
+        // which is exactly what `verified` records.
+        let verified = matches!(self.auth, AuthPolicy::AuthorizedKeys(_));
+        let tenant = Tenant::from_ssh(user, Some(&fingerprint), verified);
+        tracing::info!(user, %fingerprint, tenant = %tenant.id, verified, "authenticated");
+        self.user = Some(user.to_string());
+        self.tenant = Some(tenant);
+        Ok(Auth::Accept)
     }
 
     async fn channel_open_session(
@@ -167,11 +201,27 @@ impl Handler for SshHandler {
             return Ok(());
         };
 
+        // russh only delivers an exec after a successful auth, so this is set;
+        // refusing rather than defaulting keeps an unattributed connection from
+        // ever reaching the store.
+        let Some(tenant) = self.tenant.clone() else {
+            tracing::error!("exec before authentication");
+            session.channel_failure(channel_id)?;
+            return Ok(());
+        };
+
         session.channel_success(channel_id)?;
 
-        tracing::info!(user = ?self.user, peer = ?self.peer_addr, %command, "serving daemon protocol");
+        tracing::info!(
+            user = ?self.user,
+            peer = ?self.peer_addr,
+            tenant = %tenant.id,
+            %command,
+            "serving daemon protocol"
+        );
 
-        let rpc_config = self.rpc_config.clone();
+        let mut rpc_config = self.rpc_config.clone();
+        rpc_config.tenant = tenant;
         let stream = channel.into_stream();
 
         // capnp-rpc capabilities are !Send, so the RPC system cannot run on the
@@ -239,7 +289,46 @@ fn is_stdio_request(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_stdio_request;
+    use super::*;
+
+    /// An `authorized_keys` line, i.e. with a trailing comment.
+    const AUTHORIZED: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z baloo@khany";
+    /// The same key as a client presents it: no comment.
+    const OFFERED: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z";
+    const OTHER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJCU6/lsgeY1GlUJF2nMkLB5kq008SBiLTz2YswJvb8o";
+
+    fn key(openssh: &str) -> PublicKey {
+        PublicKey::from_openssh(openssh).expect("parseable")
+    }
+
+    #[test]
+    fn an_authorized_key_is_recognised_despite_its_comment() {
+        // Regression: `PublicKey` equality includes the comment, so comparing
+        // whole values rejected every key in an `authorized_keys` file.
+        let policy = AuthPolicy::AuthorizedKeys(Arc::new(vec![key(AUTHORIZED)]));
+        assert!(policy.permits(&key(OFFERED)));
+        assert!(policy.permits(&key(AUTHORIZED)));
+    }
+
+    #[test]
+    fn an_unlisted_key_is_refused() {
+        let policy = AuthPolicy::AuthorizedKeys(Arc::new(vec![key(AUTHORIZED)]));
+        assert!(!policy.permits(&key(OTHER)));
+        assert!(!AuthPolicy::AuthorizedKeys(Arc::new(Vec::new())).permits(&key(OFFERED)));
+    }
+
+    #[test]
+    fn the_same_key_is_the_same_tenant_whatever_the_username() {
+        // Tenancy follows the key so that enabling auth does not renumber
+        // anyone, and so a username cannot be used to reach another's data.
+        let fingerprint = key(OFFERED).fingerprint(Default::default()).to_string();
+        let alice = Tenant::from_ssh("alice", Some(&fingerprint), true);
+        let claiming_bob = Tenant::from_ssh("bob", Some(&fingerprint), true);
+        assert_eq!(alice.id, claiming_bob.id);
+
+        let other = key(OTHER).fingerprint(Default::default()).to_string();
+        assert_ne!(alice.id, Tenant::from_ssh("alice", Some(&other), true).id);
+    }
 
     #[test]
     fn accepts_the_shapes_lix_sends() {
@@ -253,6 +342,7 @@ mod tests {
     #[test]
     fn rejects_everything_else() {
         assert!(!is_stdio_request("bash"));
+        // the serve protocol is a different wire format; we do not speak it
         assert!(!is_stdio_request("nix-store --serve --write"));
         assert!(!is_stdio_request(""));
         // must be a distinct argument, not a substring

@@ -1,0 +1,13 @@
+[package]
+name = "kubernix-signing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+ed25519-dalek.workspace = true
+crypto-common = { version = "0.2.2", features = ["getrandom"] }
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

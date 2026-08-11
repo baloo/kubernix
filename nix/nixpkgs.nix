@@ -8,11 +8,13 @@ let
   lixSource = flakeNodes."${flakeRoots.lix}";
   nixpkgsSource = flakeNodes."${flakeRoots.nixpkgs}";
 
-  lix = builtins.fetchGit {
-    inherit (lixSource.locked) url rev;
+  lix = builtins.fetchTarball {
+    url = "https://github.com/nixos/nixpkgs/archive/${lixSource.locked.rev}.tar.gz";
+    sha256 = lixSource.locked.narHash;
   };
   nixpkgs = builtins.fetchTarball {
-    url = "https://github.com/nixos/nixpkgs/archives/${nixpkgsSource.locked.rev}.tar.gz";
+    # `archive`, not `archives` — the latter 404s.
+    url = "https://github.com/nixos/nixpkgs/archive/${nixpkgsSource.locked.rev}.tar.gz";
     sha256 = nixpkgsSource.locked.narHash;
   };
 in let

@@ -14,11 +14,8 @@
 
 #include "config.h"
 
-// gc-store.hh must precede daemon-rpc.hh: the latter references GCOptions
-// without including it. See NOTES.md item 3.
 #include <lix/libstore/derivations.hh>
 #include <lix/libstore/nar-accessor.hh>
-#include <lix/libstore/gc-store.hh>
 #include <lix/libstore/daemon-rpc.hh>
 
 #include <lix/libstore/daemon.hh>

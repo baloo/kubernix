@@ -19,6 +19,7 @@ use futures_util::StreamExt;
 use uuid::Uuid;
 
 use crate::kubernix_capnp;
+use crate::tenant::TenantId;
 
 pub const JOBS_STREAM: &str = "kubernix_jobs";
 pub const RESULTS_STREAM: &str = "kubernix_results";
@@ -35,6 +36,17 @@ pub fn results_subject(job_id: &Uuid) -> String {
     format!("kubernix.results.{job_id}")
 }
 
+#[derive(Debug, Clone)]
+pub struct InputRef {
+    pub store_path: String,
+    /// Object key holding the zstd-compressed bare NAR.
+    pub key: String,
+    /// Sent with the key because a bare NAR cannot be imported alone: the
+    /// worker wraps it into an export stream, which needs both of these.
+    pub references: Vec<String>,
+    pub deriver: String,
+}
+
 #[derive(Debug)]
 pub struct BuildJob {
     pub job_id: Uuid,
@@ -42,6 +54,13 @@ pub struct BuildJob {
     pub system: String,
     /// Serialized derivation, so the worker does not need it in its store first.
     pub drv: Vec<u8>,
+    /// Inputs staged to the object store for this build.
+    pub inputs: Vec<InputRef>,
+    /// Whose build this is.
+    ///
+    /// Travels with the job because the worker needs it to ask for pre-signed
+    /// URLs: the frontend grants keys under this tenant and refuses the rest.
+    pub tenant: TenantId,
 }
 
 /// Per-output metadata the worker reports, which is what `narinfo` is generated
@@ -156,12 +175,32 @@ impl JobQueue {
             req.set_derivation_path(job.derivation_path.as_str());
             req.set_system(job.system.as_str());
             req.set_drv(&job.drv);
+            req.set_tenant(job.tenant.as_str());
+
+            let mut inputs = req.reborrow().init_inputs(job.inputs.len() as u32);
+            for (i, input) in job.inputs.iter().enumerate() {
+                let mut entry = inputs.reborrow().get(i as u32);
+                entry.set_store_path(input.store_path.as_str());
+                entry.set_key(input.key.as_str());
+                entry.set_deriver(input.deriver.as_str());
+                let mut refs = entry.init_references(input.references.len() as u32);
+                for (r, reference) in input.references.iter().enumerate() {
+                    refs.set(r as u32, reference.as_str());
+                }
+            }
         }
         let mut payload = Vec::new();
         capnp::serialize::write_message(&mut payload, &message)?;
 
         let subject = jobs_subject(&job.system);
-        tracing::info!(job_id = %job.job_id, %subject, drv = %job.derivation_path, "submitting job");
+        tracing::info!(
+            job_id = %job.job_id,
+            tenant = %job.tenant,
+            %subject,
+            drv = %job.derivation_path,
+            inputs = job.inputs.len(),
+            "submitting job"
+        );
 
         // Await the ack: a publish that silently failed would leave the client
         // waiting for a build nobody queued.

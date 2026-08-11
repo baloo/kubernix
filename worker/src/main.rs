@@ -12,6 +12,9 @@ pub mod kubernix_capnp {
     include!(concat!(env!("OUT_DIR"), "/kubernix_capnp.rs"));
 }
 
+mod derivation;
+mod nar_export;
+mod serve;
 mod upload;
 
 /// Request/reply subject for pre-signed upload URLs. The frontend holds the S3
@@ -20,14 +23,73 @@ pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
 
 use async_nats::jetstream::{self, consumer::PullConsumer};
 use futures_util::stream::StreamExt;
-use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 struct Job {
     job_id: String,
     derivation_path: String,
+    /// Whose build this is. Every artifact key is scoped by it, and the
+    /// frontend signs nothing outside that scope.
+    tenant: String,
+    inputs: Vec<InputRef>,
+    /// The derivation itself, shipped inline by `buildDerivation`.
+    drv: Vec<u8>,
+}
+
+/// The output paths a derivation declares.
+///
+/// Taken from the derivation rather than from a builder's stdout: with
+/// `nix-store --serve` stdout carries the protocol, and the derivation is the
+/// authoritative statement of where its outputs go regardless.
+fn declared_outputs(job: &Job) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let drv = derivation::parse(&job.drv)?;
+    Ok(drv.outputs.into_iter().map(|o| o.path).collect())
+}
+
+struct InputRef {
+    store_path: String,
+    key: String,
+    /// Needed to wrap the NAR into an importable export stream; a bare NAR
+    /// carries neither.
+    references: Vec<String>,
+    deriver: String,
+}
+
+/// Fetch and import every input the frontend staged for this job.
+///
+/// Done before the build: the whole point is that a worker on another machine
+/// has the closure it needs without ever holding S3 credentials.
+async fn fetch_inputs(
+    client: &async_nats::Client,
+    http: &reqwest::Client,
+    job: &Job,
+    nix_store: &str,
+    store_uri: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if job.inputs.is_empty() {
+        return Ok(());
+    }
+
+    let keys: Vec<String> = job.inputs.iter().map(|i| i.key.clone()).collect();
+    let urls = upload::request_download_urls(client, &job.job_id, &job.tenant, &keys).await?;
+
+    for (input, url) in job.inputs.iter().zip(urls) {
+        tracing::info!(job_id = %job.job_id, path = %input.store_path, "importing input");
+        upload::fetch_input(
+            http,
+            &url,
+            &input.store_path,
+            &input.references,
+            &input.deriver,
+            nix_store,
+            store_uri,
+        )
+        .await?;
+    }
+
+    tracing::info!(job_id = %job.job_id, count = job.inputs.len(), "inputs imported");
+    Ok(())
 }
 
 #[tokio::main]
@@ -44,6 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let system = std::env::var("NIX_SYSTEM").unwrap_or_else(|_| "x86_64-linux".to_string());
     let builder = std::env::var("KUBERNIX_NIX_BUILDER").unwrap_or_else(|_| "nix-store".to_string());
+    // A worker pod owns its store; pointing at one explicitly also makes local
+    // testing honest, since it cannot silently rely on the host's /nix/store.
+    let nix_cli = std::env::var("KUBERNIX_NIX_CLI").unwrap_or_else(|_| "nix".to_string());
+    let store_uri = std::env::var("KUBERNIX_NIX_STORE").ok();
 
     tracing::info!(%nats_url, %system, "starting worker");
     let client = async_nats::connect(&nats_url).await?;
@@ -116,13 +182,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        tracing::info!(job_id = %job.job_id, drv = %job.derivation_path, "building");
-        let (mut outcome, log) = run_build(&client, &job, &builder).await;
+        tracing::info!(job_id = %job.job_id, drv = %job.derivation_path, inputs = job.inputs.len(), "building");
+
+        if let Err(e) = fetch_inputs(&client, &http, &job, &builder, store_uri.as_deref()).await {
+            tracing::error!(job_id = %job.job_id, error = %e, "could not fetch inputs");
+            let outcome = Outcome::Failed(format!("fetching inputs: {e}"));
+            let _ = publish_result(&jetstream, &job, &outcome, &[], "").await;
+            let _ = message.ack().await;
+            continue;
+        }
+
+        // Where the outputs will land, read from the derivation itself.
+        let outputs = match declared_outputs(&job) {
+            Ok(outputs) => outputs,
+            Err(e) => {
+                tracing::error!(job_id = %job.job_id, error = %e, "undecodable derivation");
+                let outcome = Outcome::Failed(format!("reading derivation: {e}"));
+                let _ = publish_result(&jetstream, &job, &outcome, &[], "").await;
+                let _ = message.ack().await;
+                continue;
+            }
+        };
+
+        let (mut outcome, log) =
+            run_build(&client, &job, outputs, &builder, store_uri.as_deref()).await;
 
         // Artifacts first, then the result: publishing a success whose outputs
         // are not yet fetchable would be worse than reporting the upload failure.
         let (artifacts, log_key) =
-            match upload_artifacts(&client, &http, &job, &outcome, log, &builder).await {
+            match upload_artifacts(
+                &client,
+                &http,
+                &job,
+                &outcome,
+                log,
+                &builder,
+                &nix_cli,
+                store_uri.as_deref(),
+            )
+            .await
+            {
                 Ok(uploaded) => uploaded,
                 Err(e) => {
                     tracing::error!(job_id = %job.job_id, error = %e, "artifact upload failed");
@@ -148,9 +247,32 @@ fn decode_job(payload: &[u8]) -> Result<Job, Box<dyn std::error::Error>> {
     let reader =
         capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
     let request = reader.get_root::<kubernix_capnp::build_request::Reader>()?;
+    let mut inputs = Vec::new();
+    for input in request.get_inputs()?.iter() {
+        let mut references = Vec::new();
+        for reference in input.get_references()?.iter() {
+            references.push(reference?.to_string()?);
+        }
+        inputs.push(InputRef {
+            store_path: input.get_store_path()?.to_string()?,
+            key: input.get_key()?.to_string()?,
+            references,
+            deriver: input.get_deriver()?.to_string()?,
+        });
+    }
+    let tenant = request.get_tenant()?.to_string()?;
+    if tenant.is_empty() {
+        // Without one the worker cannot name a key the frontend will sign, so
+        // failing here beats failing later with a refused URL request.
+        return Err("build request carries no tenant".into());
+    }
+
     Ok(Job {
         job_id: request.get_job_id()?.to_string()?,
         derivation_path: request.get_derivation_path()?.to_string()?,
+        tenant,
+        inputs,
+        drv: request.get_drv()?.to_vec(),
     })
 }
 
@@ -173,102 +295,146 @@ async fn upload_artifacts(
     outcome: &Outcome,
     log: Vec<u8>,
     nix_store: &str,
+    nix_cli: &str,
+    store_uri: Option<&str>,
 ) -> Result<(Vec<upload::OutputArtifact>, String), Box<dyn std::error::Error>> {
     let outputs: Vec<String> = match outcome {
         Outcome::Completed(paths) => paths.clone(),
         Outcome::Failed(_) => Vec::new(),
     };
 
-    let log_key = upload::log_key(&job.derivation_path)
+    let log_key = upload::log_key(&job.tenant, &job.derivation_path)
         .ok_or_else(|| format!("cannot derive log key from {}", job.derivation_path))?;
 
     // One round trip for every key this job needs.
     let mut keys = vec![log_key.clone()];
     for path in &outputs {
         keys.push(
-            upload::nar_key(path).ok_or_else(|| format!("cannot derive nar key from {path}"))?,
+            upload::nar_key(&job.tenant, path)
+                .ok_or_else(|| format!("cannot derive nar key from {path}"))?,
         );
     }
 
-    let urls = upload::request_upload_urls(client, &job.job_id, &keys).await?;
+    let urls = upload::request_upload_urls(client, &job.job_id, &job.tenant, &keys).await?;
 
-    upload::upload_log(http, &urls[0], &log_key, log).await?;
+    // An empty log is possible — a build that printed nothing — and some S3
+    // implementations reject a zero-length PUT outright. Losing the whole job
+    // over an empty log would be absurd, so skip the upload and report no key.
+    let log_key = if log.is_empty() {
+        tracing::debug!(job_id = %job.job_id, "build produced no log; not uploading one");
+        String::new()
+    } else {
+        upload::upload_log(http, &urls[0], &log_key, log).await?;
+        log_key
+    };
 
     let mut artifacts = Vec::new();
     for (i, path) in outputs.iter().enumerate() {
         let key = keys[i + 1].clone();
         tracing::info!(job_id = %job.job_id, %path, %key, "uploading output");
-        artifacts.push(upload::upload_output(http, &urls[i + 1], key, path, nix_store).await?);
+        artifacts.push(
+            upload::upload_output(http, &urls[i + 1], key, path, nix_store, nix_cli, store_uri)
+                .await?,
+        );
     }
 
     Ok((artifacts, log_key))
 }
 
-/// Realise the derivation, publishing each output line to the job's log subject
-/// as it arrives, and returning the accumulated log for archival.
+/// Build the job's derivation and stream its log.
+///
+/// Goes through `nix-store --serve` rather than writing a `.drv` and calling
+/// `nix-store --realise`. The derivation we receive is *resolved*, and Nix
+/// computes an input-addressed output path from the derivation itself, so a
+/// reconstructed `.drv` disagrees with the outputs recorded inside it — see
+/// `serve.rs`. Passing the derivation by value sidesteps that entirely.
 async fn run_build(
     client: &async_nats::Client,
     job: &Job,
+    outputs: Vec<String>,
     builder: &str,
+    store_uri: Option<&str>,
 ) -> (Outcome, Vec<u8>) {
     let log_subject = format!("kubernix.logs.{}", job.job_id);
 
-    let mut child = match Command::new(builder)
-        .arg("--realise")
-        .arg(&job.derivation_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
+    let mut conn = match serve::ServeConnection::open(builder, store_uri).await {
+        Ok(conn) => conn,
         Err(e) => {
-            let message = format!("failed to spawn {builder}: {e}");
+            let message = format!("starting {builder} --serve: {e}");
             let _ = client.publish(log_subject, message.clone().into()).await;
             return (Outcome::Failed(message.clone()), message.into_bytes());
         }
     };
 
-    // stdout carries the realised output paths; stderr carries the build log.
-    let mut stdout = BufReader::new(child.stdout.take().expect("piped")).lines();
-    let mut stderr = BufReader::new(child.stderr.take().expect("piped")).lines();
+    // The log has to be drained *while* the build runs: it is a pipe, and a full
+    // one would block the builder rather than merely delaying the output.
+    let stderr = conn.stderr.take();
+    let pump = tokio::spawn(pump_log(client.clone(), log_subject.clone(), stderr));
 
-    let mut outputs = Vec::new();
-    let mut tail = Vec::new();
-    // The full log, kept for archival to the object store.
-    let mut archive: Vec<u8> = Vec::new();
+    let result = conn.build_derivation(&job.derivation_path, &job.drv).await;
+
+    // Closing drops stdin, which is what tells `nix-store --serve` to exit, which
+    // in turn ends the log stream. Done before awaiting the pump for that reason.
+    if let Err(e) = conn.close().await {
+        tracing::warn!(error = %e, "serve connection did not close cleanly");
+    }
+    let (archive, tail) = pump.await.unwrap_or_default();
+    let _ = client.flush().await;
+
+    let outcome = match result {
+        Ok(outcome) if outcome.succeeded() => Outcome::Completed(outputs),
+        Ok(outcome) => {
+            // The client already saw the log live; the tail is what makes the
+            // failure message useful on its own.
+            let mut message = outcome.describe();
+            if !tail.is_empty() {
+                message.push('\n');
+                message.push_str(&tail.join("\n"));
+            }
+            Outcome::Failed(message)
+        }
+        Err(e) => Outcome::Failed(format!("building {}: {e}", job.derivation_path)),
+    };
+
+    (outcome, archive)
+}
+
+/// Relay the builder's output to `kubernix.logs.<job_id>` as it arrives.
+///
+/// Returns the full log for archival, and the last few lines for the failure
+/// message.
+async fn pump_log(
+    client: async_nats::Client,
+    subject: String,
+    stderr: Option<tokio::process::ChildStderr>,
+) -> (Vec<u8>, Vec<String>) {
+    let mut archive = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+
+    let Some(stderr) = stderr else {
+        return (archive, tail);
+    };
+    let mut lines = BufReader::new(stderr).lines();
 
     loop {
-        tokio::select! {
-            line = stdout.next_line() => match line {
-                Ok(Some(line)) => outputs.push(line),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(error = %e, "stdout read error"),
-            },
-            line = stderr.next_line() => match line {
-                Ok(Some(line)) => {
-                    let _ = client.publish(log_subject.clone(), line.clone().into()).await;
-                    archive.extend_from_slice(line.as_bytes());
-                    archive.push(b'\n');
-                    // Kept for the failure message; the client already saw it live.
-                    if tail.len() == 20 { tail.remove(0); }
-                    tail.push(line);
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let _ = client.publish(subject.clone(), line.clone().into()).await;
+                archive.extend_from_slice(line.as_bytes());
+                archive.push(b'\n');
+                if tail.len() == 20 {
+                    tail.remove(0);
                 }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(error = %e, "stderr read error"),
-            },
-            status = child.wait() => {
-                let _ = client.flush().await;
-                let outcome = match status {
-                    Ok(status) if status.success() => Outcome::Completed(outputs),
-                    Ok(status) => Outcome::Failed(format!(
-                        "{builder} exited with {status}\n{}", tail.join("\n")
-                    )),
-                    Err(e) => Outcome::Failed(format!("waiting on {builder}: {e}")),
-                };
-                return (outcome, archive);
+                tail.push(line);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "log read error");
+                break;
             }
         }
     }
+    (archive, tail)
 }
 
 async fn publish_result(

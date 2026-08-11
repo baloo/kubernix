@@ -18,53 +18,24 @@ lix_util = dependency('lix-util')
 capnp_dep = dependency('capnp')
 capnp_rpc_dep = dependency('capnp-rpc')
 
-capnp = find_program('capnp', required : true)
-
-# Lix does not install the generated capnp headers for libstore, even though it
-# installs daemon-rpc.hh which includes them, and even though libutil installs
-# its own. We regenerate them here from Lix's schema sources; the output is
-# byte-identical to Lix's build tree. See NOTES.md item 1.
+# Three workarounds used to live here, all for Lix packaging bugs that have since
+# been fixed upstream (NOTES.md items 1-3):
 #
-# Generated from the *Lix source we link against* rather than a vendored copy on
-# purpose: we rely on liblix-store.so to supply the schema blobs, so the headers
-# must describe exactly the schema that library was built with.
-lix_source = get_option('lix-source')
-if lix_source == ''
-  error(
-    'lix-source is unset. Point it at the Lix source tree matching the Lix ' +
-    'being linked, e.g. -Dlix-source=/path/to/lix (Nix passes ${lix.src}).'
-  )
-endif
-
-lixgen = meson.current_build_dir() / 'lixgen'
-run_command('mkdir', '-p', lixgen, check : true)
-run_command(
-  capnp, 'compile',
-  '-oc++:' + lixgen,
-  '--src-prefix=' + lix_source,
-  '-I' + lix_source,
-  lix_source / 'lix/libstore/daemon.capnp',
-  lix_source / 'lix/libstore/types.capnp',
-  check : true,
-)
-
-# Only the headers are used. The corresponding .c++ schema blobs are deliberately
-# NOT compiled in: liblix-store.so already exports them, verified by linking a
-# probe both with and without. See NOTES.md item 1.
-
-lix_includedir = lix_store.get_variable(pkgconfig : 'includedir')
-
-kubernix_cpp_args = [
-  # daemon-rpc.hh includes "libstore/build-result.hh" without the lix/ prefix,
-  # so the include root itself must be on the path. See NOTES.md item 2.
-  '-I' + lix_includedir / 'lix',
-  '-I' + lixgen,
-]
+#   * generated capnp headers were not installed  -> lix b8f75f742
+#   * daemon-rpc.hh used build-tree-relative includes -> lix ee252770f
+#   * daemon-rpc.hh was not self-contained        -> lix 7104538c1
+#
+# Nothing replaces them: the installed headers are now sufficient on their own.
+# That is also why `-Dlix-source` is gone — it existed only to regenerate the
+# headers, so the plugin no longer needs a Lix *source* tree at all, just the
+# package.
+#
+# The schema blobs are still deliberately NOT compiled in: liblix-store.so
+# exports them, verified by linking a probe both with and without.
 
 shared_module('kubernix',
   'src/plugin.cc',
   dependencies : [lix_main, lix_store, lix_util, capnp_dep, capnp_rpc_dep],
-  cpp_args : kubernix_cpp_args,
   install : true,
   install_dir : get_option('libdir') / 'lix' / 'plugins',
   name_prefix : '',

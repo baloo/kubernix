@@ -6,7 +6,7 @@
 
 use std::process::Stdio;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, digest::Output};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -17,10 +17,10 @@ use crate::kubernix_capnp;
 pub struct OutputArtifact {
     pub store_path: String,
     /// sha256 of the uncompressed NAR — what Nix verifies against.
-    pub nar_hash: Vec<u8>,
+    pub nar_hash: Output<Sha256>,
     pub nar_size: u64,
     /// sha256 of the compressed object — what a client downloads.
-    pub file_hash: Vec<u8>,
+    pub file_hash: Output<Sha256>,
     pub file_size: u64,
     pub key: String,
     pub references: Vec<String>,
@@ -34,24 +34,57 @@ pub fn hash_part_of(path: &str) -> Option<&str> {
     (hash.len() == 32).then_some(hash)
 }
 
-pub fn nar_key(store_path: &str) -> Option<String> {
-    Some(format!("nar/{}.nar.zst", hash_part_of(store_path)?))
+/// Artifact keys are tenant-scoped: the frontend signs a key only for the
+/// tenant whose job asked for it, so the prefix is part of the key rather than
+/// something applied later.
+pub fn nar_key(tenant: &str, store_path: &str) -> Option<String> {
+    Some(format!(
+        "{tenant}/nar/{}.nar.zst",
+        hash_part_of(store_path)?
+    ))
 }
 
-pub fn log_key(drv_path: &str) -> Option<String> {
-    Some(format!("log/{}", hash_part_of(drv_path)?))
+pub fn log_key(tenant: &str, drv_path: &str) -> Option<String> {
+    Some(format!("{tenant}/log/{}", hash_part_of(drv_path)?))
 }
 
-/// Ask the frontend to pre-sign the given keys.
+/// Ask the frontend to pre-sign the given keys for upload.
 pub async fn request_upload_urls(
     client: &async_nats::Client,
     job_id: &str,
+    tenant: &str,
     keys: &[String],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    request_urls(client, job_id, tenant, keys, false).await
+}
+
+/// Ask the frontend to pre-sign the given keys for download.
+///
+/// Requested when the job is dequeued rather than baked into the job message:
+/// a job can sit queued for longer than a URL's lifetime, and a URL minted at
+/// submit time would have started expiring before any worker saw it.
+pub async fn request_download_urls(
+    client: &async_nats::Client,
+    job_id: &str,
+    tenant: &str,
+    keys: &[String],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    request_urls(client, job_id, tenant, keys, true).await
+}
+
+async fn request_urls(
+    client: &async_nats::Client,
+    job_id: &str,
+    tenant: &str,
+    keys: &[String],
+    download: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut message = capnp::message::Builder::new_default();
     {
         let mut request = message.init_root::<kubernix_capnp::upload_url_request::Builder>();
         request.set_job_id(job_id);
+        request.set_download(download);
+        request.set_tenant(tenant);
         let mut list = request.reborrow().init_keys(keys.len() as u32);
         for (i, key) in keys.iter().enumerate() {
             list.set(i as u32, key.as_str());
@@ -65,8 +98,7 @@ pub async fn request_upload_urls(
         .await?;
 
     let mut cursor = reply.payload.as_ref();
-    let reader =
-        capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
     let response = reader.get_root::<kubernix_capnp::upload_url_response::Reader>()?;
 
     let error = response.get_error_msg()?.to_string()?;
@@ -95,18 +127,41 @@ pub async fn upload_output(
     key: String,
     store_path: &str,
     nix_store: &str,
+    nix_cli: &str,
+    store_uri: Option<&str>,
 ) -> Result<OutputArtifact, Box<dyn std::error::Error>> {
-    let mut child = Command::new(nix_store)
-        .arg("--dump")
+    // `nix store dump-path`, not `nix-store --dump`: the latter takes a
+    // *filesystem* path and ignores --store entirely, so it cannot find an
+    // output living under a chroot store root.
+    let mut command = Command::new(nix_cli);
+    command.arg("store").arg("dump-path");
+    if let Some(uri) = store_uri {
+        command.arg("--store").arg(uri);
+    }
+    let mut child = command
         .arg(store_path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
 
     let mut stdout = child.stdout.take().expect("piped");
+    // Compressed as the NAR arrives, into a temporary file rather than memory,
+    // so nothing here scales with the size of the output. Both hashes are
+    // computed in the same pass — buffering to hash afterwards would defeat the
+    // point for a large closure.
+    //
+    // Why a file and not a streaming request body: a pre-signed PUT is signed
+    // for a specific request, and a streaming body means chunked
+    // transfer-encoding with no `Content-Length`, which S3 rejects outright
+    // (`HTTP 400`). Spooling to disk gives a length to declare while keeping
+    // *memory* flat, which is what actually mattered.
+    let spool = tempfile::NamedTempFile::new()?;
+    let mut sink = tokio::fs::File::from_std(spool.reopen()?);
 
     let mut nar_hasher = Sha256::new();
+    let mut file_hasher = Sha256::new();
     let mut nar_size: u64 = 0;
+    let mut file_size: u64 = 0;
     let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3)?;
 
     let mut buf = vec![0u8; 64 * 1024];
@@ -118,39 +173,142 @@ pub async fn upload_output(
         nar_hasher.update(&buf[..read]);
         nar_size += read as u64;
         std::io::Write::write_all(&mut encoder, &buf[..read])?;
+
+        let compressed = std::mem::take(encoder.get_mut());
+        if !compressed.is_empty() {
+            file_hasher.update(&compressed);
+            file_size += compressed.len() as u64;
+            tokio::io::AsyncWriteExt::write_all(&mut sink, &compressed).await?;
+        }
     }
 
+    let tail = encoder.finish()?;
+    if !tail.is_empty() {
+        file_hasher.update(&tail);
+        file_size += tail.len() as u64;
+        tokio::io::AsyncWriteExt::write_all(&mut sink, &tail).await?;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut sink).await?;
+    drop(sink);
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr).await;
+    }
     let status = child.wait().await?;
     if !status.success() {
-        return Err(format!("{nix_store} --dump {store_path} exited with {status}").into());
+        return Err(format!("dumping {store_path}: {} ({status})", stderr.trim()).into());
     }
 
-    let compressed = encoder.finish()?;
-    let file_size = compressed.len() as u64;
-    let file_hash = Sha256::digest(&compressed).to_vec();
-
+    // Streamed from disk with the length declared, so the request is one the
+    // pre-signed URL will accept.
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(
+        tokio::fs::File::from_std(spool.reopen()?),
+    ));
     let response = http
         .put(url)
         .header("content-type", "application/x-nix-nar-zstd")
-        .body(compressed)
+        .header(reqwest::header::CONTENT_LENGTH, file_size)
+        .body(body)
         .send()
         .await?;
     if !response.status().is_success() {
         return Err(format!("uploading {key}: HTTP {}", response.status()).into());
     }
 
-    let (references, deriver) = query_path_metadata(nix_store, store_path).await?;
+    let (references, deriver) = query_path_metadata(nix_store, store_path, store_uri).await?;
 
     Ok(OutputArtifact {
         store_path: store_path.to_string(),
-        nar_hash: nar_hasher.finalize().to_vec(),
+        nar_hash: nar_hasher.finalize(),
         nar_size,
-        file_hash,
+        file_hash: file_hasher.finalize(),
         file_size,
         key,
         references,
         deriver,
     })
+}
+
+/// Fetch a staged input and import it into the local store.
+///
+/// The object is a zstd-compressed *bare NAR* -- the same shape every artifact
+/// has. `--import` needs an export stream, so the wrapping is added here, which
+/// is why the references and deriver travel alongside the key rather than being
+/// stored a second time.
+///
+/// Streamed end to end: fetched, decompressed and piped into the child a chunk
+/// at a time, so peak memory does not scale with the size of the input.
+pub async fn fetch_input(
+    http: &reqwest::Client,
+    url: &str,
+    store_path: &str,
+    references: &[String],
+    deriver: &str,
+    nix_store: &str,
+    store_uri: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = http.get(url).send().await?;
+    if !response.status().is_success() {
+        return Err(format!("fetching {store_path}: HTTP {}", response.status()).into());
+    }
+
+    let mut command = Command::new(nix_store);
+    if let Some(uri) = store_uri {
+        command.arg("--store").arg(uri);
+    }
+    let mut child = command
+        .arg("--import")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    {
+        use futures_util::StreamExt as _;
+        use std::io::Write as _;
+        use tokio::io::AsyncWriteExt;
+
+        let mut stdin = child.stdin.take().expect("piped");
+
+        // The object is a bare NAR; `--import` wants an export stream. The
+        // wrapping is built here rather than stored, so the object store holds
+        // one representation of a path rather than two — see `nar_export`.
+        stdin.write_all(&crate::nar_export::header()).await?;
+
+        // Decompressed as it arrives rather than in one piece: peak memory is a
+        // chunk, not the whole NAR. `zstd`'s streaming writer is enough for
+        // this, so it needs no additional dependency.
+        let mut decoder = zstd::stream::write::Decoder::new(Vec::new())?;
+        let mut body = response.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            decoder.write_all(&chunk?)?;
+            let decoded = std::mem::take(decoder.get_mut());
+            if !decoded.is_empty() {
+                stdin.write_all(&decoded).await?;
+            }
+        }
+        decoder.flush()?;
+        let decoded = std::mem::take(decoder.get_mut());
+        if !decoded.is_empty() {
+            stdin.write_all(&decoded).await?;
+        }
+
+        stdin
+            .write_all(&crate::nar_export::trailer(store_path, references, deriver))
+            .await?;
+        stdin.shutdown().await?;
+    }
+
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        return Err(format!(
+            "importing {store_path}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Upload the build log.
@@ -180,9 +338,18 @@ pub async fn upload_log(
 async fn query_path_metadata(
     nix_store: &str,
     store_path: &str,
+    store_uri: Option<&str>,
 ) -> Result<(Vec<String>, String), Box<dyn std::error::Error>> {
-    let references = Command::new(nix_store)
-        .arg("--query")
+    let with_store = |cmd: &str| {
+        let mut c = Command::new(nix_store);
+        if let Some(uri) = store_uri {
+            c.arg("--store").arg(uri);
+        }
+        c.arg(cmd);
+        c
+    };
+
+    let references = with_store("--query")
         .arg("--references")
         .arg(store_path)
         .output()
@@ -192,8 +359,7 @@ async fn query_path_metadata(
         .map(str::to_string)
         .collect();
 
-    let deriver = Command::new(nix_store)
-        .arg("--query")
+    let deriver = with_store("--query")
         .arg("--deriver")
         .arg(store_path)
         .output()
@@ -217,24 +383,29 @@ mod tests {
 
     #[test]
     fn derives_keys_from_store_paths() {
+        assert_eq!(hash_part_of(P), Some("21d91afy6vgw4l00yzy92kp92b1w3cdm"));
         assert_eq!(
-            hash_part_of(P),
-            Some("21d91afy6vgw4l00yzy92kp92b1w3cdm")
+            nar_key("tenant-1", P).as_deref(),
+            Some("tenant-1/nar/21d91afy6vgw4l00yzy92kp92b1w3cdm.nar.zst")
         );
         assert_eq!(
-            nar_key(P).as_deref(),
-            Some("nar/21d91afy6vgw4l00yzy92kp92b1w3cdm.nar.zst")
+            log_key("tenant-1", P).as_deref(),
+            Some("tenant-1/log/21d91afy6vgw4l00yzy92kp92b1w3cdm")
         );
-        assert_eq!(
-            log_key(P).as_deref(),
-            Some("log/21d91afy6vgw4l00yzy92kp92b1w3cdm")
-        );
+    }
+
+    #[test]
+    fn keys_are_scoped_per_tenant() {
+        // Two tenants building the same derivation must not collide in the
+        // object store, and neither may be signed for the other.
+        assert_ne!(nar_key("tenant-1", P), nar_key("tenant-2", P));
+        assert_ne!(log_key("tenant-1", P), log_key("tenant-2", P));
     }
 
     #[test]
     fn rejects_paths_without_a_hash_part() {
         assert_eq!(hash_part_of("/etc/passwd"), None);
         assert_eq!(hash_part_of("notapath"), None);
-        assert_eq!(nar_key("/etc/passwd"), None);
+        assert_eq!(nar_key("tenant-1", "/etc/passwd"), None);
     }
 }

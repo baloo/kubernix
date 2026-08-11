@@ -1,10 +1,10 @@
-{ rustPlatform, capnproto, gitignoreRecursiveSource }:
+{ rustPlatform, capnproto, workspaceSource }:
 
 rustPlatform.buildRustPackage {
   pname = "kubernix-worker";
   version = "0.1.0";
 
-  src = gitignoreRecursiveSource [] ../.;
+  src = workspaceSource;
   buildAndTestSubdir = "worker";
 
   cargoLock = {

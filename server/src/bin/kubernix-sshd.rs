@@ -14,12 +14,14 @@
 //!   `KUBERNIX_SSH_LISTEN`          bind address (default `0.0.0.0:2222`)
 //!   `KUBERNIX_SSH_HOST_KEY`        host key path (generated if absent)
 //!   `KUBERNIX_SSH_AUTHORIZED_KEYS` authorized_keys path; if unset, any key is accepted
+//!   `DATABASE_URL`                 PostgreSQL; if unset, an in-memory store is used
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use kubernix_server::daemon_rpc::Config as RpcConfig;
+use kubernix_server::postgres_store::PostgresStore;
 use kubernix_server::ssh::{AuthPolicy, SshServer};
 use russh::server::Server as _;
 
@@ -60,6 +62,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut rpc_config = RpcConfig::default();
+
+    // Without a database the frontend still works, but every path it knows is
+    // forgotten on restart — which strands objects a worker already uploaded.
+    // Refusing to start would be worse for development, so this warns loudly
+    // instead.
+    match std::env::var("DATABASE_URL") {
+        Ok(url) => match PostgresStore::connect(&url).await {
+            Ok(store) => rpc_config.store = store,
+            Err(e) => {
+                tracing::error!(error = %e, "could not reach PostgreSQL");
+                return Err(e.into());
+            }
+        },
+        Err(_) => tracing::warn!(
+            "DATABASE_URL unset - using the in-memory store; every path is lost on restart"
+        ),
+    }
+
     if let Ok(nats_url) = std::env::var("NATS_URL") {
         match kubernix_server::jobs::JobQueue::connect(&nats_url).await {
             Ok(queue) => {
@@ -67,9 +87,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // of S3 credentials; workers receive per-object capabilities.
                 match kubernix_server::uploads::UploadSigner::from_env().await {
                     Ok(signer) => {
+                        let signer = std::sync::Arc::new(signer);
+                        // Same signer both ways: it writes inputs directly and
+                        // pre-signs the URLs workers use for outputs.
+                        rpc_config.uploader = Some(signer.clone());
                         let client = queue.client();
+                        let serving = signer.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = signer.serve(client).await {
+                            if let Err(e) = (*serving).clone().serve(client).await {
                                 tracing::error!(error = %e, "upload url service stopped");
                             }
                         });

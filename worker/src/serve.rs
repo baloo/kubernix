@@ -1,0 +1,277 @@
+//! Building a `BasicDerivation` through `nix-store --serve`.
+//!
+//! **Why this exists.** `buildDerivation` ships a *resolved* derivation: inputs
+//! that were `inputDrvs` have already become concrete `inputSrcs`. The obvious
+//! implementation — write it out as a `.drv` and run `nix-store --realise` —
+//! cannot work for anything but a leaf derivation, because Nix computes an
+//! input-addressed output path *from the derivation*, so a reconstructed `.drv`
+//! disagrees with the output paths recorded inside it:
+//!
+//! ```text
+//! error: derivation '/nix/store/h6bd…-x.drv' has incorrect output
+//!        '/nix/store/7wjk…-x', should be '/nix/store/qff8…-x'
+//! ```
+//!
+//! `nix-store --serve` has a `BuildDerivation` command that takes a derivation
+//! *by value* and never writes a `.drv` at all (`lix/legacy/nix-store.cc:1065`,
+//! `store->buildDerivation(drvPath, drv)`). It reads exactly the bytes we
+//! already hold: both sides use Lix's `serializeDerivation`/`readDerivation`
+//! pair, so the `drv` field from the daemon protocol goes out unmodified.
+//!
+//! The wire format is the serve protocol — u64 little-endian integers, strings
+//! length-prefixed and padded to a multiple of eight. Unrelated to the Cap'n
+//! Proto daemon protocol the frontend speaks.
+
+use std::process::Stdio;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+
+/// `lix/libstore/serve-protocol.hh`.
+const MAGIC_1: u64 = 0x390c_9deb;
+const MAGIC_2: u64 = 0x5452_eecb;
+
+/// Pinned at 2.7 upstream and documented as never changing.
+const PROTOCOL_VERSION: u64 = (2 << 8) | 7;
+
+const CMD_BUILD_DERIVATION: u64 = 8;
+
+/// `BuildResult::Status` (`lix/libstore/build-result.hh:24`).
+const STATUS_BUILT: u64 = 0;
+const STATUS_SUBSTITUTED: u64 = 1;
+const STATUS_ALREADY_VALID: u64 = 2;
+const STATUS_RESOLVES_TO_ALREADY_VALID: u64 = 13;
+
+#[derive(Debug)]
+pub struct BuildOutcome {
+    pub status: u64,
+    pub error_msg: String,
+}
+
+impl BuildOutcome {
+    /// Whether the outputs exist afterwards.
+    ///
+    /// Several statuses mean "it is there now" without meaning "we just built
+    /// it", and all of them are success for our purposes.
+    pub fn succeeded(&self) -> bool {
+        matches!(
+            self.status,
+            STATUS_BUILT | STATUS_SUBSTITUTED | STATUS_ALREADY_VALID | STATUS_RESOLVES_TO_ALREADY_VALID
+        )
+    }
+
+    pub fn describe(&self) -> String {
+        if self.error_msg.is_empty() {
+            format!("build reported status {}", self.status)
+        } else {
+            self.error_msg.clone()
+        }
+    }
+}
+
+/// A running `nix-store --serve --write`.
+pub struct ServeConnection {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    /// Taken by the caller so build output can be streamed while the build runs.
+    pub stderr: Option<ChildStderr>,
+}
+
+impl ServeConnection {
+    /// Spawn `nix-store --serve --write` and exchange greetings.
+    pub async fn open(
+        nix_store: &str,
+        store_uri: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut command = Command::new(nix_store);
+        command.arg("--serve").arg("--write");
+        // Without this the build log never reaches us. `getBuildSettings` on the
+        // far side forces `lvlError`, but that is not what suppresses the log:
+        // build output is emitted via `printError` and gated on the logger's
+        // `printBuildLogs`, which only `raw-with-logs` turns on
+        // (`lix/libmain/loggers.cc:31`). Streaming logs is Phase 6 behaviour, so
+        // losing them here would be a regression.
+        command.arg("--log-format").arg("raw-with-logs");
+        if let Some(uri) = store_uri {
+            command.arg("--store").arg(uri);
+        }
+
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let mut stdin = child.stdin.take().ok_or("no stdin")?;
+        let mut stdout = child.stdout.take().ok_or("no stdout")?;
+        let stderr = child.stderr.take();
+
+        // The client writes both words before reading; the server answers with
+        // its own pair. See `lix/legacy/nix-store.cc:933`.
+        write_u64(&mut stdin, MAGIC_1).await?;
+        write_u64(&mut stdin, PROTOCOL_VERSION).await?;
+        stdin.flush().await?;
+
+        let magic = read_u64(&mut stdout).await?;
+        if magic != MAGIC_2 {
+            return Err(format!("serve protocol mismatch: got {magic:#x}").into());
+        }
+        let remote_version = read_u64(&mut stdout).await?;
+        if remote_version & 0xff00 != PROTOCOL_VERSION & 0xff00 {
+            return Err(format!("unsupported serve protocol version {remote_version:#x}").into());
+        }
+
+        tracing::debug!(version = format_args!("{remote_version:#x}"), "serve connection open");
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Build a derivation given its path and its serialized form.
+    ///
+    /// `drv` is passed through byte for byte: it is already `serializeDerivation`
+    /// output, which is exactly what the far side's `readDerivation` expects.
+    pub async fn build_derivation(
+        &mut self,
+        drv_path: &str,
+        drv: &[u8],
+    ) -> Result<BuildOutcome, Box<dyn std::error::Error>> {
+        write_u64(&mut self.stdin, CMD_BUILD_DERIVATION).await?;
+        write_str(&mut self.stdin, drv_path.as_bytes()).await?;
+        self.stdin.write_all(drv).await?;
+
+        // `getBuildSettings` on the far side reads these unconditionally, in
+        // this order (`nix-store.cc:952`). Omitting one desynchronises the
+        // stream rather than being ignored.
+        write_u64(&mut self.stdin, 0).await?; // maxSilentTime: no limit
+        write_u64(&mut self.stdin, 0).await?; // buildTimeout: no limit
+        write_u64(&mut self.stdin, 0).await?; // maxLogSize: no limit
+        write_u64(&mut self.stdin, 0).await?; // buildRepeat, unsupported upstream
+        write_u64(&mut self.stdin, 0).await?; // enforceDeterminism, ignored
+        write_u64(&mut self.stdin, 0).await?; // keepFailed (minor >= 7)
+        self.stdin.flush().await?;
+
+        let status = read_u64(&mut self.stdout).await?;
+        let error_msg = read_string(&mut self.stdout).await?;
+
+        // Protocol 2.7 always carries these; reading them keeps the stream in
+        // step even though we only report status and message.
+        let _times_built = read_u64(&mut self.stdout).await?;
+        let _non_deterministic = read_u64(&mut self.stdout).await?;
+        let _start_time = read_u64(&mut self.stdout).await?;
+        let _stop_time = read_u64(&mut self.stdout).await?;
+
+        // `builtOutputs`, a map of realisations. Empty for input-addressed
+        // derivations, which is everything we build today — but it has to be
+        // drained regardless.
+        let realisations = read_u64(&mut self.stdout).await?;
+        for _ in 0..realisations {
+            read_string(&mut self.stdout).await?; // DrvOutput
+            read_string(&mut self.stdout).await?; // Realisation
+        }
+
+        Ok(BuildOutcome { status, error_msg })
+    }
+
+    /// Close the connection and reap the child.
+    ///
+    /// Dropping stdin is what tells `nix-store --serve` to exit: it reads
+    /// commands until EOF.
+    pub async fn close(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        drop(self.stdin);
+        let status = self.child.wait().await?;
+        if !status.success() {
+            tracing::warn!(?status, "nix-store --serve exited non-zero");
+        }
+        Ok(())
+    }
+}
+
+async fn write_u64(out: &mut ChildStdin, value: u64) -> std::io::Result<()> {
+    out.write_all(&value.to_le_bytes()).await
+}
+
+/// A length-prefixed string, zero-padded to a multiple of eight.
+async fn write_str(out: &mut ChildStdin, value: &[u8]) -> std::io::Result<()> {
+    write_u64(out, value.len() as u64).await?;
+    out.write_all(value).await?;
+    let padding = (8 - value.len() % 8) % 8;
+    if padding > 0 {
+        out.write_all(&[0u8; 8][..padding]).await?;
+    }
+    Ok(())
+}
+
+async fn read_u64(input: &mut ChildStdout) -> std::io::Result<u64> {
+    let mut buf = [0u8; 8];
+    input.read_exact(&mut buf).await?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+async fn read_string(input: &mut ChildStdout) -> std::io::Result<String> {
+    let len = read_u64(input).await? as usize;
+    let mut buf = vec![0u8; len];
+    input.read_exact(&mut buf).await?;
+
+    // Skip the padding, or every later field is misaligned.
+    let padding = (8 - len % 8) % 8;
+    if padding > 0 {
+        let mut discard = [0u8; 8];
+        input.read_exact(&mut discard[..padding]).await?;
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn success_covers_every_status_that_means_the_output_exists() {
+        // `AlreadyValid` and `Substituted` are not builds, but the outputs are
+        // there — treating them as failure would break every rebuild of
+        // something already present.
+        for status in [
+            STATUS_BUILT,
+            STATUS_SUBSTITUTED,
+            STATUS_ALREADY_VALID,
+            STATUS_RESOLVES_TO_ALREADY_VALID,
+        ] {
+            let outcome = BuildOutcome {
+                status,
+                error_msg: String::new(),
+            };
+            assert!(outcome.succeeded(), "status {status} should be a success");
+        }
+    }
+
+    #[test]
+    fn failures_are_failures() {
+        for status in [3u64, 4, 5, 6, 8, 9, 10, 11, 12] {
+            let outcome = BuildOutcome {
+                status,
+                error_msg: String::new(),
+            };
+            assert!(!outcome.succeeded(), "status {status} should be a failure");
+        }
+    }
+
+    #[test]
+    fn a_status_without_a_message_still_describes_itself() {
+        let outcome = BuildOutcome {
+            status: 3,
+            error_msg: String::new(),
+        };
+        assert!(outcome.describe().contains('3'));
+
+        let outcome = BuildOutcome {
+            status: 3,
+            error_msg: "builder failed".to_string(),
+        };
+        assert_eq!(outcome.describe(), "builder failed");
+    }
+}

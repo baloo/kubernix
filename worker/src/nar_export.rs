@@ -1,0 +1,130 @@
+//! Nix `--export` format.
+//!
+//! `nix-store --import` needs more than file contents: registering a path also
+//! needs its references and deriver, and a bare NAR carries neither. The export
+//! format wraps a NAR together with that metadata.
+//!
+//! **This is built here, on the worker, rather than stored.** The object store
+//! holds exactly one representation of a path — a compressed bare NAR — because
+//! that is what `narFromPath` streams and what the binary cache serves. Wrapping
+//! it for import is a per-consumer concern, so the frontend ships the references
+//! and deriver alongside the object key (`InputRef` in `protocol/kubernix.capnp`)
+//! and the worker assembles the stream itself. Storing a second, export-shaped
+//! copy of every input would be pure duplication.
+//!
+//! Layout, from `Store::exportPath` (`lix/libstore/export-import.cc:28-58`) and
+//! `Store::importPaths`, per path:
+//!
+//! ```text
+//! u64  1                 -- 0 terminates the stream
+//! ..   <NAR bytes>
+//! u64  exportMagic       -- 0x4558494e
+//! str  store path
+//! strs references
+//! str  deriver           -- empty when unknown
+//! u64  0                 -- obsolete signature field
+//! ```
+//!
+//! then a final `u64 0`.
+
+/// `lix/libstore/store-api.hh:107`.
+const EXPORT_MAGIC: u64 = 0x4558_494e;
+
+/// Integers are little-endian u64; strings are a u64 length followed by the
+/// bytes, zero-padded to a multiple of 8.
+fn write_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_str(out: &mut Vec<u8>, value: &[u8]) {
+    write_u64(out, value.len() as u64);
+    out.extend_from_slice(value);
+    let padding = (8 - (value.len() % 8)) % 8;
+    out.extend(std::iter::repeat_n(0u8, padding));
+}
+
+/// The bytes that follow a NAR to make it an importable export stream.
+///
+/// Returned separately from the NAR so a caller can stream the NAR through
+/// without ever holding it: write the header, forward the NAR, then write this.
+pub fn trailer(store_path: &str, references: &[String], deriver: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(512);
+    write_u64(&mut out, EXPORT_MAGIC);
+    write_str(&mut out, store_path.as_bytes());
+
+    write_u64(&mut out, references.len() as u64);
+    for reference in references {
+        write_str(&mut out, reference.as_bytes());
+    }
+
+    write_str(&mut out, deriver.as_bytes());
+    write_u64(&mut out, 0);
+
+    // End of stream.
+    write_u64(&mut out, 0);
+    out
+}
+
+/// The bytes that precede the NAR: the marker saying a path follows.
+pub fn header() -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    write_u64(&mut out, 1);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const P: &str = "/nix/store/00000000000000000000000000000000-thing";
+
+    fn read_u64(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn frames_a_single_path() {
+        let header = header();
+        assert_eq!(read_u64(&header, 0), 1, "stream starts with a path marker");
+
+        let trailer = trailer(P, &[], "");
+        assert_eq!(read_u64(&trailer, 0), EXPORT_MAGIC);
+        assert_eq!(read_u64(&trailer, 8) as usize, P.len());
+        assert_eq!(&trailer[16..16 + P.len()], P.as_bytes());
+        assert_eq!(
+            read_u64(&trailer, trailer.len() - 8),
+            0,
+            "stream is terminated"
+        );
+    }
+
+    #[test]
+    fn pads_strings_to_eight_bytes() {
+        // A reader that mis-handles padding desynchronises for the rest of the
+        // stream, so assert the field *after* the path lands where it should.
+        let padding = (8 - (P.len() % 8)) % 8;
+        assert_ne!(padding, 0, "this path should exercise padding");
+
+        let trailer = trailer(P, &[], "");
+        // magic(8) + length(8) = 16, then the path itself.
+        let after_path = 16 + P.len() + padding;
+        assert_eq!(
+            read_u64(&trailer, after_path),
+            0,
+            "reference count should follow the padded path"
+        );
+    }
+
+    #[test]
+    fn carries_references_and_deriver() {
+        // Without these a worker can fetch a path's bytes but not register it,
+        // which is the whole reason they travel with the object key.
+        let dep = "/nix/store/11111111111111111111111111111111-dep".to_string();
+        let drv = "/nix/store/22222222222222222222222222222222-thing.drv";
+        let trailer = trailer(P, std::slice::from_ref(&dep), drv);
+
+        let haystack = String::from_utf8_lossy(&trailer);
+        assert!(haystack.contains(&dep), "references must survive");
+        assert!(haystack.contains(drv), "deriver must survive");
+    }
+}

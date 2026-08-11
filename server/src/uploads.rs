@@ -12,6 +12,7 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use futures_util::StreamExt;
 
 use crate::kubernix_capnp;
+use crate::tenant::TenantId;
 
 pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
 
@@ -19,14 +20,42 @@ pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
 /// output on a slow link, short enough that a leaked URL expires quickly.
 const URL_TTL: Duration = Duration::from_secs(3600);
 
-/// Keys a worker may be granted. Anything else is refused: the URLs are issued
-/// by a trusted component, so the prefix check is what stops a compromised
-/// worker from writing over unrelated objects.
-fn key_is_permitted(key: &str) -> bool {
+/// Keys a worker may be granted, for the tenant whose job it is running.
+///
+/// This is the whole access-control boundary for the object store: workers hold
+/// no credentials, so what they can reach is exactly what this function agrees
+/// to sign. Two independent things are checked, and both matter:
+///
+/// * the key belongs to `tenant` — otherwise a worker running one tenant's build
+///   could read or overwrite another's artifacts;
+/// * within that, it is an artifact namespace and not an escape.
+fn key_is_permitted(key: &str, download: bool, tenant: &TenantId) -> bool {
     if key.contains("..") || key.starts_with('/') {
         return false;
     }
-    key.starts_with("nar/") || key.starts_with("log/")
+
+    // Match the separator too: a prefix test alone would let tenant `a` reach
+    // tenant `ab`'s keys.
+    let Some(rest) = key.strip_prefix(&format!("{tenant}/")) else {
+        return false;
+    };
+
+    if download {
+        // Workers read the inputs staged for a build, and may read back
+        // artifacts they or a previous build for this tenant wrote. Both are
+        // `nar/`: a path has exactly one representation in the object store.
+        //
+        // `untrusted/nar/` is included deliberately — quarantined content is
+        // exactly what a worker must still be able to build against, and
+        // confining it to this tenant is what makes that safe. Quarantine limits
+        // who may *rely* on a path, not who may build with it.
+        rest.starts_with("nar/") || rest.starts_with("untrusted/nar/") || rest.starts_with("log/")
+    } else {
+        // Workers only ever write their own build products, which are `built` by
+        // definition — so never under `untrusted/`, and never a path the
+        // frontend staged, which it writes itself with credentials it holds.
+        rest.starts_with("nar/") || rest.starts_with("log/")
+    }
 }
 
 #[derive(Clone)]
@@ -63,6 +92,26 @@ impl UploadSigner {
         Ok(Self { s3, bucket })
     }
 
+    /// Write an object directly. Used for inputs, which arrive at the frontend
+    /// over the daemon connection — the frontend already holds the bytes and the
+    /// credentials, so there is nothing to delegate.
+    pub async fn put_object(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let len = body.len();
+        self.s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body.into())
+            .send()
+            .await?;
+        tracing::debug!(%key, bytes = len, "uploaded object");
+        Ok(())
+    }
+
     pub async fn presign_put(
         &self,
         key: &str,
@@ -70,6 +119,62 @@ impl UploadSigner {
         let presigned = self
             .s3
             .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .presigned(PresigningConfig::expires_in(URL_TTL)?)
+            .await?;
+        Ok(presigned.uri().to_string())
+    }
+
+    /// Read an object back as a stream.
+    ///
+    /// Preferred over [`Self::get_object`] for anything artifact-sized: the
+    /// caller can decompress and forward as bytes arrive, so peak memory does
+    /// not scale with the object.
+    pub async fn get_object_reader(
+        &self,
+        key: &str,
+    ) -> Result<impl tokio::io::AsyncRead + Unpin + Send, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let object = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+        Ok(object.body.into_async_read())
+    }
+
+    /// Read an object back, whole.
+    ///
+    /// Only for things known to be small — a build log. Artifacts should use
+    /// [`Self::get_object_reader`].
+    pub async fn get_object(
+        &self,
+        key: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let object = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+        let bytes = object.body.collect().await?.into_bytes();
+        tracing::debug!(%key, bytes = bytes.len(), "fetched object");
+        Ok(bytes.to_vec())
+    }
+
+    /// The same capability model in the read direction: workers fetch staged
+    /// inputs with these rather than holding credentials.
+    pub async fn presign_get(
+        &self,
+        key: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let presigned = self
+            .s3
+            .get_object()
             .bucket(&self.bucket)
             .key(key)
             .presigned(PresigningConfig::expires_in(URL_TTL)?)
@@ -119,32 +224,49 @@ impl UploadSigner {
         // Decode to owned values first. capnp readers are !Send, and holding one
         // across the presigning awaits would make this future !Send — which it
         // cannot be, since it runs under tokio::spawn.
-        let (job_id, keys) = decode_request(payload)?;
+        let (job_id, keys, download, tenant) = decode_request(payload)?;
+
+        // A request that names no tenant cannot be scoped, so it cannot be
+        // safely honoured at all.
+        let Some(tenant) = tenant else {
+            tracing::warn!(%job_id, "refusing url request with no tenant");
+            return Err("request names no tenant".to_string());
+        };
 
         // Validate every key before signing any: a request containing one
         // disallowed key is refused whole rather than partially honoured.
         for key in &keys {
-            if !key_is_permitted(key) {
-                tracing::warn!(%job_id, %key, "refusing upload url for disallowed key");
+            if !key_is_permitted(key, download, &tenant) {
+                tracing::warn!(%job_id, %tenant, %key, download, "refusing url for disallowed key");
                 return Err(format!("key not permitted: {key}"));
             }
         }
 
         let mut urls = Vec::with_capacity(keys.len());
         for key in &keys {
-            let url = self
-                .presign_put(key)
-                .await
-                .map_err(|e| format!("presigning {key}: {e}"))?;
+            let url = if download {
+                self.presign_get(key).await
+            } else {
+                self.presign_put(key).await
+            }
+            .map_err(|e| format!("presigning {key}: {e}"))?;
             urls.push(url);
         }
 
-        tracing::info!(%job_id, count = urls.len(), "issued pre-signed upload urls");
+        tracing::info!(
+            %job_id,
+            %tenant,
+            count = urls.len(),
+            direction = if download { "download" } else { "upload" },
+            "issued pre-signed urls"
+        );
         Ok(urls)
     }
 }
 
-fn decode_request(payload: &[u8]) -> Result<(String, Vec<String>), String> {
+type UrlRequest = (String, Vec<String>, bool, Option<TenantId>);
+
+fn decode_request(payload: &[u8]) -> Result<UrlRequest, String> {
     let mut cursor = payload;
     let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
         .map_err(|e| format!("undecodable request: {e}"))?;
@@ -158,6 +280,12 @@ fn decode_request(payload: &[u8]) -> Result<(String, Vec<String>), String> {
         .and_then(|t| t.to_string().ok())
         .unwrap_or_default();
 
+    let tenant = request
+        .get_tenant()
+        .ok()
+        .and_then(|t| t.to_string().ok())
+        .and_then(TenantId::from_wire);
+
     let mut keys = Vec::new();
     for key in request.get_keys().map_err(|e| e.to_string())?.iter() {
         keys.push(
@@ -166,7 +294,7 @@ fn decode_request(payload: &[u8]) -> Result<(String, Vec<String>), String> {
                 .map_err(|e| e.to_string())?,
         );
     }
-    Ok((job_id, keys))
+    Ok((job_id, keys, request.get_download(), tenant))
 }
 
 fn encode_response(response: &Result<Vec<String>, String>) -> capnp::Result<Vec<u8>> {
@@ -190,21 +318,165 @@ fn encode_response(response: &Result<Vec<String>, String>) -> capnp::Result<Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::key_is_permitted;
+    use super::*;
+
+    const UPLOAD: bool = false;
+    const DOWNLOAD: bool = true;
+
+    fn tenant(name: &str) -> TenantId {
+        crate::tenant::Tenant::from_ssh(name, None, false).id
+    }
+
+    const P: &str = "/nix/store/00000000000000000000000000000000-thing";
+
+    /// `<tenant>/<suffix>`, as the frontend and worker both build them.
+    fn key(t: &TenantId, suffix: &str) -> String {
+        format!("{t}/{suffix}")
+    }
 
     #[test]
     fn permits_artifact_keys() {
-        assert!(key_is_permitted("nar/abc123.nar.zst"));
-        assert!(key_is_permitted("log/def456"));
+        let t = tenant("alice");
+        assert!(key_is_permitted(&key(&t, "nar/abc123.nar.zst"), UPLOAD, &t));
+        assert!(key_is_permitted(&key(&t, "log/def456"), UPLOAD, &t));
     }
 
     #[test]
     fn refuses_anything_else() {
         // A worker must not be able to write outside the artifact namespaces,
         // escape them, or address the bucket root.
-        assert!(!key_is_permitted("secrets/creds"));
-        assert!(!key_is_permitted("nar/../secrets/creds"));
-        assert!(!key_is_permitted("/nar/abc"));
-        assert!(!key_is_permitted(""));
+        let t = tenant("alice");
+        assert!(!key_is_permitted(&key(&t, "secrets/creds"), UPLOAD, &t));
+        assert!(!key_is_permitted(
+            &key(&t, "nar/../secrets/creds"),
+            UPLOAD,
+            &t
+        ));
+        assert!(!key_is_permitted("/nar/abc", UPLOAD, &t));
+        assert!(!key_is_permitted("", UPLOAD, &t));
+        // Unprefixed keys are the pre-tenancy shape and must no longer pass.
+        assert!(!key_is_permitted("nar/abc123.nar.zst", UPLOAD, &t));
+    }
+
+    #[test]
+    fn inputs_and_outputs_share_one_namespace() {
+        // A path has exactly one representation in the object store, so the
+        // input a worker fetches and the output it writes are the same shape and
+        // the same prefix. There is no longer an `input/` namespace to separate.
+        let t = tenant("alice");
+        let key = key(&t, "nar/abc.nar.zst");
+        assert!(key_is_permitted(&key, DOWNLOAD, &t));
+        assert!(key_is_permitted(&key, UPLOAD, &t));
+
+        // What a worker still may not write is anything the frontend vouches
+        // differently for.
+        assert!(!key_is_permitted(
+            &crate::store::nar_key(&t, crate::store::Tier::Quarantined, P).unwrap(),
+            UPLOAD,
+            &t
+        ));
+    }
+
+    #[test]
+    fn escapes_are_refused_in_both_directions() {
+        let t = tenant("alice");
+        assert!(!key_is_permitted(
+            &key(&t, "nar/../secrets/creds"),
+            DOWNLOAD,
+            &t
+        ));
+        assert!(!key_is_permitted(&key(&t, "secrets/creds"), DOWNLOAD, &t));
+    }
+
+    #[test]
+    fn quarantined_inputs_are_still_readable_by_a_worker() {
+        // Quarantine limits who may *rely* on a path, not who may build with it.
+        // Refusing this would break every build whose inputs are ordinary
+        // input-addressed store paths, which is most of them.
+        let t = tenant("alice");
+        assert!(key_is_permitted(
+            &key(&t, "untrusted/nar/abc.nar.zst"),
+            DOWNLOAD,
+            &t
+        ));
+        // But a worker never writes there: its own outputs are `built`.
+        assert!(!key_is_permitted(
+            &key(&t, "untrusted/nar/abc.nar.zst"),
+            UPLOAD,
+            &t
+        ));
+        assert!(!key_is_permitted(
+            &key(&t, "untrusted/nar/abc.nar.zst"),
+            UPLOAD,
+            &t
+        ));
+        // And it is still confined to its tenant.
+        assert!(!key_is_permitted(
+            &key(&t, "untrusted/nar/abc.nar.zst"),
+            DOWNLOAD,
+            &tenant("bob")
+        ));
+    }
+
+    #[test]
+    fn a_worker_cannot_reach_another_tenants_artifacts() {
+        // The point of the whole phase: a worker running alice's job holds a
+        // capability for alice's keys and nothing else, in either direction.
+        let (alice, bob) = (tenant("alice"), tenant("bob"));
+        let bobs_nar = key(&bob, "nar/abc123.nar.zst");
+
+        assert!(key_is_permitted(&bobs_nar, DOWNLOAD, &bob));
+        assert!(!key_is_permitted(&bobs_nar, DOWNLOAD, &alice));
+        assert!(!key_is_permitted(&bobs_nar, UPLOAD, &alice));
+        assert!(!key_is_permitted(
+            &key(&bob, "nar/abc.nar.zst"),
+            DOWNLOAD,
+            &alice
+        ));
+    }
+
+    #[test]
+    fn a_tenant_is_not_a_prefix_of_another() {
+        // Without matching the separator, tenant `a` would be granted every key
+        // belonging to `ab`. Ids are hash-suffixed so this cannot arise from
+        // `from_ssh`, but the check must not depend on that.
+        let a = TenantId::from_wire("a").expect("well formed");
+        let ab = TenantId::from_wire("ab").expect("well formed");
+        assert!(!key_is_permitted("ab/nar/x.nar.zst", DOWNLOAD, &a));
+        assert!(key_is_permitted("ab/nar/x.nar.zst", DOWNLOAD, &ab));
+    }
+
+    #[test]
+    fn a_request_without_a_tenant_is_refused() {
+        // Decoding yields None for an absent or malformed tenant, and `handle`
+        // refuses rather than falling back to an unscoped grant.
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut request =
+                message.init_root::<kubernix_capnp::upload_url_request::Builder>();
+            request.set_job_id("job");
+            request.reborrow().init_keys(1).set(0, "nar/x.nar.zst");
+        }
+        let mut payload = Vec::new();
+        capnp::serialize::write_message(&mut payload, &message).unwrap();
+
+        let (_, _, _, tenant) = decode_request(&payload).expect("decodable");
+        assert!(tenant.is_none());
+    }
+
+    #[test]
+    fn a_malformed_wire_tenant_decodes_to_none() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut request =
+                message.init_root::<kubernix_capnp::upload_url_request::Builder>();
+            request.set_job_id("job");
+            request.set_tenant("../escape");
+        }
+        let mut payload = Vec::new();
+        capnp::serialize::write_message(&mut payload, &message).unwrap();
+
+        let (_, _, _, tenant) = decode_request(&payload).expect("decodable");
+        assert!(tenant.is_none(), "an escaping tenant must not be honoured");
     }
 }
