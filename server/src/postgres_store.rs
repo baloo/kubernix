@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use sha2::{Sha256, digest::Output};
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -169,7 +170,7 @@ impl PostgresStore {
         )
         .bind(object.key.as_str())
         .bind(object.file_size as i64)
-        .bind(object.file_hash.as_slice())
+        .bind(&object.file_hash[..])
         .execute(&mut *txn)
         .await
         .map_err(db_err)?;
@@ -341,7 +342,8 @@ impl Store for PostgresStore {
         Some(RemoteObject {
             key: ObjectKey::new(row.get::<String, _>("key")),
             file_size: row.get::<i64, _>("file_size") as u64,
-            file_hash: row.get("file_hash"),
+            file_hash: Output::<Sha256>::try_from(row.get::<Vec<u8>, _>("file_hash").as_slice())
+                .expect("file_hash column is always a sha256 digest"),
         })
     }
 
@@ -551,7 +553,7 @@ mod tests {
         RemoteObject {
             key: ObjectKey::new(key),
             file_size: 3,
-            file_hash: vec![9; 32],
+            file_hash: Output::<Sha256>::from([9u8; 32]),
         }
     }
 
@@ -645,7 +647,7 @@ mod tests {
                 RemoteObject {
                     key: ObjectKey::new(key),
                     file_size: 99,
-                    file_hash: vec![0xcd; 32],
+                    file_hash: Output::<Sha256>::from([0xcdu8; 32]),
                 },
                 Tier::Built,
             )
@@ -659,7 +661,7 @@ mod tests {
         assert_eq!(remote.file_size, 99);
         // The compressed hash must survive: it is what a narinfo `FileHash`
         // states, and a client verifies its download against it.
-        assert_eq!(remote.file_hash, vec![0xcd; 32]);
+        assert_eq!(remote.file_hash, Output::<Sha256>::from([0xcdu8; 32]));
     }
 
     #[tokio::test]
@@ -836,7 +838,7 @@ mod tests {
                 crate::store::RemoteObject {
                     key: ObjectKey::new(shared_key),
                     file_size: 111,
-                    file_hash: vec![1; 32],
+                    file_hash: Output::<Sha256>::from([1u8; 32]),
                 },
                 Tier::Verified,
             )
@@ -851,7 +853,7 @@ mod tests {
                 crate::store::RemoteObject {
                     key: ObjectKey::new(shared_key),
                     file_size: 222,
-                    file_hash: vec![2; 32],
+                    file_hash: Output::<Sha256>::from([2u8; 32]),
                 },
                 Tier::Verified,
             )
@@ -860,7 +862,7 @@ mod tests {
 
         let bobs_view = store.output_object(&bob, &p()).await.unwrap();
         assert_eq!(bobs_view.file_size, 111);
-        assert_eq!(bobs_view.file_hash, vec![1; 32]);
+        assert_eq!(bobs_view.file_hash, Output::<Sha256>::from([1u8; 32]));
     }
 
     #[tokio::test]

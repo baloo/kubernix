@@ -160,7 +160,7 @@ async fn record_outputs(store: &dyn Store, tenant: &TenantId, infos: &[crate::jo
             deriver: info.deriver.clone(),
             nar_hash: Hash {
                 hash_type: HashType::Sha256,
-                bytes: info.nar_hash.clone(),
+                bytes: info.nar_hash.to_vec(),
             },
             nar_size: info.nar_size,
             references: info.references.clone(),
@@ -1287,7 +1287,7 @@ impl legacy_protocol::stream::Server for NarSink {
             let compressed = zstd::stream::encode_all(nar.as_slice(), 3)
                 .map_err(|e| rpc_error::failed(format!("compressing {}: {e}", self.info.path)))?;
             let file_size = compressed.len() as u64;
-            let file_hash = <sha2::Sha256 as sha2::Digest>::digest(&compressed).to_vec();
+            let file_hash = <sha2::Sha256 as sha2::Digest>::digest(&compressed);
 
             // A `Verified` key carries no tenant prefix (PLAN.md Phase 9c), so
             // another tenant pushing the same content may already have put
@@ -1394,7 +1394,7 @@ mod tests {
         crate::store::RemoteObject {
             key: kubernix_types::ObjectKey::new(key),
             file_size: 0,
-            file_hash: Vec::new(),
+            file_hash: Default::default(),
         }
     }
 

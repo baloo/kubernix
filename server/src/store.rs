@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use kubernix_signing::{LocalSigner, Signer, key_name_for};
 use kubernix_types::{ObjectKey, StorePath};
+use sha2::{Sha256, digest::Output};
 
 use crate::tenant::TenantId;
 
@@ -319,7 +320,7 @@ pub struct RemoteObject {
     /// Hash of the *compressed* object, which is what a narinfo `FileHash`
     /// states and what a client checks the download against. Distinct from
     /// `PathInfo::nar_hash`, which describes the uncompressed NAR.
-    pub file_hash: Vec<u8>,
+    pub file_hash: Output<Sha256>,
 }
 
 impl MemoryStore {
@@ -511,7 +512,7 @@ mod tests {
         RemoteObject {
             key: ObjectKey::new(key),
             file_size: 3,
-            file_hash: vec![1; 32],
+            file_hash: Output::<Sha256>::from([1u8; 32]),
         }
     }
 

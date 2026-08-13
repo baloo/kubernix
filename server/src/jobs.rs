@@ -17,6 +17,7 @@ use std::time::Duration;
 use async_nats::jetstream::{self, consumer::pull, stream::RetentionPolicy};
 use futures_util::StreamExt;
 use kubernix_types::{ObjectKey, StorePath, System};
+use sha2::{Sha256, digest::Output};
 use uuid::Uuid;
 
 use crate::kubernix_capnp;
@@ -69,9 +70,9 @@ pub struct BuildJob {
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
     pub store_path: StorePath,
-    pub nar_hash: Vec<u8>,
+    pub nar_hash: Output<Sha256>,
     pub nar_size: u64,
-    pub file_hash: Vec<u8>,
+    pub file_hash: Output<Sha256>,
     pub file_size: u64,
     pub key: ObjectKey,
     pub compression: String,
@@ -260,9 +261,9 @@ pub fn decode_outcome(
                 let deriver = info.get_deriver()?.to_string()?;
                 infos.push(OutputInfo {
                     store_path: StorePath::new(info.get_store_path()?.to_string()?),
-                    nar_hash: info.get_nar_hash()?.to_vec(),
+                    nar_hash: Output::<Sha256>::try_from(info.get_nar_hash()?)?,
                     nar_size: info.get_nar_size(),
-                    file_hash: info.get_file_hash()?.to_vec(),
+                    file_hash: Output::<Sha256>::try_from(info.get_file_hash()?)?,
                     file_size: info.get_file_size(),
                     key: ObjectKey::new(info.get_key()?.to_string()?),
                     compression: info.get_compression()?.to_string()?,
