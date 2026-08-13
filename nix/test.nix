@@ -62,9 +62,15 @@ pkgs.testers.nixosTest {
     imports = [ ./module.nix ];
 
     # The VM builds a derivation of its own and runs a Nix client, so it needs
-    # room and cores.
+    # room and cores. Cores matter more than the comment used to suggest: the
+    # frontend spawns a dedicated OS thread with its own single-threaded Tokio
+    # runtime per SSH connection (capnp-rpc capabilities are `!Send`, PLAN.md
+    # Phase 4), so on a single vCPU one connection's thread can go unscheduled
+    # long enough that even its own 30s DB pool-acquire timeout never gets
+    # polled -- a bounded wait silently becomes an unbounded hang under load.
     virtualisation.memorySize = 4096;
     virtualisation.diskSize = 8192;
+    virtualisation.cores = 4;
 
     environment.systemPackages = [
       pkgs.lix
@@ -72,6 +78,8 @@ pkgs.testers.nixosTest {
       pkgs.openssh
       pkgs.jq
     ];
+
+    nix.settings.experimental-features = [ "nix-command" ];
 
     services.nats = {
       enable = true;
@@ -127,8 +135,6 @@ pkgs.testers.nixosTest {
   };
 
   testScript = ''
-    import json
-
     plugin = "${kubernix-plugin}/lib/lix/plugins/kubernix.so"
     ssh_opts = "${sshOpts}"
 
@@ -229,7 +235,7 @@ pkgs.testers.nixosTest {
         # Built locally, then pushed: input-addressed, so its path cannot be
         # derived from its content and the frontend has to take it on trust.
         pushed = machine.succeed(
-            f"nix build -f ${unverifiable} --no-link --print-out-paths"
+            "nix build -f ${unverifiable} --no-link --print-out-paths"
         ).strip()
         machine.succeed(
             f"NIX_SSHOPTS='{ssh_opts}' nix --plugin-files {plugin} copy "

@@ -483,9 +483,11 @@ impl legacy_boot::Server for LegacyBootImpl {
             // channel: the frontend will pump `kubernix.logs.<job_id>` into it.
             let logger = params.get()?.get_logger()?;
 
+            tracing::debug!(tenant = %tenant.id, "init: registering tenant");
             if let Err(e) = store.register_tenant(&tenant).await {
                 tracing::error!(tenant = %tenant.id, error = %e, "could not register tenant");
             }
+            tracing::debug!(tenant = %tenant.id, "init: tenant registered");
 
             let proto: legacy_protocol::Client =
                 capnp_rpc::new_client(LegacyProtocolImpl {

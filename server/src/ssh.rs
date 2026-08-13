@@ -229,6 +229,7 @@ impl Handler for SshHandler {
         // thread with its own current-thread runtime and LocalSet. The stream
         // itself is Send, which is what makes this bridge possible.
         std::thread::spawn(move || {
+            tracing::debug!(?channel_id, "rpc thread starting");
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -240,8 +241,10 @@ impl Handler for SshHandler {
                 }
             };
 
+            tracing::debug!(?channel_id, "rpc runtime built, entering event loop");
             let local = tokio::task::LocalSet::new();
             let result = local.block_on(&runtime, serve_rpc(stream, rpc_config));
+            tracing::debug!(?channel_id, ?result, "rpc event loop returned");
 
             match result {
                 Ok(()) => tracing::info!("rpc session ended"),
