@@ -34,6 +34,33 @@ CREATE TABLE IF NOT EXISTS tenants (
     signing_public_key   BYTEA
 );
 
+-- The bytes behind a path, addressed by object-store key. Split out from
+-- `store_paths` (PLAN.md Phase 9c / Phase 12) so that two rows can point at
+-- the same object: a `Verified` path is content-addressed, so identical
+-- content pushed by two tenants is *the same bytes* under `nar_key`'s scheme
+-- (no tenant prefix for that tier), and there is no reason to store it twice.
+-- `Built` and `Quarantined` stay tenant-prefixed, so this table holds their
+-- objects too but never dedups them — one row each, same as before.
+--
+-- `file_size`/`file_hash` moved here from `store_paths` because they describe
+-- the *object*, not the path: once two paths can share one, a column on the
+-- shared row is what makes disagreeing about its hash unrepresentable rather
+-- than merely unlikely.
+--
+-- Referrer counting (Phase 12) is an anti-join over `store_paths.object_key`,
+-- never a stored counter — a counter has to be maintained correctly by every
+-- writer and crash path, and there is no way to audit one after it drifts.
+CREATE TABLE IF NOT EXISTS objects (
+    key        TEXT PRIMARY KEY,
+    file_size  BIGINT NOT NULL,
+    -- Hash of the *compressed* object, which is what a narinfo `FileHash`
+    -- states and what a client verifies its download against. Distinct from
+    -- `store_paths.nar_hash`, which describes the uncompressed NAR — emitting
+    -- one where the other is meant makes every substitution fail.
+    file_hash  BYTEA  NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- One row per valid path. This is simultaneously what `queryPathInfo` answers
 -- from and what a narinfo is generated from; they must not become two sources
 -- of truth.
@@ -58,14 +85,9 @@ CREATE TABLE IF NOT EXISTS store_paths (
     sigs              TEXT[] NOT NULL DEFAULT '{}',
 
     -- Where the bytes are. The database never holds them: every path, however
-    -- it arrived, is a zstd-compressed bare NAR in the object store.
-    object_key        TEXT,
-    file_size         BIGINT,
-    -- Hash of the *compressed* object, which is what a narinfo `FileHash` states
-    -- and what a client verifies its download against. Distinct from `nar_hash`,
-    -- which describes the uncompressed NAR — emitting one where the other is
-    -- meant makes every substitution fail.
-    file_hash         BYTEA,
+    -- it arrived, is a zstd-compressed bare NAR in the object store, recorded
+    -- once in `objects` and pointed at from here.
+    object_key        TEXT REFERENCES objects(key),
 
     -- How much the frontend can vouch for this path (PLAN.md Phase 9):
     --   verified    - the path was recomputed from the bytes
@@ -78,6 +100,11 @@ CREATE TABLE IF NOT EXISTS store_paths (
 
     PRIMARY KEY (tenant, path)
 );
+
+-- `output_object` and the referrer anti-join both go from a path to its
+-- object; without this it is a sequential scan of `store_paths` for either.
+CREATE INDEX IF NOT EXISTS store_paths_object_key
+    ON store_paths (object_key);
 
 CREATE INDEX IF NOT EXISTS store_paths_hash_part
     ON store_paths (tenant, hash_part);

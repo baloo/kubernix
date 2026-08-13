@@ -281,7 +281,7 @@ run-db db_name="kubernix" port="5433":
     trap 'echo "Cleaning up $dir..."; rm -rf "$dir"' EXIT
 
     echo "Initializing database in $dir..."
-    nix-shell -p postgresql --run "
+    nix-shell -I nixpkgs=./nix/nixpkgs.nix -p postgresql --run "
         set -euo pipefail
         initdb -D \"$dir/db\" -U postgres >/dev/null
 

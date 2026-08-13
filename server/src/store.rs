@@ -200,6 +200,15 @@ pub trait Store: Send + Sync {
     /// implementation free of an object-store client.
     async fn output_object(&self, tenant: &TenantId, path: &str) -> Option<RemoteObject>;
 
+    /// Whether an object key is already recorded.
+    ///
+    /// Read before uploading a `Verified` path: if another tenant already
+    /// pushed identical content, `nar_key` computed the same key and the bytes
+    /// are already in the object store — PLAN.md Phase 9c. Skipping the upload
+    /// is the actual saving; `record_path`'s own dedup keeps the database
+    /// correct either way, so this is an optimisation, not a safety check.
+    async fn object_known(&self, key: &str) -> bool;
+
     async fn add_signatures(&self, tenant: &TenantId, path: &str, sigs: Vec<String>) -> Result<()>;
 
     /// Split `paths` into what would need building versus what is already there.
@@ -247,6 +256,11 @@ pub struct MissingPaths {
 #[derive(Default)]
 pub struct MemoryStore {
     inner: Mutex<HashMap<TenantId, Inner>>,
+    /// Objects by key, shared across tenants rather than living inside
+    /// `Inner` — mirroring `PostgresStore`'s `objects` table, which is what
+    /// makes a `Verified` key collision between two tenants a dedup rather
+    /// than two independent objects. See [`Store::object_known`].
+    objects: Mutex<HashMap<String, RemoteObject>>,
 }
 
 /// One tenant's view. Partitioned rather than keyed by `(tenant, path)` so that
@@ -268,24 +282,32 @@ struct Inner {
 
 /// Object key for a path's compressed NAR.
 ///
-/// Tenant-scoped, because the key is what a pre-signed URL grants access to and
-/// the same store path may hold different bytes for two tenants until pushes can
-/// be verified.
+/// `Built` and `Quarantined` are tenant-scoped, because the key is what a
+/// pre-signed URL grants access to and the same store path may hold different
+/// bytes for two tenants until pushes can be verified. A quarantined path is
+/// additionally segregated under `untrusted/`. The tenant prefix is what the
+/// signing check actually enforces, so this is not itself a control — but it
+/// is what the HTTP surface routes on when refusing to serve unverifiable
+/// content, and it makes the distinction visible in the bucket rather than
+/// only in the database.
 ///
-/// A quarantined path is additionally segregated under `untrusted/`. The tenant
-/// prefix is what the signing check actually enforces, so this is not itself a
-/// control — but it is what the HTTP surface routes on when refusing to serve
-/// unverifiable content, and it makes the distinction visible in the bucket
-/// rather than only in the database.
+/// `Verified` carries no tenant prefix at all — PLAN.md Phase 9c. A verified
+/// path's identity *is* its content (that is what verification checked), so
+/// two tenants pushing the same content compute the same key and share the
+/// one object rather than paying for it twice. Sharing the bytes is not
+/// sharing validity: each tenant's `store_paths` row is unaffected, and
+/// `key_is_permitted` still decides who may fetch this key.
 pub fn nar_key(tenant: &TenantId, tier: Tier, store_path: &str) -> Option<String> {
     let base = store_path.rsplit('/').next()?;
     let hash = base.split('-').next()?;
-    let scope = if tier.is_vouchable() {
-        ""
-    } else {
-        "untrusted/"
-    };
-    (hash.len() == 32).then(|| format!("{tenant}/{scope}nar/{hash}.nar.zst"))
+    if hash.len() != 32 {
+        return None;
+    }
+    Some(match tier {
+        Tier::Verified => format!("nar/{hash}.nar.zst"),
+        Tier::Built => format!("{tenant}/nar/{hash}.nar.zst"),
+        Tier::Quarantined => format!("{tenant}/untrusted/nar/{hash}.nar.zst"),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -385,6 +407,11 @@ impl Store for MemoryStore {
             tier = tier.as_str(),
             "recorded path"
         );
+        self.objects
+            .lock()
+            .unwrap()
+            .entry(object.key.clone())
+            .or_insert_with(|| object.clone());
         self.write(tenant, |inner| {
             inner.remote.insert(info.path.clone(), object);
             inner.tiers.insert(info.path.clone(), tier);
@@ -395,6 +422,10 @@ impl Store for MemoryStore {
 
     async fn output_object(&self, tenant: &TenantId, path: &str) -> Option<RemoteObject> {
         self.read(tenant, |inner| inner.remote.get(path).cloned())
+    }
+
+    async fn object_known(&self, key: &str) -> bool {
+        self.objects.lock().unwrap().contains_key(key)
     }
 
     async fn add_signatures(&self, tenant: &TenantId, path: &str, sigs: Vec<String>) -> Result<()> {
@@ -650,10 +681,10 @@ mod tests {
     #[test]
     fn nar_keys_are_scoped_by_tenant_and_tier() {
         let alice = tenant("alice");
-        let verified = nar_key(&alice, Tier::Verified, P).expect("a key");
+        let built = nar_key(&alice, Tier::Built, P).expect("a key");
         let quarantined = nar_key(&alice, Tier::Quarantined, P).expect("a key");
 
-        assert!(verified.starts_with(&format!("{alice}/nar/")));
+        assert!(built.starts_with(&format!("{alice}/nar/")));
         assert!(
             quarantined.contains("/untrusted/nar/"),
             "unverifiable content should be visibly separated: {quarantined}"
@@ -662,8 +693,22 @@ mod tests {
         // enforces — `untrusted/` is a routing marker, not the control.
         assert!(quarantined.starts_with(&format!("{alice}/")));
 
-        // Two tenants may hold different bytes at one path, so keys must differ.
-        assert_ne!(verified, nar_key(&tenant("bob"), Tier::Verified, P).unwrap());
-        assert_eq!(nar_key(&alice, Tier::Verified, "/etc/passwd"), None);
+        // Two tenants running their own builds hold independent bytes at one
+        // path, so their `Built` keys must differ.
+        assert_ne!(built, nar_key(&tenant("bob"), Tier::Built, P).unwrap());
+        assert_eq!(nar_key(&alice, Tier::Built, "/etc/passwd"), None);
+    }
+
+    #[test]
+    fn verified_keys_carry_no_tenant_and_are_shared() {
+        // PLAN.md Phase 9c: a verified path's identity is its content, so two
+        // tenants pushing the same content must compute the same key — that
+        // convergence is the whole saving.
+        let (alice, bob) = (tenant("alice"), tenant("bob"));
+        let key = nar_key(&alice, Tier::Verified, P).expect("a key");
+
+        assert_eq!(key, nar_key(&bob, Tier::Verified, P).unwrap());
+        assert!(!key.contains(alice.as_str()));
+        assert!(key.starts_with("nar/"));
     }
 }

@@ -1268,20 +1268,37 @@ impl legacy_protocol::stream::Server for NarSink {
             let file_size = compressed.len() as u64;
             let file_hash = <sha2::Sha256 as sha2::Digest>::digest(&compressed).to_vec();
 
-            tracing::debug!(
-                path = %self.info.path,
-                %key,
-                nar_bytes = nar.len(),
-                object_bytes = file_size,
-                "storing pushed path in the object store"
-            );
+            // A `Verified` key carries no tenant prefix (PLAN.md Phase 9c), so
+            // another tenant pushing the same content may already have put
+            // these exact bytes at this exact key. Recomputing and
+            // re-uploading them would be correct but wasteful — this is the
+            // saving the sharing exists for. `Built`/`Quarantined` keys are
+            // tenant-scoped and effectively never collide, so they always
+            // upload as before.
+            let already_there = matches!(tier, Tier::Verified) && self.store.object_known(&key).await;
 
-            // Uploaded before the row is written, so a failure here cannot leave
-            // a path registered with no bytes behind it.
-            uploader
-                .put_object(&key, compressed)
-                .await
-                .map_err(|e| rpc_error::failed(format!("uploading {}: {e}", self.info.path)))?;
+            if already_there {
+                tracing::debug!(
+                    path = %self.info.path,
+                    %key,
+                    "content already in the object store under this shared key; skipping upload"
+                );
+            } else {
+                tracing::debug!(
+                    path = %self.info.path,
+                    %key,
+                    nar_bytes = nar.len(),
+                    object_bytes = file_size,
+                    "storing pushed path in the object store"
+                );
+
+                // Uploaded before the row is written, so a failure here cannot
+                // leave a path registered with no bytes behind it.
+                uploader
+                    .put_object(&key, compressed)
+                    .await
+                    .map_err(|e| rpc_error::failed(format!("uploading {}: {e}", self.info.path)))?;
+            }
 
             // Signed here, on the way in, so the signature lands in the same row
             // as the path. A verified push is one we derived ourselves, so it is

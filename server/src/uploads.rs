@@ -20,6 +20,16 @@ pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
 /// output on a slow link, short enough that a leaked URL expires quickly.
 const URL_TTL: Duration = Duration::from_secs(3600);
 
+/// A `Verified` path's shared object key — `nar/<hash>.nar.zst`, no tenant
+/// prefix — PLAN.md Phase 9c. Checked structurally rather than trusted: the
+/// shape is what `nar_key` promises to produce, not what any caller asserts.
+fn is_shared_verified_key(key: &str) -> bool {
+    let Some(hash) = key.strip_prefix("nar/").and_then(|r| r.strip_suffix(".nar.zst")) else {
+        return false;
+    };
+    hash.len() == 32 && kubernix_signing::base32::is_valid(hash)
+}
+
 /// Keys a worker may be granted, for the tenant whose job it is running.
 ///
 /// This is the whole access-control boundary for the object store: workers hold
@@ -32,6 +42,16 @@ const URL_TTL: Duration = Duration::from_secs(3600);
 fn key_is_permitted(key: &str, download: bool, tenant: &TenantId) -> bool {
     if key.contains("..") || key.starts_with('/') {
         return false;
+    }
+
+    // A `Verified` object carries no tenant prefix at all, by design: it is
+    // shared by every tenant that pushed the same content. Downloading one
+    // requires already knowing its key, which requires already knowing the
+    // content hash, so this grants nothing a tenant could not already prove
+    // it has — never for upload, since only the frontend writes these
+    // directly with its own credentials; a worker never should.
+    if download && is_shared_verified_key(key) {
+        return true;
     }
 
     // Match the separator too: a prefix test alone would let tenant `a` reach
@@ -356,6 +376,41 @@ mod tests {
         assert!(!key_is_permitted("", UPLOAD, &t));
         // Unprefixed keys are the pre-tenancy shape and must no longer pass.
         assert!(!key_is_permitted("nar/abc123.nar.zst", UPLOAD, &t));
+    }
+
+    #[test]
+    fn a_verified_objects_shared_key_is_downloadable_by_any_tenant() {
+        // PLAN.md Phase 9c: a `Verified` object carries no tenant prefix, so
+        // this is the one key shape that must NOT require the tenant match —
+        // any tenant whose job needs it as an input may fetch it.
+        let (alice, bob) = (tenant("alice"), tenant("bob"));
+        let shared = crate::store::nar_key(&alice, crate::store::Tier::Verified, P).unwrap();
+
+        assert!(key_is_permitted(&shared, DOWNLOAD, &alice));
+        assert!(key_is_permitted(&shared, DOWNLOAD, &bob));
+
+        // But never for upload: only the frontend writes these, directly,
+        // with its own credentials. A worker asking to *write* the shared
+        // prefix is not making a legitimate request.
+        assert!(!key_is_permitted(&shared, UPLOAD, &alice));
+        assert!(!key_is_permitted(&shared, UPLOAD, &bob));
+    }
+
+    #[test]
+    fn a_shared_looking_key_must_still_be_a_real_hash() {
+        // The download carve-out is structural, not a blanket exemption for
+        // anything starting with `nar/` — that would hand back the unscoped
+        // pre-tenancy behaviour `refuses_anything_else` guards against.
+        let t = tenant("alice");
+        assert!(!key_is_permitted("nar/abc123.nar.zst", DOWNLOAD, &t));
+        assert!(!key_is_permitted("nar/../secrets", DOWNLOAD, &t));
+        // Right length, wrong alphabet: `e` is one of the four letters Nix's
+        // base32 omits (RFC 4648 has it; this is not that).
+        assert!(!key_is_permitted(
+            &format!("nar/{}.nar.zst", "e".repeat(32)),
+            DOWNLOAD,
+            &t
+        ));
     }
 
     #[test]

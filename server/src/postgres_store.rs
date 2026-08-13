@@ -136,6 +136,13 @@ impl PostgresStore {
     /// Upsert a path's metadata.
     ///
     /// No bytes: the database records *where* a path is, never what it holds.
+    ///
+    /// The object is upserted first, in the same transaction, `ON CONFLICT
+    /// (key) DO NOTHING` — PLAN.md Phase 9c. For a `Built` or `Quarantined`
+    /// key that is a no-op the first time and never fires again, since those
+    /// keys are unique per tenant. For a `Verified` key it is the dedup
+    /// itself: whichever tenant's push lands first owns the row, and every
+    /// later tenant pushing the same content merely points at it.
     async fn upsert_path(
         &self,
         tenant: &TenantId,
@@ -144,11 +151,25 @@ impl PostgresStore {
         tier: Tier,
     ) -> Result<()> {
         self.ensure_tenant_id(tenant).await?;
+
+        let mut txn = self.pool.begin().await.map_err(db_err)?;
+
+        sqlx::query(
+            "INSERT INTO objects (key, file_size, file_hash) VALUES ($1, $2, $3)
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .bind(object.key.as_str())
+        .bind(object.file_size as i64)
+        .bind(object.file_hash.as_slice())
+        .execute(&mut *txn)
+        .await
+        .map_err(db_err)?;
+
         sqlx::query(
             "INSERT INTO store_paths (
                  tenant, path, hash_part, deriver, nar_hash_algo, nar_hash, nar_size,
-                 registration_time, ultimate, refs, sigs, object_key, file_size, file_hash, tier
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                 registration_time, ultimate, refs, sigs, object_key, tier
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
              ON CONFLICT (tenant, path) DO UPDATE SET
                  deriver = EXCLUDED.deriver,
                  nar_hash_algo = EXCLUDED.nar_hash_algo,
@@ -159,8 +180,6 @@ impl PostgresStore {
                  refs = EXCLUDED.refs,
                  sigs = EXCLUDED.sigs,
                  object_key = EXCLUDED.object_key,
-                 file_size = EXCLUDED.file_size,
-                 file_hash = EXCLUDED.file_hash,
                  tier = EXCLUDED.tier",
         )
         .bind(tenant.as_str())
@@ -175,12 +194,12 @@ impl PostgresStore {
         .bind(&info.references)
         .bind(&info.sigs)
         .bind(object.key.as_str())
-        .bind(object.file_size as i64)
-        .bind(object.file_hash.as_slice())
         .bind(tier.as_str())
-        .execute(&self.pool)
+        .execute(&mut *txn)
         .await
         .map_err(db_err)?;
+
+        txn.commit().await.map_err(db_err)?;
         Ok(())
     }
 }
@@ -284,7 +303,9 @@ impl Store for PostgresStore {
 
     async fn output_object(&self, tenant: &TenantId, path: &str) -> Option<RemoteObject> {
         let row = sqlx::query(
-            "SELECT object_key, file_size, file_hash FROM store_paths WHERE tenant = $1 AND path = $2",
+            "SELECT o.key, o.file_size, o.file_hash
+               FROM store_paths sp JOIN objects o ON o.key = sp.object_key
+              WHERE sp.tenant = $1 AND sp.path = $2",
         )
         .bind(tenant.as_str())
         .bind(path)
@@ -296,10 +317,22 @@ impl Store for PostgresStore {
         })?;
 
         Some(RemoteObject {
-            key: row.get::<Option<String>, _>("object_key")?,
-            file_size: row.get::<Option<i64>, _>("file_size").unwrap_or(0) as u64,
-            file_hash: row.get::<Option<Vec<u8>>, _>("file_hash").unwrap_or_default(),
+            key: row.get("key"),
+            file_size: row.get::<i64, _>("file_size") as u64,
+            file_hash: row.get("file_hash"),
         })
+    }
+
+    async fn object_known(&self, key: &str) -> bool {
+        sqlx::query("SELECT 1 FROM objects WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, %key, "object lookup failed");
+                None
+            })
+            .is_some()
     }
 
     async fn add_signatures(&self, tenant: &TenantId, path: &str, sigs: Vec<String>) -> Result<()> {
@@ -674,6 +707,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.tier(&t, P).await, Some(Tier::Built));
+    }
+
+    #[tokio::test]
+    async fn object_known_reports_whether_a_key_is_recorded() {
+        let Some(store) = db().await else { return };
+        assert!(!store.object_known("no-such-key").await);
+
+        let t = tenant("object-known");
+        store
+            .record_path(&t, info(P), object("shared/nar/x.nar.zst"), Tier::Verified)
+            .await
+            .unwrap();
+        assert!(store.object_known("shared/nar/x.nar.zst").await);
+    }
+
+    #[tokio::test]
+    async fn two_tenants_pushing_the_same_object_key_share_one_objects_row() {
+        // The dedup PLAN.md Phase 9c step 1 exists for: a `Verified` key is
+        // shared by construction (no tenant prefix — `nar_key`), so two
+        // tenants recording the same key must land on one `objects` row, not
+        // two, and neither tenant's own row loses its distinct path/tier.
+        let Some(store) = db().await else { return };
+        let (alice, bob) = (tenant("dedup-alice"), tenant("dedup-bob"));
+        let shared_key = "nar/00000000000000000000000000000000.nar.zst";
+
+        store
+            .record_path(&alice, info(P), object(shared_key), Tier::Verified)
+            .await
+            .unwrap();
+        store
+            .record_path(&bob, info(P), object(shared_key), Tier::Verified)
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE key = $1")
+            .bind(shared_key)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "one shared object, not one per tenant");
+
+        // And each tenant still has its own store_paths row pointing at it —
+        // sharing the bytes did not merge the paths.
+        assert_eq!(
+            store.output_object(&alice, P).await.unwrap().key,
+            shared_key
+        );
+        assert_eq!(store.output_object(&bob, P).await.unwrap().key, shared_key);
+    }
+
+    #[tokio::test]
+    async fn a_later_push_of_the_same_key_does_not_overwrite_the_objects_row() {
+        // `ON CONFLICT (key) DO NOTHING`: whichever tenant's push lands first
+        // owns the object row's file_size/file_hash, and a second push under
+        // the same key — necessarily identical content, since the key is a
+        // function of it — must not disturb that.
+        let Some(store) = db().await else { return };
+        let (alice, bob) = (tenant("first-wins-alice"), tenant("first-wins-bob"));
+        let shared_key = "nar/11111111111111111111111111111111.nar.zst";
+
+        store
+            .record_path(
+                &alice,
+                info(P),
+                crate::store::RemoteObject {
+                    key: shared_key.to_string(),
+                    file_size: 111,
+                    file_hash: vec![1; 32],
+                },
+                Tier::Verified,
+            )
+            .await
+            .unwrap();
+        // Bob's own compression of identical bytes need not produce the exact
+        // same size, so record different metadata to prove it is ignored.
+        store
+            .record_path(
+                &bob,
+                info(P),
+                crate::store::RemoteObject {
+                    key: shared_key.to_string(),
+                    file_size: 222,
+                    file_hash: vec![2; 32],
+                },
+                Tier::Verified,
+            )
+            .await
+            .unwrap();
+
+        let bobs_view = store.output_object(&bob, P).await.unwrap();
+        assert_eq!(bobs_view.file_size, 111);
+        assert_eq!(bobs_view.file_hash, vec![1; 32]);
     }
 
     #[tokio::test]
