@@ -91,6 +91,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compression"
+version = "0.4.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-nats"
 version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,6 +1000,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "compression-codecs"
+version = "0.4.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
+dependencies = [
+ "compression-core",
+ "zstd",
+ "zstd-safe",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1289,6 +1318,16 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
+]
+
+[[package]]
+name = "digest-io"
+version = "0.1.0"
+source = "git+https://github.com/baloo/utils.git?branch=push-lrlwvoqosqno#9e01b31e29daa654401b9a1f7d23c8139629223d"
+dependencies = [
+ "digest 0.11.3",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -2363,11 +2402,13 @@ version = "0.1.0"
 name = "kubernix-worker"
 version = "0.1.0"
 dependencies = [
+ "async-compression",
  "async-nats",
  "aws-config",
  "aws-sdk-s3",
  "capnp",
  "capnpc",
+ "digest-io",
  "futures-util",
  "kubernix-types",
  "reqwest",

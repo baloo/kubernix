@@ -11,11 +11,13 @@ members = [
 kubernix-signing = { version = "0.1.0", path = "./signing" }
 kubernix-types = { version = "0.1.0", path = "./types" }
 
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-nats = "0.50.0"
 async-trait = "0.1.92"
 aws-config = "1.10.1"
 aws-sdk-s3 = "1.140"
 capnp = { version = "0.27", features = ["alloc", "std"] }
+digest-io = { version = "0.1.0", features = ["tokio"] }
 ed25519-dalek = { version = "3", features = ["digest", "rand_core"] }
 futures-util = "0.3.33"
 sha2 = "0.11"
@@ -25,3 +27,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 zstd = "0.13.3"
+
+[patch.crates-io]
+# AsyncRead/AsyncWrite support
+# https://github.com/RustCrypto/utils/pull/1517
+digest-io = { git = "https://github.com/baloo/utils.git", branch = "push-lrlwvoqosqno" }

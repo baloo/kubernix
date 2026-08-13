@@ -6,8 +6,10 @@
 
 use std::process::Stdio;
 
+use async_compression::tokio::write::ZstdEncoder;
+use digest_io::{HashReader, HashWriter};
 use sha2::{Digest, Sha256, digest::Output};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use kubernix_types::{ObjectKey, StorePath, TenantId};
@@ -142,7 +144,7 @@ pub async fn upload_output(
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let mut stdout = child.stdout.take().expect("piped");
+    let stdout = child.stdout.take().expect("piped");
     // Compressed as the NAR arrives, into a temporary file rather than memory,
     // so nothing here scales with the size of the output. Both hashes are
     // computed in the same pass — buffering to hash afterwards would defeat the
@@ -154,39 +156,28 @@ pub async fn upload_output(
     // (`HTTP 400`). Spooling to disk gives a length to declare while keeping
     // *memory* flat, which is what actually mattered.
     let spool = tempfile::NamedTempFile::new()?;
-    let mut sink = tokio::fs::File::from_std(spool.reopen()?);
+    let sink = tokio::fs::File::from_std(spool.reopen()?);
 
-    let mut nar_hasher = Sha256::new();
-    let mut file_hasher = Sha256::new();
-    let mut nar_size: u64 = 0;
-    let mut file_size: u64 = 0;
-    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3)?;
+    // `HashReader`/`HashWriter` (digest-io) hash a stream as it passes
+    // through; `ZstdEncoder` (async-compression) compresses one as it's
+    // written. Stacking them turns the whole dump -> hash -> compress ->
+    // hash -> spool pipeline into a single `tokio::io::copy`, with no manual
+    // buffering.
+    let mut nar_reader = HashReader::<Sha256, _>::new(stdout);
+    let file_writer = HashWriter::<Sha256, _>::new(sink);
+    let mut encoder = ZstdEncoder::with_quality(file_writer, async_compression::Level::Precise(3));
 
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let read = stdout.read(&mut buf).await?;
-        if read == 0 {
-            break;
-        }
-        nar_hasher.update(&buf[..read]);
-        nar_size += read as u64;
-        std::io::Write::write_all(&mut encoder, &buf[..read])?;
+    let nar_size = tokio::io::copy(&mut nar_reader, &mut encoder).await?;
+    // Flushes zstd's trailing frame bytes through the `HashWriter` — must
+    // happen before the file hash/size below are read.
+    encoder.shutdown().await?;
+    let file_writer = encoder.into_inner();
 
-        let compressed = std::mem::take(encoder.get_mut());
-        if !compressed.is_empty() {
-            file_hasher.update(&compressed);
-            file_size += compressed.len() as u64;
-            tokio::io::AsyncWriteExt::write_all(&mut sink, &compressed).await?;
-        }
-    }
-
-    let tail = encoder.finish()?;
-    if !tail.is_empty() {
-        file_hasher.update(&tail);
-        file_size += tail.len() as u64;
-        tokio::io::AsyncWriteExt::write_all(&mut sink, &tail).await?;
-    }
-    tokio::io::AsyncWriteExt::flush(&mut sink).await?;
+    let nar_hash = nar_reader.finalize();
+    let (file_hasher, mut sink) = file_writer.into_parts();
+    sink.flush().await?;
+    let file_hash = file_hasher.finalize();
+    let file_size = sink.metadata().await?.len();
     drop(sink);
 
     let mut stderr = String::new();
@@ -218,9 +209,9 @@ pub async fn upload_output(
 
     Ok(OutputArtifact {
         store_path: store_path.clone(),
-        nar_hash: nar_hasher.finalize(),
+        nar_hash,
         nar_size,
-        file_hash: file_hasher.finalize(),
+        file_hash,
         file_size,
         key,
         references,
@@ -265,7 +256,6 @@ pub async fn fetch_input(
     {
         use futures_util::StreamExt as _;
         use std::io::Write as _;
-        use tokio::io::AsyncWriteExt;
 
         let mut stdin = child.stdin.take().expect("piped");
 
