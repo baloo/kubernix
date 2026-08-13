@@ -24,6 +24,7 @@
 use base64::Engine as _;
 use crypto_common::Generate;
 use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
+use kubernix_types::{StorePath, TenantId};
 
 pub mod base32;
 
@@ -39,7 +40,7 @@ pub struct Fingerprint<'a> {
     /// The raw sha256 digest of the uncompressed NAR.
     pub nar_hash: &'a [u8],
     pub nar_size: u64,
-    pub references: &'a [String],
+    pub references: &'a [StorePath],
 }
 
 /// What a signature is computed over.
@@ -47,12 +48,18 @@ pub struct Fingerprint<'a> {
 /// Every field a client verifies is in here, which is the point: a signature
 /// that covered less would let the uncovered part be altered freely.
 pub fn fingerprint(f: &Fingerprint<'_>) -> String {
+    let references = f
+        .references
+        .iter()
+        .map(StorePath::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "1;{};sha256:{};{};{}",
         f.path,
         base32_encode(f.nar_hash),
         f.nar_size,
-        f.references.join(",")
+        references
     )
 }
 
@@ -142,9 +149,9 @@ impl LocalSigner {
     /// (`crypto.cc`). We store only the seed and derive the rest, so there is no
     /// second copy to disagree.
     pub fn from_material(name: impl Into<String>, material: &[u8]) -> Result<Self, SignError> {
-        let seed: [u8; 32] = material
-            .try_into()
-            .map_err(|_| SignError::Unusable(format!("expected 32 bytes, got {}", material.len())))?;
+        let seed: [u8; 32] = material.try_into().map_err(|_| {
+            SignError::Unusable(format!("expected 32 bytes, got {}", material.len()))
+        })?;
         Ok(Self {
             name: name.into(),
             key: SigningKey::from_bytes(&seed),
@@ -189,8 +196,11 @@ pub fn verify(fingerprint: &str, signature: &str, public_key: &[u8; 32]) -> bool
     let Ok(key) = VerifyingKey::from_bytes(public_key) else {
         return false;
     };
-    key.verify_strict(fingerprint.as_bytes(), &ed25519_dalek::Signature::from_bytes(&bytes))
-        .is_ok()
+    key.verify_strict(
+        fingerprint.as_bytes(),
+        &ed25519_dalek::Signature::from_bytes(&bytes),
+    )
+    .is_ok()
 }
 
 /// The key name for a tenant.
@@ -201,7 +211,7 @@ pub fn verify(fingerprint: &str, signature: &str, public_key: &[u8; 32]) -> bool
 /// The trailing `-1` follows the convention `cache.nixos.org-1` sets: it names a
 /// key *generation*, so a rotation can be published alongside the old one rather
 /// than replacing it.
-pub fn key_name_for(tenant: &str) -> String {
+pub fn key_name_for(tenant: &TenantId) -> String {
     format!("kubernix-{tenant}-1")
 }
 
@@ -215,11 +225,11 @@ mod tests {
         "/nix/store/22222222222222222222222222222222-b",
     ];
 
-    fn refs() -> Vec<String> {
-        REFS.iter().map(|s| s.to_string()).collect()
+    fn refs() -> Vec<StorePath> {
+        REFS.iter().map(|s| StorePath::new(*s)).collect()
     }
 
-    fn subject(refs: &[String]) -> Fingerprint<'_> {
+    fn subject(refs: &[StorePath]) -> Fingerprint<'_> {
         Fingerprint {
             path: PATH,
             nar_hash: &[0xab; 32],
@@ -267,7 +277,7 @@ mod tests {
         other.nar_size = 9999;
         assert_ne!(base, fingerprint(&other));
 
-        let fewer = vec![REFS[0].to_string()];
+        let fewer = vec![StorePath::new(REFS[0])];
         assert_ne!(base, fingerprint(&subject(&fewer)));
     }
 
@@ -371,7 +381,9 @@ mod tests {
 
     #[test]
     fn key_names_are_per_tenant_and_carry_a_generation() {
-        assert_ne!(key_name_for("alice"), key_name_for("bob"));
-        assert!(key_name_for("alice").ends_with("-1"));
+        let alice = TenantId::from_wire("alice").unwrap();
+        let bob = TenantId::from_wire("bob").unwrap();
+        assert_ne!(key_name_for(&alice), key_name_for(&bob));
+        assert!(key_name_for(&alice).ends_with("-1"));
     }
 }

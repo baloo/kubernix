@@ -11,6 +11,8 @@ use std::time::Duration;
 use aws_sdk_s3::presigning::PresigningConfig;
 use futures_util::StreamExt;
 
+use kubernix_types::ObjectKey;
+
 use crate::kubernix_capnp;
 use crate::tenant::TenantId;
 
@@ -23,8 +25,12 @@ const URL_TTL: Duration = Duration::from_secs(3600);
 /// A `Verified` path's shared object key — `nar/<hash>.nar.zst`, no tenant
 /// prefix — PLAN.md Phase 9c. Checked structurally rather than trusted: the
 /// shape is what `nar_key` promises to produce, not what any caller asserts.
-fn is_shared_verified_key(key: &str) -> bool {
-    let Some(hash) = key.strip_prefix("nar/").and_then(|r| r.strip_suffix(".nar.zst")) else {
+fn is_shared_verified_key(key: &ObjectKey) -> bool {
+    let Some(hash) = key
+        .as_str()
+        .strip_prefix("nar/")
+        .and_then(|r| r.strip_suffix(".nar.zst"))
+    else {
         return false;
     };
     hash.len() == 32 && kubernix_signing::base32::is_valid(hash)
@@ -39,8 +45,9 @@ fn is_shared_verified_key(key: &str) -> bool {
 /// * the key belongs to `tenant` — otherwise a worker running one tenant's build
 ///   could read or overwrite another's artifacts;
 /// * within that, it is an artifact namespace and not an escape.
-fn key_is_permitted(key: &str, download: bool, tenant: &TenantId) -> bool {
-    if key.contains("..") || key.starts_with('/') {
+fn key_is_permitted(key: &ObjectKey, download: bool, tenant: &TenantId) -> bool {
+    let key_str = key.as_str();
+    if key_str.contains("..") || key_str.starts_with('/') {
         return false;
     }
 
@@ -56,7 +63,7 @@ fn key_is_permitted(key: &str, download: bool, tenant: &TenantId) -> bool {
 
     // Match the separator too: a prefix test alone would let tenant `a` reach
     // tenant `ab`'s keys.
-    let Some(rest) = key.strip_prefix(&format!("{tenant}/")) else {
+    let Some(rest) = key_str.strip_prefix(&format!("{tenant}/")) else {
         return false;
     };
 
@@ -117,14 +124,14 @@ impl UploadSigner {
     /// credentials, so there is nothing to delegate.
     pub async fn put_object(
         &self,
-        key: &str,
+        key: &ObjectKey,
         body: Vec<u8>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let len = body.len();
         self.s3
             .put_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(key.as_str())
             .body(body.into())
             .send()
             .await?;
@@ -134,13 +141,13 @@ impl UploadSigner {
 
     pub async fn presign_put(
         &self,
-        key: &str,
+        key: &ObjectKey,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let presigned = self
             .s3
             .put_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(key.as_str())
             .presigned(PresigningConfig::expires_in(URL_TTL)?)
             .await?;
         Ok(presigned.uri().to_string())
@@ -153,14 +160,14 @@ impl UploadSigner {
     /// not scale with the object.
     pub async fn get_object_reader(
         &self,
-        key: &str,
+        key: &ObjectKey,
     ) -> Result<impl tokio::io::AsyncRead + Unpin + Send, Box<dyn std::error::Error + Send + Sync>>
     {
         let object = self
             .s3
             .get_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(key.as_str())
             .send()
             .await?;
         Ok(object.body.into_async_read())
@@ -172,13 +179,13 @@ impl UploadSigner {
     /// [`Self::get_object_reader`].
     pub async fn get_object(
         &self,
-        key: &str,
+        key: &ObjectKey,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let object = self
             .s3
             .get_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(key.as_str())
             .send()
             .await?;
         let bytes = object.body.collect().await?.into_bytes();
@@ -190,13 +197,13 @@ impl UploadSigner {
     /// inputs with these rather than holding credentials.
     pub async fn presign_get(
         &self,
-        key: &str,
+        key: &ObjectKey,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let presigned = self
             .s3
             .get_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(key.as_str())
             .presigned(PresigningConfig::expires_in(URL_TTL)?)
             .await?;
         Ok(presigned.uri().to_string())
@@ -284,7 +291,7 @@ impl UploadSigner {
     }
 }
 
-type UrlRequest = (String, Vec<String>, bool, Option<TenantId>);
+type UrlRequest = (String, Vec<ObjectKey>, bool, Option<TenantId>);
 
 fn decode_request(payload: &[u8]) -> Result<UrlRequest, String> {
     let mut cursor = payload;
@@ -308,11 +315,11 @@ fn decode_request(payload: &[u8]) -> Result<UrlRequest, String> {
 
     let mut keys = Vec::new();
     for key in request.get_keys().map_err(|e| e.to_string())?.iter() {
-        keys.push(
+        keys.push(ObjectKey::new(
             key.map_err(|e| e.to_string())?
                 .to_string()
                 .map_err(|e| e.to_string())?,
-        );
+        ));
     }
     Ok((job_id, keys, request.get_download(), tenant))
 }
@@ -349,9 +356,13 @@ mod tests {
 
     const P: &str = "/nix/store/00000000000000000000000000000000-thing";
 
+    fn p() -> kubernix_types::StorePath {
+        kubernix_types::StorePath::new(P)
+    }
+
     /// `<tenant>/<suffix>`, as the frontend and worker both build them.
-    fn key(t: &TenantId, suffix: &str) -> String {
-        format!("{t}/{suffix}")
+    fn key(t: &TenantId, suffix: &str) -> ObjectKey {
+        ObjectKey::new(format!("{t}/{suffix}"))
     }
 
     #[test]
@@ -372,10 +383,14 @@ mod tests {
             UPLOAD,
             &t
         ));
-        assert!(!key_is_permitted("/nar/abc", UPLOAD, &t));
-        assert!(!key_is_permitted("", UPLOAD, &t));
+        assert!(!key_is_permitted(&ObjectKey::new("/nar/abc"), UPLOAD, &t));
+        assert!(!key_is_permitted(&ObjectKey::new(""), UPLOAD, &t));
         // Unprefixed keys are the pre-tenancy shape and must no longer pass.
-        assert!(!key_is_permitted("nar/abc123.nar.zst", UPLOAD, &t));
+        assert!(!key_is_permitted(
+            &ObjectKey::new("nar/abc123.nar.zst"),
+            UPLOAD,
+            &t
+        ));
     }
 
     #[test]
@@ -384,7 +399,7 @@ mod tests {
         // this is the one key shape that must NOT require the tenant match —
         // any tenant whose job needs it as an input may fetch it.
         let (alice, bob) = (tenant("alice"), tenant("bob"));
-        let shared = crate::store::nar_key(&alice, crate::store::Tier::Verified, P).unwrap();
+        let shared = crate::store::nar_key(&alice, crate::store::Tier::Verified, &p()).unwrap();
 
         assert!(key_is_permitted(&shared, DOWNLOAD, &alice));
         assert!(key_is_permitted(&shared, DOWNLOAD, &bob));
@@ -402,12 +417,20 @@ mod tests {
         // anything starting with `nar/` — that would hand back the unscoped
         // pre-tenancy behaviour `refuses_anything_else` guards against.
         let t = tenant("alice");
-        assert!(!key_is_permitted("nar/abc123.nar.zst", DOWNLOAD, &t));
-        assert!(!key_is_permitted("nar/../secrets", DOWNLOAD, &t));
+        assert!(!key_is_permitted(
+            &ObjectKey::new("nar/abc123.nar.zst"),
+            DOWNLOAD,
+            &t
+        ));
+        assert!(!key_is_permitted(
+            &ObjectKey::new("nar/../secrets"),
+            DOWNLOAD,
+            &t
+        ));
         // Right length, wrong alphabet: `e` is one of the four letters Nix's
         // base32 omits (RFC 4648 has it; this is not that).
         assert!(!key_is_permitted(
-            &format!("nar/{}.nar.zst", "e".repeat(32)),
+            &ObjectKey::new(format!("nar/{}.nar.zst", "e".repeat(32))),
             DOWNLOAD,
             &t
         ));
@@ -426,7 +449,7 @@ mod tests {
         // What a worker still may not write is anything the frontend vouches
         // differently for.
         assert!(!key_is_permitted(
-            &crate::store::nar_key(&t, crate::store::Tier::Quarantined, P).unwrap(),
+            &crate::store::nar_key(&t, crate::store::Tier::Quarantined, &p()).unwrap(),
             UPLOAD,
             &t
         ));
@@ -497,8 +520,16 @@ mod tests {
         // `from_ssh`, but the check must not depend on that.
         let a = TenantId::from_wire("a").expect("well formed");
         let ab = TenantId::from_wire("ab").expect("well formed");
-        assert!(!key_is_permitted("ab/nar/x.nar.zst", DOWNLOAD, &a));
-        assert!(key_is_permitted("ab/nar/x.nar.zst", DOWNLOAD, &ab));
+        assert!(!key_is_permitted(
+            &ObjectKey::new("ab/nar/x.nar.zst"),
+            DOWNLOAD,
+            &a
+        ));
+        assert!(key_is_permitted(
+            &ObjectKey::new("ab/nar/x.nar.zst"),
+            DOWNLOAD,
+            &ab
+        ));
     }
 
     #[test]
@@ -507,8 +538,7 @@ mod tests {
         // refuses rather than falling back to an unscoped grant.
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut request =
-                message.init_root::<kubernix_capnp::upload_url_request::Builder>();
+            let mut request = message.init_root::<kubernix_capnp::upload_url_request::Builder>();
             request.set_job_id("job");
             request.reborrow().init_keys(1).set(0, "nar/x.nar.zst");
         }
@@ -523,8 +553,7 @@ mod tests {
     fn a_malformed_wire_tenant_decodes_to_none() {
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut request =
-                message.init_root::<kubernix_capnp::upload_url_request::Builder>();
+            let mut request = message.init_root::<kubernix_capnp::upload_url_request::Builder>();
             request.set_job_id("job");
             request.set_tenant("../escape");
         }

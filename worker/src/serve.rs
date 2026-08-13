@@ -56,7 +56,10 @@ impl BuildOutcome {
     pub fn succeeded(&self) -> bool {
         matches!(
             self.status,
-            STATUS_BUILT | STATUS_SUBSTITUTED | STATUS_ALREADY_VALID | STATUS_RESOLVES_TO_ALREADY_VALID
+            STATUS_BUILT
+                | STATUS_SUBSTITUTED
+                | STATUS_ALREADY_VALID
+                | STATUS_RESOLVES_TO_ALREADY_VALID
         )
     }
 
@@ -122,7 +125,10 @@ impl ServeConnection {
             return Err(format!("unsupported serve protocol version {remote_version:#x}").into());
         }
 
-        tracing::debug!(version = format_args!("{remote_version:#x}"), "serve connection open");
+        tracing::debug!(
+            version = format_args!("{remote_version:#x}"),
+            "serve connection open"
+        );
         Ok(Self {
             child,
             stdin,

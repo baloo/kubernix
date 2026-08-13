@@ -30,12 +30,12 @@ pub mod kubernix_capnp {
 }
 
 pub mod daemon_rpc;
-pub mod ssh;
-pub mod uploads;
 pub mod http;
 pub mod jobs;
 pub mod postgres_store;
 pub mod rpc_error;
+pub mod ssh;
 pub mod store;
 pub mod store_path;
 pub mod tenant;
+pub mod uploads;

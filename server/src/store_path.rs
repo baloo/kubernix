@@ -25,6 +25,8 @@
 
 use sha2::{Digest, Sha256};
 
+use kubernix_types::StorePath;
+
 /// How the content was ingested, mirroring `ContentAddressMethod` on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaMethod {
@@ -68,14 +70,14 @@ pub fn make_store_path(store_dir: &str, ty: &str, hash_hex: &str, name: &str) ->
 ///
 /// A bit hacky, and deliberately so upstream: they cannot go anywhere else in
 /// the grammar without becoming ambiguous.
-fn make_type(store_dir: &str, base: &str, references: &[String], self_ref: bool) -> String {
+fn make_type(store_dir: &str, base: &str, references: &[StorePath], self_ref: bool) -> String {
     let mut ty = base.to_string();
     for reference in references {
         ty.push(':');
         // References are already printed paths on our wire, but tolerate a bare
         // name so callers cannot accidentally produce `…:/nix/store//nix/store/…`.
-        if reference.starts_with(store_dir) {
-            ty.push_str(reference);
+        if reference.as_str().starts_with(store_dir) {
+            ty.push_str(reference.as_str());
         } else {
             ty.push_str(&format!("{store_dir}/{reference}"));
         }
@@ -99,8 +101,8 @@ pub fn store_path_for(
     method: CaMethod,
     hash_algo: &str,
     hash: &[u8],
-    references: &[String],
-) -> Option<String> {
+    references: &[StorePath],
+) -> Option<StorePath> {
     match method {
         CaMethod::Text => {
             // `makeTextPath` asserts sha256; anything else is not a text CA.
@@ -108,21 +110,21 @@ pub fn store_path_for(
                 return None;
             }
             let ty = make_type(store_dir, "text", references, false);
-            Some(make_store_path(
+            Some(StorePath::new(make_store_path(
                 store_dir,
                 &ty,
                 &format!("sha256:{}", hex(hash)),
                 name,
-            ))
+            )))
         }
         CaMethod::Recursive if hash_algo == "sha256" => {
             let ty = make_type(store_dir, "source", references, false);
-            Some(make_store_path(
+            Some(StorePath::new(make_store_path(
                 store_dir,
                 &ty,
                 &format!("sha256:{}", hex(hash)),
                 name,
-            ))
+            )))
         }
         // The long form: hash the description of the fixed output, then use
         // *that* as the store path's hash.
@@ -137,12 +139,12 @@ pub fn store_path_for(
             };
             let inner = format!("fixed:out:{prefix}{hash_algo}:{}:", hex(hash));
             let digest = Sha256::digest(inner.as_bytes());
-            Some(make_store_path(
+            Some(StorePath::new(make_store_path(
                 store_dir,
                 "output:out",
                 &format!("sha256:{}", hex(&digest)),
                 name,
-            ))
+            )))
         }
     }
 }
@@ -173,10 +175,9 @@ impl std::fmt::Display for Rejection {
                 f,
                 "content hash mismatch: declared {declared}, computed {actual}"
             ),
-            Rejection::WrongPath { claimed, computed } => write!(
-                f,
-                "content belongs at {computed}, not {claimed}"
-            ),
+            Rejection::WrongPath { claimed, computed } => {
+                write!(f, "content belongs at {computed}, not {claimed}")
+            }
             Rejection::Unverifiable(why) => write!(f, "cannot verify: {why}"),
         }
     }
@@ -193,13 +194,17 @@ impl std::fmt::Display for Rejection {
 /// match the one claimed, which is what stops a client presenting honest content
 /// under someone else's name.
 pub fn verify(
-    path: &str,
+    path: &StorePath,
     ca: &ContentAddress,
-    references: &[String],
+    references: &[StorePath],
     nar: &[u8],
 ) -> std::result::Result<(), Rejection> {
-    let name = name_of(path).ok_or(Rejection::Unverifiable("not a store path"))?;
-    let store_dir = store_dir_of(path).ok_or(Rejection::Unverifiable("not a store path"))?;
+    let name = path
+        .name()
+        .ok_or(Rejection::Unverifiable("not a store path"))?;
+    let store_dir = path
+        .store_dir()
+        .ok_or(Rejection::Unverifiable("not a store path"))?;
 
     if ca.algo != "sha256" {
         // Everything a Lix client produces is sha256. Refusing the rest is not a
@@ -229,10 +234,10 @@ pub fn verify(
     let computed = store_path_for(store_dir, name, ca.method, &ca.algo, &actual, references)
         .ok_or(Rejection::Unverifiable("no path for this address"))?;
 
-    if computed != path {
+    if &computed != path {
         return Err(Rejection::WrongPath {
             claimed: path.to_string(),
-            computed,
+            computed: computed.to_string(),
         });
     }
     Ok(())
@@ -278,7 +283,8 @@ fn regular_file_contents(nar: &[u8]) -> Option<&[u8]> {
 fn read_token<'a>(nar: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
     let len = nar
         .get(*at..*at + 8)
-        .map(|slice| u64::from_le_bytes(slice.try_into().expect("eight bytes")))? as usize;
+        .map(|slice| u64::from_le_bytes(slice.try_into().expect("eight bytes")))?
+        as usize;
     let start = *at + 8;
     let end = start.checked_add(len)?;
     if end > nar.len() {
@@ -288,18 +294,6 @@ fn read_token<'a>(nar: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
     // padding desynchronises for the rest of the stream.
     *at = end + (8 - len % 8) % 8;
     Some(&nar[start..end])
-}
-
-/// The `<name>` part of `/nix/store/<hash>-<name>`.
-pub fn name_of(path: &str) -> Option<&str> {
-    let base = path.rsplit('/').next()?;
-    let (hash, name) = base.split_once('-')?;
-    (hash.len() == 32 && !name.is_empty()).then_some(name)
-}
-
-/// The store directory a path sits in: `/nix/store/abc-x` → `/nix/store`.
-pub fn store_dir_of(path: &str) -> Option<&str> {
-    path.rfind('/').map(|at| &path[..at])
 }
 
 #[cfg(test)]
@@ -355,7 +349,8 @@ mod tests {
                 &nar_hash,
                 &[],
             )
-            .as_deref(),
+            .as_ref()
+            .map(StorePath::as_str),
             Some("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt")
         );
     }
@@ -373,7 +368,8 @@ mod tests {
                 &unhex(FLAT_HASH),
                 &[],
             )
-            .as_deref(),
+            .as_ref()
+            .map(StorePath::as_str),
             Some("/nix/store/6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt")
         );
     }
@@ -384,8 +380,16 @@ mod tests {
         // "/nix/store/ik0brqacj8rn97il4ygixp855xyh64ld-greeting"
         let hash = Sha256::digest(b"round trip");
         assert_eq!(
-            store_path_for("/nix/store", "greeting", CaMethod::Text, "sha256", &hash, &[])
-                .as_deref(),
+            store_path_for(
+                "/nix/store",
+                "greeting",
+                CaMethod::Text,
+                "sha256",
+                &hash,
+                &[]
+            )
+            .as_ref()
+            .map(StorePath::as_str),
             Some("/nix/store/ik0brqacj8rn97il4ygixp855xyh64ld-greeting")
         );
     }
@@ -403,7 +407,9 @@ mod tests {
             CaMethod::Text,
             "sha256",
             &hash,
-            &["/nix/store/00000000000000000000000000000000-dep".to_string()],
+            &[StorePath::new(
+                "/nix/store/00000000000000000000000000000000-dep",
+            )],
         );
         assert_ne!(bare, with);
         assert!(bare.is_some() && with.is_some());
@@ -422,7 +428,9 @@ mod tests {
                 CaMethod::Flat,
                 "sha256",
                 &hash,
-                &["/nix/store/00000000000000000000000000000000-dep".to_string()],
+                &[StorePath::new(
+                    "/nix/store/00000000000000000000000000000000-dep",
+                )],
             ),
             None
         );
@@ -447,7 +455,7 @@ mod tests {
     }
 
     /// A well-formed push: the content, its address, and the path it belongs at.
-    fn honest_push() -> (String, ContentAddress, Vec<u8>) {
+    fn honest_push() -> (StorePath, ContentAddress, Vec<u8>) {
         let contents = b"hello content addressing\n";
         let nar = nar_of(contents);
         let ca = ContentAddress {
@@ -456,7 +464,7 @@ mod tests {
             hash: Sha256::digest(&nar).to_vec(),
         };
         (
-            "/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt".to_string(),
+            StorePath::new("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt"),
             ca,
             nar,
         )
@@ -485,10 +493,10 @@ mod tests {
         // presented at a path it does not belong at. Only recomputing the path
         // catches this — the hash check alone passes.
         let (_, ca, nar) = honest_push();
-        let claimed = "/nix/store/00000000000000000000000000000000-bash";
-        match verify(claimed, &ca, &[], &nar) {
+        let claimed = StorePath::new("/nix/store/00000000000000000000000000000000-bash");
+        match verify(&claimed, &ca, &[], &nar) {
             Err(Rejection::WrongPath { computed, .. }) => {
-                assert_ne!(computed, claimed);
+                assert_ne!(computed, claimed.to_string());
                 // The name is itself part of what is hashed, so the content does
                 // not even land at the same hash under a different name — a
                 // client cannot rename its way into an existing path.
@@ -504,7 +512,9 @@ mod tests {
         // References are folded into the path, so adding one moves the path —
         // which means a client cannot smuggle extra references past us.
         let (path, ca, nar) = honest_push();
-        let refs = vec!["/nix/store/00000000000000000000000000000000-dep".to_string()];
+        let refs = vec![StorePath::new(
+            "/nix/store/00000000000000000000000000000000-dep",
+        )];
         assert!(matches!(
             verify(&path, &ca, &refs, &nar),
             Err(Rejection::WrongPath { .. })
@@ -523,7 +533,7 @@ mod tests {
         };
         assert_eq!(
             verify(
-                "/nix/store/ik0brqacj8rn97il4ygixp855xyh64ld-greeting",
+                &StorePath::new("/nix/store/ik0brqacj8rn97il4ygixp855xyh64ld-greeting"),
                 &ca,
                 &[],
                 &nar_of(contents),
@@ -547,15 +557,16 @@ mod tests {
         // Nor may a non-store path.
         let (_, ca, nar) = honest_push();
         assert!(matches!(
-            verify("/etc/passwd", &ca, &[], &nar),
+            verify(&StorePath::new("/etc/passwd"), &ca, &[], &nar),
             Err(Rejection::Unverifiable(_))
         ));
     }
 
     #[test]
     fn splits_paths() {
-        assert_eq!(name_of("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt"), Some("f.txt"));
-        assert_eq!(store_dir_of("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt"), Some("/nix/store"));
-        assert_eq!(name_of("/etc/passwd"), None);
+        let p = StorePath::new("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt");
+        assert_eq!(p.name(), Some("f.txt"));
+        assert_eq!(p.store_dir(), Some("/nix/store"));
+        assert_eq!(StorePath::new("/etc/passwd").name(), None);
     }
 }

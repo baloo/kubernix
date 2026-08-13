@@ -27,11 +27,13 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::Router;
+
+use kubernix_types::ObjectKey;
 
 use crate::store::{PathInfo, Store};
 use crate::tenant::TenantId;
@@ -80,13 +82,11 @@ fn tenant_router() -> Router<HttpState> {
 /// traversal attempt cannot reach the object store, where the id becomes a key
 /// prefix.
 fn tenant_of(raw: &str) -> Result<TenantId, Response> {
-    TenantId::from_wire(raw).ok_or_else(|| (StatusCode::NOT_FOUND, "unknown tenant\n").into_response())
+    TenantId::from_wire(raw)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown tenant\n").into_response())
 }
 
-async fn nix_cache_info(
-    State(state): State<HttpState>,
-    Path(tenant): Path<String>,
-) -> Response {
+async fn nix_cache_info(State(state): State<HttpState>, Path(tenant): Path<String>) -> Response {
     if let Err(response) = tenant_of(&tenant) {
         return response;
     }
@@ -182,7 +182,7 @@ async fn narinfo(
 /// makes a captured response comparable with a real cache's.
 fn render_narinfo(
     info: &PathInfo,
-    object_key: &str,
+    object_key: &ObjectKey,
     file_size: u64,
     file_hash: &[u8],
     store_dir: &str,
@@ -191,7 +191,10 @@ fn render_narinfo(
     out.push_str(&format!("StorePath: {}\n", info.path));
     // Relative to the cache root, which is the tenant prefix — so a client that
     // fetched `/<tenant>/<hash>.narinfo` resolves this against the same prefix.
-    out.push_str(&format!("URL: nar/{}\n", object_key_basename(object_key)));
+    out.push_str(&format!(
+        "URL: nar/{}\n",
+        object_key_basename(object_key.as_str())
+    ));
     out.push_str("Compression: zstd\n");
     out.push_str(&format!(
         "FileHash: sha256:{}\n",
@@ -209,14 +212,19 @@ fn render_narinfo(
     let references: Vec<&str> = info
         .references
         .iter()
-        .map(|r| r.strip_prefix(&format!("{store_dir}/")).unwrap_or(r))
+        .map(|r| {
+            r.as_str()
+                .strip_prefix(&format!("{store_dir}/"))
+                .unwrap_or(r.as_str())
+        })
         .collect();
     out.push_str(&format!("References: {}\n", references.join(" ")));
 
     if let Some(deriver) = &info.deriver {
         let deriver = deriver
+            .as_str()
             .strip_prefix(&format!("{store_dir}/"))
-            .unwrap_or(deriver);
+            .unwrap_or(deriver.as_str());
         out.push_str(&format!("Deriver: {deriver}\n"));
     }
     for sig in &info.sigs {
@@ -253,7 +261,7 @@ async fn nar(
     if file.contains('/') || file.contains("..") {
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
     }
-    let key = format!("{tenant}/nar/{file}");
+    let key = ObjectKey::new(format!("{tenant}/nar/{file}"));
 
     match uploader.presign_get(&key).await {
         Ok(url) => Redirect::temporary(&url).into_response(),
@@ -283,7 +291,10 @@ async fn log(
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
     }
 
-    match uploader.get_object(&format!("{tenant}/log/{drv_hash}")).await {
+    match uploader
+        .get_object(&ObjectKey::new(format!("{tenant}/log/{drv_hash}")))
+        .await
+    {
         Ok(bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -302,19 +313,22 @@ async fn log(
 mod tests {
     use super::*;
     use crate::store::{Hash, HashType};
+    use kubernix_types::StorePath;
 
     fn info() -> PathInfo {
         PathInfo {
-            path: "/nix/store/00000000000000000000000000000000-thing".to_string(),
-            deriver: Some("/nix/store/33333333333333333333333333333333-thing.drv".to_string()),
+            path: StorePath::new("/nix/store/00000000000000000000000000000000-thing"),
+            deriver: Some(StorePath::new(
+                "/nix/store/33333333333333333333333333333333-thing.drv",
+            )),
             nar_hash: Hash {
                 hash_type: HashType::Sha256,
                 bytes: vec![0xab; 32],
             },
             nar_size: 4096,
             references: vec![
-                "/nix/store/11111111111111111111111111111111-a".to_string(),
-                "/nix/store/22222222222222222222222222222222-b".to_string(),
+                StorePath::new("/nix/store/11111111111111111111111111111111-a"),
+                StorePath::new("/nix/store/22222222222222222222222222222222-b"),
             ],
             registration_time: 0,
             ultimate: true,
@@ -325,7 +339,7 @@ mod tests {
     fn rendered() -> String {
         render_narinfo(
             &info(),
-            "tenant/nar/abc.nar.zst",
+            &ObjectKey::new("tenant/nar/abc.nar.zst"),
             1024,
             &[0xcd; 32],
             "/nix/store",
@@ -396,7 +410,13 @@ mod tests {
         // than a malformed one.
         let mut unsigned = info();
         unsigned.sigs.clear();
-        let body = render_narinfo(&unsigned, "t/nar/x.nar.zst", 1, &[0xcd; 32], "/nix/store");
+        let body = render_narinfo(
+            &unsigned,
+            &ObjectKey::new("t/nar/x.nar.zst"),
+            1,
+            &[0xcd; 32],
+            "/nix/store",
+        );
         assert!(!body.contains("Sig:"));
         assert!(body.contains("StorePath: "));
     }

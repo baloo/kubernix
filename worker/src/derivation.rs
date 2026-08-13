@@ -25,10 +25,12 @@
 
 use std::collections::BTreeMap;
 
+use kubernix_types::{StorePath, System};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub name: String,
-    pub path: String,
+    pub path: StorePath,
     /// Empty for input-addressed outputs.
     pub algo: String,
     pub hash: String,
@@ -37,8 +39,8 @@ pub struct Output {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BasicDerivation {
     pub outputs: Vec<Output>,
-    pub input_srcs: Vec<String>,
-    pub platform: String,
+    pub input_srcs: Vec<StorePath>,
+    pub platform: System,
     pub builder: String,
     pub args: Vec<String>,
     /// Ordered: the ATerm form is sorted by key, and `env` is a std::map on the
@@ -108,14 +110,14 @@ pub fn parse(bytes: &[u8]) -> Result<BasicDerivation> {
     for _ in 0..output_count {
         outputs.push(Output {
             name: reader.string()?,
-            path: reader.string()?,
+            path: StorePath::new(reader.string()?),
             algo: reader.string()?,
             hash: reader.string()?,
         });
     }
 
-    let input_srcs = reader.strings()?;
-    let platform = reader.string()?;
+    let input_srcs = reader.strings()?.into_iter().map(StorePath::new).collect();
+    let platform = System::new(reader.string()?);
     let builder = reader.string()?;
     let args = reader.strings()?;
 
@@ -177,7 +179,7 @@ mod tests {
         let drv = parse(&sample_wire()).unwrap();
         assert_eq!(drv.outputs.len(), 1);
         assert_eq!(drv.outputs[0].name, "out");
-        assert_eq!(drv.platform, "x86_64-linux");
+        assert_eq!(drv.platform.as_str(), "x86_64-linux");
         assert_eq!(drv.builder, "/bin/sh");
         assert_eq!(drv.args, vec!["-c", "echo hi"]);
         assert_eq!(drv.input_srcs.len(), 1);

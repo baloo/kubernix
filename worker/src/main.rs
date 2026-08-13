@@ -23,15 +23,16 @@ pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
 
 use async_nats::jetstream::{self, consumer::PullConsumer};
 use futures_util::stream::StreamExt;
+use kubernix_types::{ObjectKey, StorePath, TenantId};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 struct Job {
     job_id: String,
-    derivation_path: String,
+    derivation_path: StorePath,
     /// Whose build this is. Every artifact key is scoped by it, and the
     /// frontend signs nothing outside that scope.
-    tenant: String,
+    tenant: TenantId,
     inputs: Vec<InputRef>,
     /// The derivation itself, shipped inline by `buildDerivation`.
     drv: Vec<u8>,
@@ -42,18 +43,18 @@ struct Job {
 /// Taken from the derivation rather than from a builder's stdout: with
 /// `nix-store --serve` stdout carries the protocol, and the derivation is the
 /// authoritative statement of where its outputs go regardless.
-fn declared_outputs(job: &Job) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn declared_outputs(job: &Job) -> Result<Vec<StorePath>, Box<dyn std::error::Error>> {
     let drv = derivation::parse(&job.drv)?;
     Ok(drv.outputs.into_iter().map(|o| o.path).collect())
 }
 
 struct InputRef {
-    store_path: String,
-    key: String,
+    store_path: StorePath,
+    key: ObjectKey,
     /// Needed to wrap the NAR into an importable export stream; a bare NAR
     /// carries neither.
-    references: Vec<String>,
-    deriver: String,
+    references: Vec<StorePath>,
+    deriver: StorePath,
 }
 
 /// Fetch and import every input the frontend staged for this job.
@@ -71,7 +72,7 @@ async fn fetch_inputs(
         return Ok(());
     }
 
-    let keys: Vec<String> = job.inputs.iter().map(|i| i.key.clone()).collect();
+    let keys: Vec<ObjectKey> = job.inputs.iter().map(|i| i.key.clone()).collect();
     let urls = upload::request_download_urls(client, &job.job_id, &job.tenant, &keys).await?;
 
     for (input, url) in job.inputs.iter().zip(urls) {
@@ -187,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = fetch_inputs(&client, &http, &job, &builder, store_uri.as_deref()).await {
             tracing::error!(job_id = %job.job_id, error = %e, "could not fetch inputs");
             let outcome = Outcome::Failed(format!("fetching inputs: {e}"));
-            let _ = publish_result(&jetstream, &job, &outcome, &[], "").await;
+            let _ = publish_result(&jetstream, &job, &outcome, &[], &ObjectKey::default()).await;
             let _ = message.ack().await;
             continue;
         }
@@ -198,7 +199,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 tracing::error!(job_id = %job.job_id, error = %e, "undecodable derivation");
                 let outcome = Outcome::Failed(format!("reading derivation: {e}"));
-                let _ = publish_result(&jetstream, &job, &outcome, &[], "").await;
+                let _ =
+                    publish_result(&jetstream, &job, &outcome, &[], &ObjectKey::default()).await;
                 let _ = message.ack().await;
                 continue;
             }
@@ -209,26 +211,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Artifacts first, then the result: publishing a success whose outputs
         // are not yet fetchable would be worse than reporting the upload failure.
-        let (artifacts, log_key) =
-            match upload_artifacts(
-                &client,
-                &http,
-                &job,
-                &outcome,
-                log,
-                &builder,
-                &nix_cli,
-                store_uri.as_deref(),
-            )
-            .await
-            {
-                Ok(uploaded) => uploaded,
-                Err(e) => {
-                    tracing::error!(job_id = %job.job_id, error = %e, "artifact upload failed");
-                    outcome = Outcome::Failed(format!("uploading artifacts: {e}"));
-                    (Vec::new(), String::new())
-                }
-            };
+        let (artifacts, log_key) = match upload_artifacts(
+            &client,
+            &http,
+            &job,
+            &outcome,
+            log,
+            &builder,
+            &nix_cli,
+            store_uri.as_deref(),
+        )
+        .await
+        {
+            Ok(uploaded) => uploaded,
+            Err(e) => {
+                tracing::error!(job_id = %job.job_id, error = %e, "artifact upload failed");
+                outcome = Outcome::Failed(format!("uploading artifacts: {e}"));
+                (Vec::new(), ObjectKey::default())
+            }
+        };
 
         if let Err(e) = publish_result(&jetstream, &job, &outcome, &artifacts, &log_key).await {
             tracing::error!(error = %e, "failed to publish result");
@@ -244,32 +245,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn decode_job(payload: &[u8]) -> Result<Job, Box<dyn std::error::Error>> {
     let mut cursor = payload;
-    let reader =
-        capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
     let request = reader.get_root::<kubernix_capnp::build_request::Reader>()?;
     let mut inputs = Vec::new();
     for input in request.get_inputs()?.iter() {
         let mut references = Vec::new();
         for reference in input.get_references()?.iter() {
-            references.push(reference?.to_string()?);
+            references.push(StorePath::new(reference?.to_string()?));
         }
         inputs.push(InputRef {
-            store_path: input.get_store_path()?.to_string()?,
-            key: input.get_key()?.to_string()?,
+            store_path: StorePath::new(input.get_store_path()?.to_string()?),
+            key: ObjectKey::new(input.get_key()?.to_string()?),
             references,
-            deriver: input.get_deriver()?.to_string()?,
+            deriver: StorePath::new(input.get_deriver()?.to_string()?),
         });
     }
     let tenant = request.get_tenant()?.to_string()?;
-    if tenant.is_empty() {
-        // Without one the worker cannot name a key the frontend will sign, so
-        // failing here beats failing later with a refused URL request.
-        return Err("build request carries no tenant".into());
-    }
+    // Without one the worker cannot name a key the frontend will sign, so
+    // failing here beats failing later with a refused URL request.
+    let tenant = TenantId::from_wire(tenant).ok_or("build request carries no tenant")?;
 
     Ok(Job {
         job_id: request.get_job_id()?.to_string()?,
-        derivation_path: request.get_derivation_path()?.to_string()?,
+        derivation_path: StorePath::new(request.get_derivation_path()?.to_string()?),
         tenant,
         inputs,
         drv: request.get_drv()?.to_vec(),
@@ -277,7 +275,7 @@ fn decode_job(payload: &[u8]) -> Result<Job, Box<dyn std::error::Error>> {
 }
 
 enum Outcome {
-    Completed(Vec<String>),
+    Completed(Vec<StorePath>),
     Failed(String),
 }
 
@@ -297,8 +295,8 @@ async fn upload_artifacts(
     nix_store: &str,
     nix_cli: &str,
     store_uri: Option<&str>,
-) -> Result<(Vec<upload::OutputArtifact>, String), Box<dyn std::error::Error>> {
-    let outputs: Vec<String> = match outcome {
+) -> Result<(Vec<upload::OutputArtifact>, ObjectKey), Box<dyn std::error::Error>> {
+    let outputs: Vec<StorePath> = match outcome {
         Outcome::Completed(paths) => paths.clone(),
         Outcome::Failed(_) => Vec::new(),
     };
@@ -322,7 +320,7 @@ async fn upload_artifacts(
     // over an empty log would be absurd, so skip the upload and report no key.
     let log_key = if log.is_empty() {
         tracing::debug!(job_id = %job.job_id, "build produced no log; not uploading one");
-        String::new()
+        ObjectKey::default()
     } else {
         upload::upload_log(http, &urls[0], &log_key, log).await?;
         log_key
@@ -351,7 +349,7 @@ async fn upload_artifacts(
 async fn run_build(
     client: &async_nats::Client,
     job: &Job,
-    outputs: Vec<String>,
+    outputs: Vec<StorePath>,
     builder: &str,
     store_uri: Option<&str>,
 ) -> (Outcome, Vec<u8>) {
@@ -371,7 +369,9 @@ async fn run_build(
     let stderr = conn.stderr.take();
     let pump = tokio::spawn(pump_log(client.clone(), log_subject.clone(), stderr));
 
-    let result = conn.build_derivation(&job.derivation_path, &job.drv).await;
+    let result = conn
+        .build_derivation(job.derivation_path.as_str(), &job.drv)
+        .await;
 
     // Closing drops stdin, which is what tells `nix-store --serve` to exit, which
     // in turn ends the log stream. Done before awaiting the pump for that reason.
@@ -442,13 +442,13 @@ async fn publish_result(
     job: &Job,
     outcome: &Outcome,
     artifacts: &[upload::OutputArtifact],
-    log_key: &str,
+    log_key: &ObjectKey,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut message = capnp::message::Builder::new_default();
     {
         let mut result = message.init_root::<kubernix_capnp::job_result::Builder>();
         result.set_job_id(job.job_id.as_str());
-        result.set_log_key(log_key);
+        result.set_log_key(log_key.as_str());
 
         match outcome {
             Outcome::Completed(outputs) => {
@@ -475,7 +475,9 @@ async fn publish_result(
             out.set_key(artifact.key.as_str());
             out.set_compression("zstd");
             out.set_deriver(artifact.deriver.as_str());
-            let mut refs = out.reborrow().init_references(artifact.references.len() as u32);
+            let mut refs = out
+                .reborrow()
+                .init_references(artifact.references.len() as u32);
             for (j, reference) in artifact.references.iter().enumerate() {
                 refs.set(j as u32, reference.as_str());
             }

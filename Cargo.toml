@@ -3,11 +3,13 @@ resolver = "3"
 members = [
     "server",
     "signing",
+    "types",
     "worker"
 ]
 
 [workspace.dependencies]
 kubernix-signing = { version = "0.1.0", path = "./signing" }
+kubernix-types = { version = "0.1.0", path = "./types" }
 
 async-nats = "0.50.0"
 async-trait = "0.1.92"

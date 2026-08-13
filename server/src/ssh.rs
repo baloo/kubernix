@@ -55,9 +55,7 @@ impl AuthPolicy {
             // carries (`ssh-ed25519 AAAA… user@host`) and the key a client
             // offers over the wire does not — so comparing whole values rejects
             // every legitimate key.
-            AuthPolicy::AuthorizedKeys(keys) => {
-                keys.iter().any(|k| k.key_data() == key.key_data())
-            }
+            AuthPolicy::AuthorizedKeys(keys) => keys.iter().any(|k| k.key_data() == key.key_data()),
         }
     }
 }
@@ -297,8 +295,10 @@ mod tests {
     /// An `authorized_keys` line, i.e. with a trailing comment.
     const AUTHORIZED: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z baloo@khany";
     /// The same key as a client presents it: no comment.
-    const OFFERED: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z";
-    const OTHER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJCU6/lsgeY1GlUJF2nMkLB5kq008SBiLTz2YswJvb8o";
+    const OFFERED: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z";
+    const OTHER: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJCU6/lsgeY1GlUJF2nMkLB5kq008SBiLTz2YswJvb8o";
 
     fn key(openssh: &str) -> PublicKey {
         PublicKey::from_openssh(openssh).expect("parseable")
@@ -336,7 +336,9 @@ mod tests {
     #[test]
     fn accepts_the_shapes_lix_sends() {
         assert!(is_stdio_request("nix-daemon --stdio"));
-        assert!(is_stdio_request("/nix/store/abc-lix/bin/nix-daemon --stdio"));
+        assert!(is_stdio_request(
+            "/nix/store/abc-lix/bin/nix-daemon --stdio"
+        ));
         assert!(is_stdio_request("nix-daemon --stdio --store /custom/store"));
         // remote-program can be anything, including our own test harness
         assert!(is_stdio_request("/tmp/kubernix-stdio --stdio"));

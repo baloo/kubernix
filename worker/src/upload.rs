@@ -10,50 +10,48 @@ use sha2::{Digest, Sha256, digest::Output};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use kubernix_types::{ObjectKey, StorePath, TenantId};
+
 use crate::kubernix_capnp;
 
 /// Metadata the frontend needs to build a narinfo, which it cannot recompute
 /// because it never sees the build.
 pub struct OutputArtifact {
-    pub store_path: String,
+    pub store_path: StorePath,
     /// sha256 of the uncompressed NAR — what Nix verifies against.
     pub nar_hash: Output<Sha256>,
     pub nar_size: u64,
     /// sha256 of the compressed object — what a client downloads.
     pub file_hash: Output<Sha256>,
     pub file_size: u64,
-    pub key: String,
-    pub references: Vec<String>,
-    pub deriver: String,
-}
-
-/// `/nix/store/<32-char hash>-<name>` → `<32-char hash>`.
-pub fn hash_part_of(path: &str) -> Option<&str> {
-    let base = path.rsplit('/').next()?;
-    let hash = base.split('-').next()?;
-    (hash.len() == 32).then_some(hash)
+    pub key: ObjectKey,
+    pub references: Vec<StorePath>,
+    pub deriver: StorePath,
 }
 
 /// Artifact keys are tenant-scoped: the frontend signs a key only for the
 /// tenant whose job asked for it, so the prefix is part of the key rather than
 /// something applied later.
-pub fn nar_key(tenant: &str, store_path: &str) -> Option<String> {
-    Some(format!(
+pub fn nar_key(tenant: &TenantId, store_path: &StorePath) -> Option<ObjectKey> {
+    Some(ObjectKey::new(format!(
         "{tenant}/nar/{}.nar.zst",
-        hash_part_of(store_path)?
-    ))
+        store_path.hash_part()?
+    )))
 }
 
-pub fn log_key(tenant: &str, drv_path: &str) -> Option<String> {
-    Some(format!("{tenant}/log/{}", hash_part_of(drv_path)?))
+pub fn log_key(tenant: &TenantId, drv_path: &StorePath) -> Option<ObjectKey> {
+    Some(ObjectKey::new(format!(
+        "{tenant}/log/{}",
+        drv_path.hash_part()?
+    )))
 }
 
 /// Ask the frontend to pre-sign the given keys for upload.
 pub async fn request_upload_urls(
     client: &async_nats::Client,
     job_id: &str,
-    tenant: &str,
-    keys: &[String],
+    tenant: &TenantId,
+    keys: &[ObjectKey],
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     request_urls(client, job_id, tenant, keys, false).await
 }
@@ -66,8 +64,8 @@ pub async fn request_upload_urls(
 pub async fn request_download_urls(
     client: &async_nats::Client,
     job_id: &str,
-    tenant: &str,
-    keys: &[String],
+    tenant: &TenantId,
+    keys: &[ObjectKey],
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     request_urls(client, job_id, tenant, keys, true).await
 }
@@ -75,8 +73,8 @@ pub async fn request_download_urls(
 async fn request_urls(
     client: &async_nats::Client,
     job_id: &str,
-    tenant: &str,
-    keys: &[String],
+    tenant: &TenantId,
+    keys: &[ObjectKey],
     download: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut message = capnp::message::Builder::new_default();
@@ -84,7 +82,7 @@ async fn request_urls(
         let mut request = message.init_root::<kubernix_capnp::upload_url_request::Builder>();
         request.set_job_id(job_id);
         request.set_download(download);
-        request.set_tenant(tenant);
+        request.set_tenant(tenant.as_str());
         let mut list = request.reborrow().init_keys(keys.len() as u32);
         for (i, key) in keys.iter().enumerate() {
             list.set(i as u32, key.as_str());
@@ -124,8 +122,8 @@ async fn request_urls(
 pub async fn upload_output(
     http: &reqwest::Client,
     url: &str,
-    key: String,
-    store_path: &str,
+    key: ObjectKey,
+    store_path: &StorePath,
     nix_store: &str,
     nix_cli: &str,
     store_uri: Option<&str>,
@@ -139,7 +137,7 @@ pub async fn upload_output(
         command.arg("--store").arg(uri);
     }
     let mut child = command
-        .arg(store_path)
+        .arg(store_path.as_str())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -219,7 +217,7 @@ pub async fn upload_output(
     let (references, deriver) = query_path_metadata(nix_store, store_path, store_uri).await?;
 
     Ok(OutputArtifact {
-        store_path: store_path.to_string(),
+        store_path: store_path.clone(),
         nar_hash: nar_hasher.finalize(),
         nar_size,
         file_hash: file_hasher.finalize(),
@@ -242,9 +240,9 @@ pub async fn upload_output(
 pub async fn fetch_input(
     http: &reqwest::Client,
     url: &str,
-    store_path: &str,
-    references: &[String],
-    deriver: &str,
+    store_path: &StorePath,
+    references: &[StorePath],
+    deriver: &StorePath,
     nix_store: &str,
     store_uri: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -320,7 +318,7 @@ pub async fn fetch_input(
 pub async fn upload_log(
     http: &reqwest::Client,
     url: &str,
-    key: &str,
+    key: &ObjectKey,
     log: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = http
@@ -337,9 +335,9 @@ pub async fn upload_log(
 
 async fn query_path_metadata(
     nix_store: &str,
-    store_path: &str,
+    store_path: &StorePath,
     store_uri: Option<&str>,
-) -> Result<(Vec<String>, String), Box<dyn std::error::Error>> {
+) -> Result<(Vec<StorePath>, StorePath), Box<dyn std::error::Error>> {
     let with_store = |cmd: &str| {
         let mut c = Command::new(nix_store);
         if let Some(uri) = store_uri {
@@ -351,25 +349,25 @@ async fn query_path_metadata(
 
     let references = with_store("--query")
         .arg("--references")
-        .arg(store_path)
+        .arg(store_path.as_str())
         .output()
         .await?;
     let references = String::from_utf8_lossy(&references.stdout)
         .lines()
-        .map(str::to_string)
+        .map(StorePath::new)
         .collect();
 
     let deriver = with_store("--query")
         .arg("--deriver")
-        .arg(store_path)
+        .arg(store_path.as_str())
         .output()
         .await?;
     let deriver = String::from_utf8_lossy(&deriver.stdout).trim().to_string();
     // `--query --deriver` prints "unknown-deriver" when there is none.
     let deriver = if deriver == "unknown-deriver" {
-        String::new()
+        StorePath::default()
     } else {
-        deriver
+        StorePath::new(deriver)
     };
 
     Ok((references, deriver))
@@ -377,19 +375,32 @@ async fn query_path_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_part_of, log_key, nar_key};
+    use super::{log_key, nar_key};
+    use kubernix_types::{ObjectKey, StorePath, TenantId};
 
     const P: &str = "/nix/store/21d91afy6vgw4l00yzy92kp92b1w3cdm-kxs-testfile.txt";
 
+    fn p() -> StorePath {
+        StorePath::new(P)
+    }
+
+    fn t(name: &str) -> TenantId {
+        TenantId::from_wire(name).expect("well formed")
+    }
+
     #[test]
     fn derives_keys_from_store_paths() {
-        assert_eq!(hash_part_of(P), Some("21d91afy6vgw4l00yzy92kp92b1w3cdm"));
+        assert_eq!(p().hash_part(), Some("21d91afy6vgw4l00yzy92kp92b1w3cdm"));
         assert_eq!(
-            nar_key("tenant-1", P).as_deref(),
+            nar_key(&t("tenant-1"), &p())
+                .as_ref()
+                .map(ObjectKey::as_str),
             Some("tenant-1/nar/21d91afy6vgw4l00yzy92kp92b1w3cdm.nar.zst")
         );
         assert_eq!(
-            log_key("tenant-1", P).as_deref(),
+            log_key(&t("tenant-1"), &p())
+                .as_ref()
+                .map(ObjectKey::as_str),
             Some("tenant-1/log/21d91afy6vgw4l00yzy92kp92b1w3cdm")
         );
     }
@@ -398,14 +409,15 @@ mod tests {
     fn keys_are_scoped_per_tenant() {
         // Two tenants building the same derivation must not collide in the
         // object store, and neither may be signed for the other.
-        assert_ne!(nar_key("tenant-1", P), nar_key("tenant-2", P));
-        assert_ne!(log_key("tenant-1", P), log_key("tenant-2", P));
+        assert_ne!(nar_key(&t("tenant-1"), &p()), nar_key(&t("tenant-2"), &p()));
+        assert_ne!(log_key(&t("tenant-1"), &p()), log_key(&t("tenant-2"), &p()));
     }
 
     #[test]
     fn rejects_paths_without_a_hash_part() {
-        assert_eq!(hash_part_of("/etc/passwd"), None);
-        assert_eq!(hash_part_of("notapath"), None);
-        assert_eq!(nar_key("tenant-1", "/etc/passwd"), None);
+        let bad = StorePath::new("/etc/passwd");
+        assert_eq!(bad.hash_part(), None);
+        assert_eq!(StorePath::new("notapath").hash_part(), None);
+        assert_eq!(nar_key(&t("tenant-1"), &bad), None);
     }
 }

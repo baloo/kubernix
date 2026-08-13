@@ -15,6 +15,7 @@ capnp-rpc = "0.27.0"
 ed25519-dalek.workspace = true
 futures-util.workspace = true
 kubernix-signing.workspace = true
+kubernix-types.workspace = true
 rand = "0.10"
 russh = { version = "0.62.5", features = ["async-trait"] }
 serde = { version = "1.0.229", features = ["derive"] }

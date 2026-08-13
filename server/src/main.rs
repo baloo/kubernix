@@ -64,8 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = HttpState {
         store,
         uploader,
-        store_dir: std::env::var("KUBERNIX_STORE_DIR")
-            .unwrap_or_else(|_| "/nix/store".to_string()),
+        store_dir: std::env::var("KUBERNIX_STORE_DIR").unwrap_or_else(|_| "/nix/store".to_string()),
         priority: std::env::var("KUBERNIX_CACHE_PRIORITY")
             .ok()
             .and_then(|p| p.parse().ok())

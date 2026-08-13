@@ -24,6 +24,7 @@ use crate::store::{
     Tier,
 };
 use kubernix_signing::{KIND_LOCAL_ED25519, LocalSigner, Signer, key_name_for};
+use kubernix_types::{ObjectKey, StorePath};
 
 use crate::tenant::{Tenant, TenantId};
 
@@ -69,13 +70,17 @@ impl PostgresStore {
     /// Connect and apply the migrations.
     pub async fn connect(url: &str) -> std::result::Result<Arc<Self>, sqlx::Error> {
         tracing::info!("connecting to PostgreSQL");
-        let pool = PgPoolOptions::new().max_connections(16).connect(url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(16)
+            .connect(url)
+            .await?;
 
         // Applied on startup rather than by a separate step so a fresh
         // deployment works without one.
-        sqlx::migrate!("./migrations").run(&pool).await.map_err(
-            |e| sqlx::Error::Configuration(Box::new(e)),
-        )?;
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
 
         tracing::info!("database ready");
         Ok(Arc::new(Self { pool }))
@@ -119,14 +124,18 @@ impl PostgresStore {
 
     fn row_to_info(row: &sqlx::postgres::PgRow) -> PathInfo {
         PathInfo {
-            path: row.get("path"),
-            deriver: row.get("deriver"),
+            path: StorePath::new(row.get::<String, _>("path")),
+            deriver: row.get::<Option<String>, _>("deriver").map(StorePath::new),
             nar_hash: Hash {
                 hash_type: algo_from_name(row.get::<String, _>("nar_hash_algo").as_str()),
                 bytes: row.get("nar_hash"),
             },
             nar_size: row.get::<i64, _>("nar_size") as u64,
-            references: row.get("refs"),
+            references: row
+                .get::<Vec<String>, _>("refs")
+                .into_iter()
+                .map(StorePath::new)
+                .collect(),
             registration_time: row.get("registration_time"),
             ultimate: row.get("ultimate"),
             sigs: row.get("sigs"),
@@ -165,6 +174,8 @@ impl PostgresStore {
         .await
         .map_err(db_err)?;
 
+        let references: Vec<&str> = info.references.iter().map(StorePath::as_str).collect();
+
         sqlx::query(
             "INSERT INTO store_paths (
                  tenant, path, hash_part, deriver, nar_hash_algo, nar_hash, nar_size,
@@ -183,15 +194,15 @@ impl PostgresStore {
                  tier = EXCLUDED.tier",
         )
         .bind(tenant.as_str())
-        .bind(&info.path)
-        .bind(hash_part_of(&info.path))
-        .bind(&info.deriver)
+        .bind(info.path.as_str())
+        .bind(hash_part_of(info.path.as_str()))
+        .bind(info.deriver.as_ref().map(StorePath::as_str))
         .bind(algo_name(info.nar_hash.hash_type))
         .bind(&info.nar_hash.bytes)
         .bind(info.nar_size as i64)
         .bind(info.registration_time)
         .bind(info.ultimate)
-        .bind(&info.references)
+        .bind(&references)
         .bind(&info.sigs)
         .bind(object.key.as_str())
         .bind(tier.as_str())
@@ -206,10 +217,10 @@ impl PostgresStore {
 
 #[async_trait::async_trait]
 impl Store for PostgresStore {
-    async fn is_valid_path(&self, tenant: &TenantId, path: &str) -> bool {
+    async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool {
         sqlx::query("SELECT 1 FROM store_paths WHERE tenant = $1 AND path = $2")
             .bind(tenant.as_str())
-            .bind(path)
+            .bind(path.as_str())
             .fetch_optional(&self.pool)
             .await
             .unwrap_or_else(|e| {
@@ -219,33 +230,38 @@ impl Store for PostgresStore {
             .is_some()
     }
 
-    async fn query_valid_paths(&self, tenant: &TenantId, paths: &[String]) -> Vec<String> {
-        sqlx::query_scalar("SELECT path FROM store_paths WHERE tenant = $1 AND path = ANY($2)")
-            .bind(tenant.as_str())
-            .bind(paths)
-            .fetch_all(&self.pool)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "queryValidPaths failed");
-                Vec::new()
-            })
+    async fn query_valid_paths(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath> {
+        let raw: Vec<&str> = paths.iter().map(StorePath::as_str).collect();
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM store_paths WHERE tenant = $1 AND path = ANY($2)")
+                .bind(tenant.as_str())
+                .bind(&raw)
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "queryValidPaths failed");
+                    Vec::new()
+                });
+        rows.into_iter().map(StorePath::new).collect()
     }
 
-    async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<String> {
-        sqlx::query_scalar("SELECT path FROM store_paths WHERE tenant = $1")
-            .bind(tenant.as_str())
-            .fetch_all(&self.pool)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "queryAllValidPaths failed");
-                Vec::new()
-            })
+    async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<StorePath> {
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM store_paths WHERE tenant = $1")
+                .bind(tenant.as_str())
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "queryAllValidPaths failed");
+                    Vec::new()
+                });
+        rows.into_iter().map(StorePath::new).collect()
     }
 
-    async fn query_path_info(&self, tenant: &TenantId, path: &str) -> Option<PathInfo> {
+    async fn query_path_info(&self, tenant: &TenantId, path: &StorePath) -> Option<PathInfo> {
         sqlx::query("SELECT * FROM store_paths WHERE tenant = $1 AND path = $2")
             .bind(tenant.as_str())
-            .bind(path)
+            .bind(path.as_str())
             .fetch_optional(&self.pool)
             .await
             .unwrap_or_else(|e| {
@@ -259,29 +275,35 @@ impl Store for PostgresStore {
         &self,
         tenant: &TenantId,
         hash_part: &str,
-    ) -> Option<String> {
-        sqlx::query_scalar("SELECT path FROM store_paths WHERE tenant = $1 AND hash_part = $2")
-            .bind(tenant.as_str())
-            .bind(hash_part)
-            .fetch_optional(&self.pool)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "queryPathFromHashPart failed");
-                None
-            })
+    ) -> Option<StorePath> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT path FROM store_paths WHERE tenant = $1 AND hash_part = $2",
+        )
+        .bind(tenant.as_str())
+        .bind(hash_part)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "queryPathFromHashPart failed");
+            None
+        })
+        .map(StorePath::new)
     }
 
-    async fn query_referrers(&self, tenant: &TenantId, path: &str) -> Vec<String> {
+    async fn query_referrers(&self, tenant: &TenantId, path: &StorePath) -> Vec<StorePath> {
         // `@>` is the array-containment operator the GIN index answers.
-        sqlx::query_scalar("SELECT path FROM store_paths WHERE tenant = $1 AND refs @> ARRAY[$2]")
-            .bind(tenant.as_str())
-            .bind(path)
-            .fetch_all(&self.pool)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, %path, "queryReferrers failed");
-                Vec::new()
-            })
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT path FROM store_paths WHERE tenant = $1 AND refs @> ARRAY[$2]",
+        )
+        .bind(tenant.as_str())
+        .bind(path.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, %path, "queryReferrers failed");
+            Vec::new()
+        });
+        rows.into_iter().map(StorePath::new).collect()
     }
 
     async fn record_path(
@@ -301,14 +323,14 @@ impl Store for PostgresStore {
         self.upsert_path(tenant, &info, &object, tier).await
     }
 
-    async fn output_object(&self, tenant: &TenantId, path: &str) -> Option<RemoteObject> {
+    async fn output_object(&self, tenant: &TenantId, path: &StorePath) -> Option<RemoteObject> {
         let row = sqlx::query(
             "SELECT o.key, o.file_size, o.file_hash
                FROM store_paths sp JOIN objects o ON o.key = sp.object_key
               WHERE sp.tenant = $1 AND sp.path = $2",
         )
         .bind(tenant.as_str())
-        .bind(path)
+        .bind(path.as_str())
         .fetch_optional(&self.pool)
         .await
         .unwrap_or_else(|e| {
@@ -317,15 +339,15 @@ impl Store for PostgresStore {
         })?;
 
         Some(RemoteObject {
-            key: row.get("key"),
+            key: ObjectKey::new(row.get::<String, _>("key")),
             file_size: row.get::<i64, _>("file_size") as u64,
             file_hash: row.get("file_hash"),
         })
     }
 
-    async fn object_known(&self, key: &str) -> bool {
+    async fn object_known(&self, key: &ObjectKey) -> bool {
         sqlx::query("SELECT 1 FROM objects WHERE key = $1")
-            .bind(key)
+            .bind(key.as_str())
             .fetch_optional(&self.pool)
             .await
             .unwrap_or_else(|e| {
@@ -335,7 +357,12 @@ impl Store for PostgresStore {
             .is_some()
     }
 
-    async fn add_signatures(&self, tenant: &TenantId, path: &str, sigs: Vec<String>) -> Result<()> {
+    async fn add_signatures(
+        &self,
+        tenant: &TenantId,
+        path: &StorePath,
+        sigs: Vec<String>,
+    ) -> Result<()> {
         // Union in SQL so concurrent signers do not clobber each other, which a
         // read-modify-write would.
         let updated = sqlx::query(
@@ -344,7 +371,7 @@ impl Store for PostgresStore {
               WHERE tenant = $1 AND path = $2",
         )
         .bind(tenant.as_str())
-        .bind(path)
+        .bind(path.as_str())
         .bind(&sigs)
         .execute(&self.pool)
         .await
@@ -356,7 +383,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn query_missing(&self, tenant: &TenantId, targets: &[String]) -> MissingPaths {
+    async fn query_missing(&self, tenant: &TenantId, targets: &[StorePath]) -> MissingPaths {
         let present = self.query_valid_paths(tenant, targets).await;
         let mut missing = MissingPaths::default();
         for target in targets {
@@ -382,7 +409,7 @@ impl Store for PostgresStore {
     async fn signer(&self, tenant: &TenantId) -> Option<Arc<dyn Signer>> {
         self.ensure_tenant_id(tenant).await.ok()?;
 
-        let name = key_name_for(tenant.as_str());
+        let name = key_name_for(tenant);
         let fresh = LocalSigner::generate(&name);
 
         let row = sqlx::query(
@@ -424,12 +451,12 @@ impl Store for PostgresStore {
         }
     }
 
-    async fn tier(&self, tenant: &TenantId, path: &str) -> Option<Tier> {
+    async fn tier(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier> {
         sqlx::query_scalar::<_, String>(
             "SELECT tier FROM store_paths WHERE tenant = $1 AND path = $2",
         )
         .bind(tenant.as_str())
-        .bind(path)
+        .bind(path.as_str())
         .fetch_optional(&self.pool)
         .await
         .unwrap_or_else(|e| {
@@ -505,7 +532,7 @@ mod tests {
 
     fn info(path: &str) -> PathInfo {
         PathInfo {
-            path: path.to_string(),
+            path: StorePath::new(path),
             deriver: None,
             nar_hash: Hash {
                 hash_type: HashType::Sha256,
@@ -522,7 +549,7 @@ mod tests {
     /// Where a path's bytes are. The database records this and never the bytes.
     fn object(key: &str) -> RemoteObject {
         RemoteObject {
-            key: key.to_string(),
+            key: ObjectKey::new(key),
             file_size: 3,
             file_hash: vec![9; 32],
         }
@@ -531,22 +558,33 @@ mod tests {
     const P: &str = "/nix/store/00000000000000000000000000000000-thing";
     const DEP: &str = "/nix/store/11111111111111111111111111111111-dep";
 
+    fn p() -> StorePath {
+        StorePath::new(P)
+    }
+
+    fn dep() -> StorePath {
+        StorePath::new(DEP)
+    }
+
     #[tokio::test]
     async fn round_trips_a_pushed_path() {
         let Some(store) = db().await else { return };
         let t = tenant("roundtrip");
 
-        assert!(!store.is_valid_path(&t, P).await);
+        assert!(!store.is_valid_path(&t, &p()).await);
         store
             .record_path(&t, info(P), object("k"), Tier::Verified)
             .await
             .unwrap();
 
-        assert!(store.is_valid_path(&t, P).await);
-        assert_eq!(store.query_valid_paths(&t, &[P.to_string()]).await, vec![P]);
-        assert_eq!(store.output_object(&t, P).await.unwrap().key, "k");
+        assert!(store.is_valid_path(&t, &p()).await);
+        assert_eq!(store.query_valid_paths(&t, &[p()]).await, vec![p()]);
+        assert_eq!(
+            store.output_object(&t, &p()).await.unwrap().key.as_str(),
+            "k"
+        );
 
-        let read = store.query_path_info(&t, P).await.expect("recorded");
+        let read = store.query_path_info(&t, &p()).await.expect("recorded");
         assert_eq!(read.nar_size, 3);
         assert_eq!(read.nar_hash.bytes, vec![7; 32]);
         assert_eq!(read.nar_hash.hash_type, HashType::Sha256);
@@ -564,9 +602,8 @@ mod tests {
         assert_eq!(
             store
                 .query_path_from_hash_part(&t, "00000000000000000000000000000000")
-                .await
-                .as_deref(),
-            Some(P)
+                .await,
+            Some(p())
         );
         assert_eq!(store.query_path_from_hash_part(&t, "deadbeef").await, None);
     }
@@ -580,19 +617,19 @@ mod tests {
             .await
             .unwrap();
         let mut referrer = info(P);
-        referrer.references = vec![DEP.to_string()];
+        referrer.references = vec![dep()];
         store
             .record_path(&t, referrer, object("k"), Tier::Verified)
             .await
             .unwrap();
 
-        assert_eq!(store.query_referrers(&t, DEP).await, vec![P]);
-        assert!(store.query_referrers(&t, P).await.is_empty());
+        assert_eq!(store.query_referrers(&t, &dep()).await, vec![p()]);
+        assert!(store.query_referrers(&t, &p()).await.is_empty());
         // And the references survive the round trip, since a narinfo is made of
         // them.
         assert_eq!(
-            store.query_path_info(&t, P).await.unwrap().references,
-            vec![DEP]
+            store.query_path_info(&t, &p()).await.unwrap().references,
+            vec![dep()]
         );
     }
 
@@ -606,7 +643,7 @@ mod tests {
                 &t,
                 info(P),
                 RemoteObject {
-                    key: key.to_string(),
+                    key: ObjectKey::new(key),
                     file_size: 99,
                     file_hash: vec![0xcd; 32],
                 },
@@ -617,8 +654,8 @@ mod tests {
 
         // The database records where the bytes are, never the bytes; the RPC
         // layer and the cache both fetch from this key.
-        let remote = store.output_object(&t, P).await.expect("has an object");
-        assert_eq!(remote.key, key);
+        let remote = store.output_object(&t, &p()).await.expect("has an object");
+        assert_eq!(remote.key.as_str(), key);
         assert_eq!(remote.file_size, 99);
         // The compressed hash must survive: it is what a narinfo `FileHash`
         // states, and a client verifies its download against it.
@@ -635,15 +672,15 @@ mod tests {
             .unwrap();
 
         store
-            .add_signatures(&t, P, vec!["a:1".to_string()])
+            .add_signatures(&t, &p(), vec!["a:1".to_string()])
             .await
             .unwrap();
         store
-            .add_signatures(&t, P, vec!["a:1".to_string(), "b:2".to_string()])
+            .add_signatures(&t, &p(), vec!["a:1".to_string(), "b:2".to_string()])
             .await
             .unwrap();
 
-        let mut sigs = store.query_path_info(&t, P).await.unwrap().sigs;
+        let mut sigs = store.query_path_info(&t, &p()).await.unwrap().sigs;
         sigs.sort();
         assert_eq!(sigs, vec!["a:1", "b:2"]);
     }
@@ -653,7 +690,9 @@ mod tests {
         let Some(store) = db().await else { return };
         let t = tenant("sigs-missing");
         assert!(matches!(
-            store.add_signatures(&t, P, vec!["a:1".to_string()]).await,
+            store
+                .add_signatures(&t, &p(), vec!["a:1".to_string()])
+                .await,
             Err(StoreError::NotFound(_))
         ));
     }
@@ -667,8 +706,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!store.is_valid_path(&bob, P).await);
-        assert!(store.query_path_info(&bob, P).await.is_none());
+        assert!(!store.is_valid_path(&bob, &p()).await);
+        assert!(store.query_path_info(&bob, &p()).await.is_none());
         assert!(store.query_all_valid_paths(&bob).await.is_empty());
         assert!(
             store
@@ -676,7 +715,7 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(store.output_object(&bob, P).await.is_none());
+        assert!(store.output_object(&bob, &p()).await.is_none());
 
         // And the same path may hold different bytes for each: whoever writes
         // second must not win, which is what `(tenant, path)` as the primary key
@@ -685,8 +724,19 @@ mod tests {
             .record_path(&bob, info(P), object("k"), Tier::Verified)
             .await
             .unwrap();
-        assert_eq!(store.output_object(&alice, P).await.unwrap().key, "alice/nar/x");
-        assert_eq!(store.output_object(&bob, P).await.unwrap().key, "k");
+        assert_eq!(
+            store
+                .output_object(&alice, &p())
+                .await
+                .unwrap()
+                .key
+                .as_str(),
+            "alice/nar/x"
+        );
+        assert_eq!(
+            store.output_object(&bob, &p()).await.unwrap().key.as_str(),
+            "k"
+        );
     }
 
     #[tokio::test]
@@ -700,26 +750,30 @@ mod tests {
             .record_path(&t, info(P), object("k"), Tier::Quarantined)
             .await
             .unwrap();
-        assert_eq!(store.tier(&t, P).await, Some(Tier::Quarantined));
+        assert_eq!(store.tier(&t, &p()).await, Some(Tier::Quarantined));
 
         store
             .record_path(&t, info(P), object("k"), Tier::Built)
             .await
             .unwrap();
-        assert_eq!(store.tier(&t, P).await, Some(Tier::Built));
+        assert_eq!(store.tier(&t, &p()).await, Some(Tier::Built));
     }
 
     #[tokio::test]
     async fn object_known_reports_whether_a_key_is_recorded() {
         let Some(store) = db().await else { return };
-        assert!(!store.object_known("no-such-key").await);
+        assert!(!store.object_known(&ObjectKey::new("no-such-key")).await);
 
         let t = tenant("object-known");
         store
             .record_path(&t, info(P), object("shared/nar/x.nar.zst"), Tier::Verified)
             .await
             .unwrap();
-        assert!(store.object_known("shared/nar/x.nar.zst").await);
+        assert!(
+            store
+                .object_known(&ObjectKey::new("shared/nar/x.nar.zst"))
+                .await
+        );
     }
 
     #[tokio::test]
@@ -751,10 +805,18 @@ mod tests {
         // And each tenant still has its own store_paths row pointing at it —
         // sharing the bytes did not merge the paths.
         assert_eq!(
-            store.output_object(&alice, P).await.unwrap().key,
+            store
+                .output_object(&alice, &p())
+                .await
+                .unwrap()
+                .key
+                .as_str(),
             shared_key
         );
-        assert_eq!(store.output_object(&bob, P).await.unwrap().key, shared_key);
+        assert_eq!(
+            store.output_object(&bob, &p()).await.unwrap().key.as_str(),
+            shared_key
+        );
     }
 
     #[tokio::test]
@@ -772,7 +834,7 @@ mod tests {
                 &alice,
                 info(P),
                 crate::store::RemoteObject {
-                    key: shared_key.to_string(),
+                    key: ObjectKey::new(shared_key),
                     file_size: 111,
                     file_hash: vec![1; 32],
                 },
@@ -787,7 +849,7 @@ mod tests {
                 &bob,
                 info(P),
                 crate::store::RemoteObject {
-                    key: shared_key.to_string(),
+                    key: ObjectKey::new(shared_key),
                     file_size: 222,
                     file_hash: vec![2; 32],
                 },
@@ -796,7 +858,7 @@ mod tests {
             .await
             .unwrap();
 
-        let bobs_view = store.output_object(&bob, P).await.unwrap();
+        let bobs_view = store.output_object(&bob, &p()).await.unwrap();
         assert_eq!(bobs_view.file_size, 111);
         assert_eq!(bobs_view.file_hash, vec![1; 32]);
     }
@@ -813,12 +875,11 @@ mod tests {
         store.register_tenant(&claimed).await.unwrap();
         store.register_tenant(&proven).await.unwrap();
 
-        let verified: bool =
-            sqlx::query_scalar("SELECT verified FROM tenants WHERE id = $1")
-                .bind(proven.id.as_str())
-                .fetch_one(&store.pool)
-                .await
-                .unwrap();
+        let verified: bool = sqlx::query_scalar("SELECT verified FROM tenants WHERE id = $1")
+            .bind(proven.id.as_str())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
         assert!(verified);
     }
 }

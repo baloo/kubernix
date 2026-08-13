@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use async_nats::jetstream::{self, consumer::pull, stream::RetentionPolicy};
 use futures_util::StreamExt;
+use kubernix_types::{ObjectKey, StorePath, System};
 use uuid::Uuid;
 
 use crate::kubernix_capnp;
@@ -24,7 +25,7 @@ use crate::tenant::TenantId;
 pub const JOBS_STREAM: &str = "kubernix_jobs";
 pub const RESULTS_STREAM: &str = "kubernix_results";
 
-pub fn jobs_subject(system: &str) -> String {
+pub fn jobs_subject(system: &System) -> String {
     format!("kubernix.jobs.{system}")
 }
 
@@ -38,20 +39,20 @@ pub fn results_subject(job_id: &Uuid) -> String {
 
 #[derive(Debug, Clone)]
 pub struct InputRef {
-    pub store_path: String,
+    pub store_path: StorePath,
     /// Object key holding the zstd-compressed bare NAR.
-    pub key: String,
+    pub key: ObjectKey,
     /// Sent with the key because a bare NAR cannot be imported alone: the
     /// worker wraps it into an export stream, which needs both of these.
-    pub references: Vec<String>,
-    pub deriver: String,
+    pub references: Vec<StorePath>,
+    pub deriver: StorePath,
 }
 
 #[derive(Debug)]
 pub struct BuildJob {
     pub job_id: Uuid,
-    pub derivation_path: String,
-    pub system: String,
+    pub derivation_path: StorePath,
+    pub system: System,
     /// Serialized derivation, so the worker does not need it in its store first.
     pub drv: Vec<u8>,
     /// Inputs staged to the object store for this build.
@@ -67,21 +68,21 @@ pub struct BuildJob {
 /// from. The frontend never sees the build, so this cannot be recomputed here.
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
-    pub store_path: String,
+    pub store_path: StorePath,
     pub nar_hash: Vec<u8>,
     pub nar_size: u64,
     pub file_hash: Vec<u8>,
     pub file_size: u64,
-    pub key: String,
+    pub key: ObjectKey,
     pub compression: String,
-    pub references: Vec<String>,
-    pub deriver: Option<String>,
+    pub references: Vec<StorePath>,
+    pub deriver: Option<StorePath>,
 }
 
 #[derive(Debug, Clone)]
 pub enum JobOutcome {
     Completed {
-        outputs: Vec<String>,
+        outputs: Vec<StorePath>,
         infos: Vec<OutputInfo>,
         log_key: String,
     },
@@ -204,7 +205,10 @@ impl JobQueue {
 
         // Await the ack: a publish that silently failed would leave the client
         // waiting for a build nobody queued.
-        self.jetstream.publish(subject, payload.into()).await?.await?;
+        self.jetstream
+            .publish(subject, payload.into())
+            .await?
+            .await?;
         Ok(())
     }
 
@@ -217,7 +221,12 @@ impl JobQueue {
 
         let message = tokio::time::timeout(self.result_timeout, messages.next())
             .await
-            .map_err(|_| format!("timed out after {:?} waiting for a worker", self.result_timeout))?
+            .map_err(|_| {
+                format!(
+                    "timed out after {:?} waiting for a worker",
+                    self.result_timeout
+                )
+            })?
             .ok_or("result stream ended before an outcome arrived")??;
 
         let outcome = decode_outcome(&message.payload)?;
@@ -230,8 +239,7 @@ pub fn decode_outcome(
     payload: &[u8],
 ) -> Result<JobOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut cursor = payload;
-    let reader =
-        capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
     let result = reader.get_root::<kubernix_capnp::job_result::Reader>()?;
 
     let log_key = result.get_log_key()?.to_string()?;
@@ -240,26 +248,26 @@ pub fn decode_outcome(
         kubernix_capnp::JobStatus::Completed => {
             let mut outputs = Vec::new();
             for path in result.get_output_paths()?.iter() {
-                outputs.push(path?.to_string()?);
+                outputs.push(StorePath::new(path?.to_string()?));
             }
 
             let mut infos = Vec::new();
             for info in result.get_outputs()?.iter() {
                 let mut references = Vec::new();
                 for reference in info.get_references()?.iter() {
-                    references.push(reference?.to_string()?);
+                    references.push(StorePath::new(reference?.to_string()?));
                 }
                 let deriver = info.get_deriver()?.to_string()?;
                 infos.push(OutputInfo {
-                    store_path: info.get_store_path()?.to_string()?,
+                    store_path: StorePath::new(info.get_store_path()?.to_string()?),
                     nar_hash: info.get_nar_hash()?.to_vec(),
                     nar_size: info.get_nar_size(),
                     file_hash: info.get_file_hash()?.to_vec(),
                     file_size: info.get_file_size(),
-                    key: info.get_key()?.to_string()?,
+                    key: ObjectKey::new(info.get_key()?.to_string()?),
                     compression: info.get_compression()?.to_string()?,
                     references,
-                    deriver: (!deriver.is_empty()).then_some(deriver),
+                    deriver: (!deriver.is_empty()).then_some(StorePath::new(deriver)),
                 });
             }
 

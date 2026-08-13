@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kubernix_signing::{LocalSigner, Signer, key_name_for};
+use kubernix_types::{ObjectKey, StorePath};
 
 use crate::tenant::TenantId;
 
@@ -31,11 +32,11 @@ pub struct Hash {
 /// that is what `StorePath.raw` carries on the wire (`types-rpc.hh:25-38`).
 #[derive(Clone, Debug)]
 pub struct PathInfo {
-    pub path: String,
-    pub deriver: Option<String>,
+    pub path: StorePath,
+    pub deriver: Option<StorePath>,
     pub nar_hash: Hash,
     pub nar_size: u64,
-    pub references: Vec<String>,
+    pub references: Vec<StorePath>,
     pub registration_time: i64,
     pub ultimate: bool,
     pub sigs: Vec<String>,
@@ -149,30 +150,30 @@ pub struct ClientOptions {
 /// see NOTES.md item 7.
 #[async_trait::async_trait]
 pub trait Store: Send + Sync {
-    async fn is_valid_path(&self, tenant: &TenantId, path: &str) -> bool;
+    async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool;
 
-    async fn query_valid_paths(&self, tenant: &TenantId, paths: &[String]) -> Vec<String>;
+    async fn query_valid_paths(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath>;
 
-    async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<String>;
+    async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<StorePath>;
 
-    async fn query_path_info(&self, tenant: &TenantId, path: &str) -> Option<PathInfo>;
+    async fn query_path_info(&self, tenant: &TenantId, path: &StorePath) -> Option<PathInfo>;
 
     /// Resolve the hash part of a store path (the 32 chars after the store dir).
     async fn query_path_from_hash_part(
         &self,
         tenant: &TenantId,
         hash_part: &str,
-    ) -> Option<String>;
+    ) -> Option<StorePath>;
 
-    async fn query_referrers(&self, tenant: &TenantId, path: &str) -> Vec<String>;
+    async fn query_referrers(&self, tenant: &TenantId, path: &StorePath) -> Vec<StorePath>;
 
     /// Paths that could be substituted. The frontend substitutes nothing on the
     /// client's behalf, so this is empty.
     async fn query_substitutable_paths(
         &self,
         _tenant: &TenantId,
-        _paths: &[String],
-    ) -> Vec<String> {
+        _paths: &[StorePath],
+    ) -> Vec<StorePath> {
         Vec::new()
     }
 
@@ -198,7 +199,7 @@ pub trait Store: Send + Sync {
     /// The store never returns bytes: it holds none. The RPC layer and the HTTP
     /// surface fetch from the key, which is what keeps every store
     /// implementation free of an object-store client.
-    async fn output_object(&self, tenant: &TenantId, path: &str) -> Option<RemoteObject>;
+    async fn output_object(&self, tenant: &TenantId, path: &StorePath) -> Option<RemoteObject>;
 
     /// Whether an object key is already recorded.
     ///
@@ -207,17 +208,22 @@ pub trait Store: Send + Sync {
     /// are already in the object store — PLAN.md Phase 9c. Skipping the upload
     /// is the actual saving; `record_path`'s own dedup keeps the database
     /// correct either way, so this is an optimisation, not a safety check.
-    async fn object_known(&self, key: &str) -> bool;
+    async fn object_known(&self, key: &ObjectKey) -> bool;
 
-    async fn add_signatures(&self, tenant: &TenantId, path: &str, sigs: Vec<String>) -> Result<()>;
+    async fn add_signatures(
+        &self,
+        tenant: &TenantId,
+        path: &StorePath,
+        sigs: Vec<String>,
+    ) -> Result<()>;
 
     /// Split `paths` into what would need building versus what is already there.
-    async fn query_missing(&self, tenant: &TenantId, targets: &[String]) -> MissingPaths;
+    async fn query_missing(&self, tenant: &TenantId, targets: &[StorePath]) -> MissingPaths;
 
     /// How much this path can be vouched for. `None` if it is not here at all.
     ///
     /// Read before signing a path or serving it to anyone but its owner.
-    async fn tier(&self, tenant: &TenantId, path: &str) -> Option<Tier>;
+    async fn tier(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier>;
 
     /// The tenant's signing key, creating one on first use.
     ///
@@ -241,9 +247,9 @@ pub trait Store: Send + Sync {
 
 #[derive(Clone, Debug, Default)]
 pub struct MissingPaths {
-    pub will_build: Vec<String>,
-    pub will_substitute: Vec<String>,
-    pub unknown: Vec<String>,
+    pub will_build: Vec<StorePath>,
+    pub will_substitute: Vec<StorePath>,
+    pub unknown: Vec<StorePath>,
     pub download_size: u64,
     pub nar_size: u64,
 }
@@ -260,7 +266,7 @@ pub struct MemoryStore {
     /// `Inner` — mirroring `PostgresStore`'s `objects` table, which is what
     /// makes a `Verified` key collision between two tenants a dedup rather
     /// than two independent objects. See [`Store::object_known`].
-    objects: Mutex<HashMap<String, RemoteObject>>,
+    objects: Mutex<HashMap<ObjectKey, RemoteObject>>,
 }
 
 /// One tenant's view. Partitioned rather than keyed by `(tenant, path)` so that
@@ -269,14 +275,14 @@ pub struct MemoryStore {
 /// tenants.
 #[derive(Default)]
 struct Inner {
-    paths: HashMap<String, PathInfo>,
+    paths: HashMap<StorePath, PathInfo>,
     /// Where each path's bytes are. Never the bytes themselves — they live in
     /// the object store, whichever route the path arrived by.
-    remote: HashMap<String, RemoteObject>,
+    remote: HashMap<StorePath, RemoteObject>,
     /// This tenant's signing key, generated on first use.
     signer: Option<Arc<dyn Signer>>,
     /// How much each path can be vouched for.
-    tiers: HashMap<String, Tier>,
+    tiers: HashMap<StorePath, Tier>,
     options: ClientOptions,
 }
 
@@ -297,22 +303,18 @@ struct Inner {
 /// one object rather than paying for it twice. Sharing the bytes is not
 /// sharing validity: each tenant's `store_paths` row is unaffected, and
 /// `key_is_permitted` still decides who may fetch this key.
-pub fn nar_key(tenant: &TenantId, tier: Tier, store_path: &str) -> Option<String> {
-    let base = store_path.rsplit('/').next()?;
-    let hash = base.split('-').next()?;
-    if hash.len() != 32 {
-        return None;
-    }
-    Some(match tier {
+pub fn nar_key(tenant: &TenantId, tier: Tier, store_path: &StorePath) -> Option<ObjectKey> {
+    let hash = store_path.hash_part()?;
+    Some(ObjectKey::new(match tier {
         Tier::Verified => format!("nar/{hash}.nar.zst"),
         Tier::Built => format!("{tenant}/nar/{hash}.nar.zst"),
         Tier::Quarantined => format!("{tenant}/untrusted/nar/{hash}.nar.zst"),
-    })
+    }))
 }
 
 #[derive(Clone, Debug)]
 pub struct RemoteObject {
-    pub key: String,
+    pub key: ObjectKey,
     pub file_size: u64,
     /// Hash of the *compressed* object, which is what a narinfo `FileHash`
     /// states and what a client checks the download against. Distinct from
@@ -341,20 +343,13 @@ impl MemoryStore {
     }
 }
 
-/// `/nix/store/<32-char hash>-<name>` → `<32-char hash>`.
-fn hash_part_of(path: &str) -> Option<&str> {
-    let base = path.rsplit('/').next()?;
-    let hash = base.split('-').next()?;
-    (hash.len() == 32).then_some(hash)
-}
-
 #[async_trait::async_trait]
 impl Store for MemoryStore {
-    async fn is_valid_path(&self, tenant: &TenantId, path: &str) -> bool {
+    async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool {
         self.read(tenant, |inner| inner.paths.contains_key(path))
     }
 
-    async fn query_valid_paths(&self, tenant: &TenantId, paths: &[String]) -> Vec<String> {
+    async fn query_valid_paths(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath> {
         self.read(tenant, |inner| {
             paths
                 .iter()
@@ -364,25 +359,29 @@ impl Store for MemoryStore {
         })
     }
 
-    async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<String> {
+    async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<StorePath> {
         self.read(tenant, |inner| inner.paths.keys().cloned().collect())
     }
 
-    async fn query_path_info(&self, tenant: &TenantId, path: &str) -> Option<PathInfo> {
+    async fn query_path_info(&self, tenant: &TenantId, path: &StorePath) -> Option<PathInfo> {
         self.read(tenant, |inner| inner.paths.get(path).cloned())
     }
 
-    async fn query_path_from_hash_part(&self, tenant: &TenantId, hash_part: &str) -> Option<String> {
+    async fn query_path_from_hash_part(
+        &self,
+        tenant: &TenantId,
+        hash_part: &str,
+    ) -> Option<StorePath> {
         self.read(tenant, |inner| {
             inner
                 .paths
                 .keys()
-                .find(|p| hash_part_of(p) == Some(hash_part))
+                .find(|p| p.hash_part() == Some(hash_part))
                 .cloned()
         })
     }
 
-    async fn query_referrers(&self, tenant: &TenantId, path: &str) -> Vec<String> {
+    async fn query_referrers(&self, tenant: &TenantId, path: &StorePath) -> Vec<StorePath> {
         self.read(tenant, |inner| {
             inner
                 .paths
@@ -420,15 +419,20 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn output_object(&self, tenant: &TenantId, path: &str) -> Option<RemoteObject> {
+    async fn output_object(&self, tenant: &TenantId, path: &StorePath) -> Option<RemoteObject> {
         self.read(tenant, |inner| inner.remote.get(path).cloned())
     }
 
-    async fn object_known(&self, key: &str) -> bool {
+    async fn object_known(&self, key: &ObjectKey) -> bool {
         self.objects.lock().unwrap().contains_key(key)
     }
 
-    async fn add_signatures(&self, tenant: &TenantId, path: &str, sigs: Vec<String>) -> Result<()> {
+    async fn add_signatures(
+        &self,
+        tenant: &TenantId,
+        path: &StorePath,
+        sigs: Vec<String>,
+    ) -> Result<()> {
         self.write(tenant, |inner| {
             let info = inner
                 .paths
@@ -443,7 +447,7 @@ impl Store for MemoryStore {
         })
     }
 
-    async fn query_missing(&self, tenant: &TenantId, targets: &[String]) -> MissingPaths {
+    async fn query_missing(&self, tenant: &TenantId, targets: &[StorePath]) -> MissingPaths {
         self.read(tenant, |inner| {
             let mut missing = MissingPaths::default();
             for target in targets {
@@ -456,7 +460,7 @@ impl Store for MemoryStore {
         })
     }
 
-    async fn tier(&self, tenant: &TenantId, path: &str) -> Option<Tier> {
+    async fn tier(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier> {
         self.read(tenant, |inner| inner.tiers.get(path).copied())
     }
 
@@ -465,9 +469,7 @@ impl Store for MemoryStore {
             Some(
                 inner
                     .signer
-                    .get_or_insert_with(|| {
-                        Arc::new(LocalSigner::generate(key_name_for(tenant.as_str())))
-                    })
+                    .get_or_insert_with(|| Arc::new(LocalSigner::generate(key_name_for(tenant))))
                     .clone(),
             )
         })
@@ -490,7 +492,7 @@ mod tests {
 
     fn info(path: &str) -> PathInfo {
         PathInfo {
-            path: path.to_string(),
+            path: StorePath::new(path),
             deriver: None,
             nar_hash: Hash {
                 hash_type: HashType::Sha256,
@@ -507,7 +509,7 @@ mod tests {
     /// Where a path's bytes are. The store records this and never the bytes.
     fn object(key: &str) -> RemoteObject {
         RemoteObject {
-            key: key.to_string(),
+            key: ObjectKey::new(key),
             file_size: 3,
             file_hash: vec![1; 32],
         }
@@ -515,25 +517,29 @@ mod tests {
 
     const P: &str = "/nix/store/00000000000000000000000000000000-thing";
 
+    fn p() -> StorePath {
+        StorePath::new(P)
+    }
+
     #[tokio::test]
     async fn round_trips_a_path() {
         let store = MemoryStore::new();
         let t = tenant("alice");
-        assert!(!store.is_valid_path(&t, P).await);
+        assert!(!store.is_valid_path(&t, &p()).await);
 
         store
             .record_path(&t, info(P), object("alice/nar/x.nar.zst"), Tier::Verified)
             .await
             .unwrap();
 
-        assert!(store.is_valid_path(&t, P).await);
-        assert_eq!(store.query_path_info(&t, P).await.unwrap().nar_size, 3);
-        assert_eq!(store.query_valid_paths(&t, &[P.to_string()]).await, vec![P]);
+        assert!(store.is_valid_path(&t, &p()).await);
+        assert_eq!(store.query_path_info(&t, &p()).await.unwrap().nar_size, 3);
+        assert_eq!(store.query_valid_paths(&t, &[p()]).await, vec![p()]);
         assert_eq!(
-            store.output_object(&t, P).await.unwrap().key,
+            store.output_object(&t, &p()).await.unwrap().key.as_str(),
             "alice/nar/x.nar.zst"
         );
-        assert_eq!(store.tier(&t, P).await, Some(Tier::Verified));
+        assert_eq!(store.tier(&t, &p()).await, Some(Tier::Verified));
     }
 
     #[tokio::test]
@@ -547,9 +553,8 @@ mod tests {
         assert_eq!(
             store
                 .query_path_from_hash_part(&t, "00000000000000000000000000000000")
-                .await
-                .as_deref(),
-            Some(P)
+                .await,
+            Some(p())
         );
         assert_eq!(store.query_path_from_hash_part(&t, "deadbeef").await, None);
     }
@@ -564,30 +569,31 @@ mod tests {
             .await
             .unwrap();
         let mut referrer = info(P);
-        referrer.references = vec![dep.to_string()];
+        referrer.references = vec![StorePath::new(dep)];
         store
             .record_path(&t, referrer, object("r"), Tier::Verified)
             .await
             .unwrap();
 
-        assert_eq!(store.query_referrers(&t, dep).await, vec![P]);
-        assert!(store.query_referrers(&t, P).await.is_empty());
+        assert_eq!(
+            store.query_referrers(&t, &StorePath::new(dep)).await,
+            vec![p()]
+        );
+        assert!(store.query_referrers(&t, &p()).await.is_empty());
     }
 
     #[tokio::test]
     async fn unknown_targets_are_reported_as_needing_a_build() {
         let store = MemoryStore::new();
-        let missing = store
-            .query_missing(&tenant("alice"), &[P.to_string()])
-            .await;
-        assert_eq!(missing.will_build, vec![P]);
+        let missing = store.query_missing(&tenant("alice"), &[p()]).await;
+        assert_eq!(missing.will_build, vec![p()]);
         assert!(missing.will_substitute.is_empty());
     }
 
     #[tokio::test]
     async fn an_unknown_path_has_no_object() {
         let store = MemoryStore::new();
-        assert!(store.output_object(&tenant("alice"), P).await.is_none());
+        assert!(store.output_object(&tenant("alice"), &p()).await.is_none());
     }
 
     #[tokio::test]
@@ -599,14 +605,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!store.is_valid_path(&bob, P).await);
-        assert!(store.query_path_info(&bob, P).await.is_none());
-        assert!(
-            store
-                .query_valid_paths(&bob, &[P.to_string()])
-                .await
-                .is_empty()
-        );
+        assert!(!store.is_valid_path(&bob, &p()).await);
+        assert!(store.query_path_info(&bob, &p()).await.is_none());
+        assert!(store.query_valid_paths(&bob, &[p()]).await.is_empty());
         assert!(store.query_all_valid_paths(&bob).await.is_empty());
         assert!(
             store
@@ -614,7 +615,7 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(store.output_object(&bob, P).await.is_none());
+        assert!(store.output_object(&bob, &p()).await.is_none());
     }
 
     #[tokio::test]
@@ -634,13 +635,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.output_object(&alice, P).await.unwrap().key,
+            store
+                .output_object(&alice, &p())
+                .await
+                .unwrap()
+                .key
+                .as_str(),
             "alice/nar/x"
         );
-        assert_eq!(store.output_object(&bob, P).await.unwrap().key, "bob/nar/x");
+        assert_eq!(
+            store.output_object(&bob, &p()).await.unwrap().key.as_str(),
+            "bob/nar/x"
+        );
         // And the tiers do not leak either.
-        assert_eq!(store.tier(&alice, P).await, Some(Tier::Verified));
-        assert_eq!(store.tier(&bob, P).await, Some(Tier::Quarantined));
+        assert_eq!(store.tier(&alice, &p()).await, Some(Tier::Verified));
+        assert_eq!(store.tier(&bob, &p()).await, Some(Tier::Quarantined));
     }
 
     #[tokio::test]
@@ -655,13 +664,13 @@ mod tests {
         // Bob cannot vouch for a path he cannot see.
         assert!(matches!(
             store
-                .add_signatures(&bob, P, vec!["forged".to_string()])
+                .add_signatures(&bob, &p(), vec!["forged".to_string()])
                 .await,
             Err(StoreError::NotFound(_))
         ));
         assert!(
             store
-                .query_path_info(&alice, P)
+                .query_path_info(&alice, &p())
                 .await
                 .unwrap()
                 .sigs
@@ -674,29 +683,32 @@ mod tests {
         // Otherwise an unauthenticated probe could grow the store's tenant map
         // without bound.
         let store = MemoryStore::new();
-        assert!(!store.is_valid_path(&tenant("nobody"), P).await);
+        assert!(!store.is_valid_path(&tenant("nobody"), &p()).await);
         assert!(store.inner.lock().unwrap().is_empty());
     }
 
     #[test]
     fn nar_keys_are_scoped_by_tenant_and_tier() {
         let alice = tenant("alice");
-        let built = nar_key(&alice, Tier::Built, P).expect("a key");
-        let quarantined = nar_key(&alice, Tier::Quarantined, P).expect("a key");
+        let built = nar_key(&alice, Tier::Built, &p()).expect("a key");
+        let quarantined = nar_key(&alice, Tier::Quarantined, &p()).expect("a key");
 
-        assert!(built.starts_with(&format!("{alice}/nar/")));
+        assert!(built.as_str().starts_with(&format!("{alice}/nar/")));
         assert!(
-            quarantined.contains("/untrusted/nar/"),
+            quarantined.as_str().contains("/untrusted/nar/"),
             "unverifiable content should be visibly separated: {quarantined}"
         );
         // Still inside the tenant's prefix, which is what the signing check
         // enforces — `untrusted/` is a routing marker, not the control.
-        assert!(quarantined.starts_with(&format!("{alice}/")));
+        assert!(quarantined.as_str().starts_with(&format!("{alice}/")));
 
         // Two tenants running their own builds hold independent bytes at one
         // path, so their `Built` keys must differ.
-        assert_ne!(built, nar_key(&tenant("bob"), Tier::Built, P).unwrap());
-        assert_eq!(nar_key(&alice, Tier::Built, "/etc/passwd"), None);
+        assert_ne!(built, nar_key(&tenant("bob"), Tier::Built, &p()).unwrap());
+        assert_eq!(
+            nar_key(&alice, Tier::Built, &StorePath::new("/etc/passwd")),
+            None
+        );
     }
 
     #[test]
@@ -705,10 +717,10 @@ mod tests {
         // tenants pushing the same content must compute the same key — that
         // convergence is the whole saving.
         let (alice, bob) = (tenant("alice"), tenant("bob"));
-        let key = nar_key(&alice, Tier::Verified, P).expect("a key");
+        let key = nar_key(&alice, Tier::Verified, &p()).expect("a key");
 
-        assert_eq!(key, nar_key(&bob, Tier::Verified, P).unwrap());
-        assert!(!key.contains(alice.as_str()));
-        assert!(key.starts_with("nar/"));
+        assert_eq!(key, nar_key(&bob, Tier::Verified, &p()).unwrap());
+        assert!(!key.as_str().contains(alice.as_str()));
+        assert!(key.as_str().starts_with("nar/"));
     }
 }

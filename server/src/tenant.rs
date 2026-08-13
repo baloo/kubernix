@@ -15,42 +15,11 @@ use sha2::{Digest, Sha256};
 
 /// A tenant's stable identifier.
 ///
-/// Used verbatim as an object-store key prefix and as the scoping key in the
-/// store, so it must be safe in both: no `/`, no `..`, no surprises. Rather than
-/// trusting the identity to be well-formed, the id is built from a sanitised
-/// prefix (so logs stay readable) plus a hash of the *full* identity (so two
-/// identities cannot sanitise down to the same tenant).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TenantId(String);
-
-impl TenantId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Accept an id that arrived over the wire, e.g. from a worker asking for
-    /// pre-signed URLs.
-    ///
-    /// Ids reach object keys by concatenation, so a value carrying `/` or `..`
-    /// would break out of its own prefix and defeat the scoping it is supposed
-    /// to provide. Rather than escaping it at every use, refuse anything that is
-    /// not in the shape [`derive_id`] produces.
-    pub fn from_wire(id: impl Into<String>) -> Option<Self> {
-        let id = id.into();
-        let well_formed = !id.is_empty()
-            && id.len() <= 128
-            && id
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        well_formed.then_some(TenantId(id))
-    }
-}
-
-impl std::fmt::Display for TenantId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+/// Defined in `kubernix-types` because it crosses the server/worker process
+/// boundary — a worker asking for pre-signed URLs needs the same type the
+/// frontend minted. What's here is the derivation logic specific to *this*
+/// process: how a tenant is attributed from what an SSH client presented.
+pub use kubernix_types::TenantId;
 
 #[derive(Clone, Debug)]
 pub struct Tenant {
@@ -114,7 +83,7 @@ fn derive_id(identity: &str) -> TenantId {
         .collect();
     let slug = slug.trim_matches('-').to_string();
 
-    TenantId(format!("{slug}-{}", &hash[..HASH_CHARS]))
+    TenantId::from_parts(&slug, &hash[..HASH_CHARS])
 }
 
 #[cfg(test)]
