@@ -11,7 +11,7 @@ let
   # the source is realised once and reused.
   workspaceSource = source.workspace {
     name = "kubernix-src";
-    crates = [ "server" "signing" "worker" ];
+    crates = [ "server" "signing" "types" "worker" ];
   };
 
   kubernix-server = pkgs.callPackage ./server.nix { inherit workspaceSource; };
