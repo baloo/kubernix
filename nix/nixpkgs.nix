@@ -8,15 +8,13 @@ let
   lixSource = flakeNodes."${flakeRoots.lix}";
   nixpkgsSource = flakeNodes."${flakeRoots.nixpkgs}";
 
-  lix = builtins.fetchTarball {
-    url = "https://github.com/nixos/nixpkgs/archive/${lixSource.locked.rev}.tar.gz";
-    sha256 = lixSource.locked.narHash;
+  fetchRepo = locked: builtins.fetchTarball {
+    url = "https://github.com/${locked.owner}/${locked.repo}/archive/${locked.rev}.tar.gz";
+    sha256 = locked.narHash;
   };
-  nixpkgs = builtins.fetchTarball {
-    # `archive`, not `archives` — the latter 404s.
-    url = "https://github.com/nixos/nixpkgs/archive/${nixpkgsSource.locked.rev}.tar.gz";
-    sha256 = nixpkgsSource.locked.narHash;
-  };
+
+  lix = fetchRepo lixSource.locked;
+  nixpkgs = fetchRepo nixpkgsSource.locked;
 in let
   overlay = self: super: {
     lix = self.callPackage "${lix}/package.nix" {
