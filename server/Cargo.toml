@@ -38,4 +38,5 @@ zstd.workspace = true
 capnpc = "0.27"
 
 [dev-dependencies]
+proptest = "1.11.0"
 serial_test = "4.0.1"

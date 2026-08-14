@@ -171,3 +171,46 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // The general form of `ids_are_safe_as_object_key_prefixes` and
+        // `derived_ids_survive_the_wire_check` above: an SSH client can
+        // present *any* username, and a fingerprint is attacker-influenced
+        // input too, so `derive_id` must produce a wire-safe `TenantId` for
+        // arbitrary text, not just the handful of tricky examples those
+        // tests hand-picked. `proptest`'s default string strategy covers
+        // arbitrary Unicode, not just ASCII.
+        #[test]
+        fn derived_ids_are_always_wire_safe(user in ".{0,64}", fingerprint in proptest::option::of(".{0,64}")) {
+            let tenant = Tenant::from_ssh(&user, fingerprint.as_deref(), false);
+            let id = tenant.id.as_str();
+
+            prop_assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "unsafe id {id:?} from user={user:?} fingerprint={fingerprint:?}"
+            );
+            prop_assert!(!id.contains(".."), "unsafe id {id:?}");
+            prop_assert!(
+                TenantId::from_wire(id).is_some(),
+                "derived id {id} would be refused off the wire"
+            );
+        }
+
+        // Same identity in, same id out — regardless of what the identity
+        // actually contains. Determinism here is load-bearing: it's what
+        // lets `the_same_client_is_the_same_tenant` hold for every client,
+        // not just the ones under test.
+        #[test]
+        fn deriving_twice_from_the_same_input_agrees(user in ".{0,64}") {
+            prop_assert_eq!(
+                Tenant::from_ssh(&user, None, false).id,
+                Tenant::from_ssh(&user, None, false).id
+            );
+        }
+    }
+}

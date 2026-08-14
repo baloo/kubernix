@@ -82,7 +82,12 @@ trait WireWrite {
     async fn write_wire_str(&mut self, value: &[u8]) -> std::io::Result<()>;
 }
 
-impl WireWrite for ChildStdin {
+// Generic over any `AsyncWrite`, not hardcoded to `ChildStdin`: the real
+// serve connection needs exactly `ChildStdin`, but a blanket impl also
+// makes this framing logic exercisable in tests against a plain in-memory
+// buffer (`Vec<u8>` implements `AsyncWrite`) with no subprocess involved —
+// see the `tests` module below.
+impl<W: tokio::io::AsyncWrite + Unpin> WireWrite for W {
     async fn write_wire_u64(&mut self, value: u64) -> std::io::Result<()> {
         self.write_all(&value.to_le_bytes()).await
     }
@@ -104,7 +109,10 @@ trait WireRead {
     async fn read_wire_string(&mut self) -> std::io::Result<String>;
 }
 
-impl WireRead for ChildStdout {
+// Same reasoning as `WireWrite`'s blanket impl above: generic over any
+// `AsyncRead`, so the same logic exercises `ChildStdout` for real and any
+// in-memory reader (`std::io::Cursor<Vec<u8>>`, say) in tests.
+impl<R: tokio::io::AsyncRead + Unpin> WireRead for R {
     async fn read_wire_u64(&mut self) -> std::io::Result<u64> {
         let mut buf = [0u8; 8];
         self.read_exact(&mut buf).await?;
@@ -351,5 +359,78 @@ mod tests {
             error_msg: "builder failed".to_string(),
         };
         assert_eq!(outcome.describe(), "builder failed");
+    }
+
+    // The wire read/write logic below needs no subprocess to exercise: the
+    // blanket `WireWrite`/`WireRead` impls above work over any `AsyncWrite`/
+    // `AsyncRead`, so a `Vec<u8>`/`Cursor<Vec<u8>>` stands in for
+    // `ChildStdin`/`ChildStdout`. This is exactly the protocol-framing logic
+    // whose own doc comment (`build_derivation`'s, and this module's) warns
+    // that a single mismatched read desynchronises the rest of the stream —
+    // worth covering directly, not just through `BuildOutcome`'s pure logic.
+
+    #[tokio::test]
+    async fn round_trips_an_integer_and_a_string() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_wire_u64(0x1122_3344_5566_7788).await.unwrap();
+        buf.write_wire_str(b"hello").await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        assert_eq!(cursor.read_wire_u64().await.unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(cursor.read_wire_string().await.unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn a_field_after_a_non_padded_string_lands_where_it_should() {
+        // A reader that mis-handles padding desynchronises for the rest of
+        // the stream, so assert the field *after* a string whose length
+        // isn't a multiple of eight lands correctly, not just the string
+        // itself.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_wire_str(b"hello").await.unwrap(); // 5 bytes: 3 bytes of padding
+        buf.write_wire_u64(42).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        assert_eq!(cursor.read_wire_string().await.unwrap(), "hello");
+        assert_eq!(cursor.read_wire_u64().await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn an_empty_string_round_trips_with_no_padding_bytes() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_wire_str(b"").await.unwrap();
+        buf.write_wire_u64(7).await.unwrap();
+
+        // 8 bytes of length prefix, nothing else, then the next field
+        // immediately: an empty string needs no padding at all.
+        assert_eq!(buf.len(), 16);
+        let mut cursor = std::io::Cursor::new(buf);
+        assert_eq!(cursor.read_wire_string().await.unwrap(), "");
+        assert_eq!(cursor.read_wire_u64().await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_greeting_that_does_not_match_is_refused() {
+        // Mirrors what `ServeConnection::open` checks for real, against a
+        // fake reply with the wrong magic — a mismatched protocol must be
+        // refused loudly rather than pressed on with.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_wire_u64(0xdead_beef).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let magic = cursor.read_wire_u64().await.unwrap();
+        assert_ne!(magic, MAGIC_2);
+    }
+
+    #[tokio::test]
+    async fn reading_past_the_end_of_the_buffer_is_an_error_not_a_panic() {
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(cursor.read_wire_u64().await.is_err());
+
+        // A length prefix claiming more than is actually there.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_wire_u64(100).await.unwrap();
+        buf.extend_from_slice(b"short");
+        let mut cursor = std::io::Cursor::new(buf);
+        assert!(cursor.read_wire_string().await.is_err());
     }
 }

@@ -5,6 +5,8 @@
 //! outputs never traverse the frontend, but no credential ever reaches here.
 
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_compression::tokio::write::ZstdEncoder;
 use digest_io::{HashReader, HashWriter};
@@ -12,6 +14,7 @@ use eyre::{Context as _, bail};
 use sha2::{Digest, Sha256, digest::Output};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio_util::io::InspectWriter;
 
 use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId};
 
@@ -139,6 +142,66 @@ pub struct NixStore<'a> {
 }
 
 impl<'a> NixStore<'a> {
+    /// The "dump -> hash -> compress -> hash -> spool" pipeline
+    /// [`Self::upload_output`] runs a `nix store dump-path` child's stdout
+    /// through — its own associated function, generic over its source and
+    /// sink (any `AsyncRead`/`AsyncWrite`) rather than tied to a real
+    /// subprocess and a real spool file, even though it needs none of
+    /// `NixStore`'s own fields. That genericity is what lets
+    /// `tests::hashes_and_compresses_a_stream` below exercise the actual
+    /// hashing/compression logic against an in-memory buffer, with no
+    /// subprocess involved.
+    ///
+    /// Returns `(nar_hash, nar_size, file_hash, file_size)` — the
+    /// uncompressed NAR's hash and size, then the compressed object's.
+    ///
+    /// `file_size` is counted as bytes flow through `sink` (via
+    /// [`InspectWriter`]) rather than read back from the sink afterwards
+    /// (e.g. `tokio::fs::File::metadata`), which is what makes this generic
+    /// over any sink at all, not just a real file.
+    async fn dump_hash_and_compress<R, W>(
+        nar: R,
+        sink: W,
+    ) -> eyre::Result<(Output<Sha256>, u64, Output<Sha256>, u64)>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let written = Arc::new(AtomicU64::new(0));
+        let counted = InspectWriter::new(sink, {
+            let written = written.clone();
+            move |chunk| {
+                written.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
+        });
+
+        // `HashReader`/`HashWriter` (digest-io) hash a stream as it passes
+        // through; `ZstdEncoder` (async-compression) compresses one as it's
+        // written. Stacking them turns the whole pipeline into a single
+        // `tokio::io::copy`, with no manual buffering.
+        let mut nar_reader = HashReader::<Sha256, _>::new(nar);
+        let file_writer = HashWriter::<Sha256, _>::new(counted);
+        let mut encoder =
+            ZstdEncoder::with_quality(file_writer, async_compression::Level::Precise(3));
+
+        let nar_size = tokio::io::copy(&mut nar_reader, &mut encoder).await?;
+        // Flushes zstd's trailing frame bytes through the `HashWriter` —
+        // must happen before the file hash/size below are read.
+        encoder
+            .shutdown()
+            .await
+            .wrap_err("flushing the compressor")?;
+        let file_writer = encoder.into_inner();
+
+        let nar_hash = nar_reader.finalize();
+        let (file_hasher, mut counted) = file_writer.into_parts();
+        counted.flush().await.wrap_err("flushing the sink")?;
+        let file_hash = file_hasher.finalize();
+        let file_size = written.load(Ordering::Relaxed);
+
+        Ok((nar_hash, nar_size, file_hash, file_size))
+    }
+
     /// Dump a store path as a NAR, compress it, and PUT it to `url`.
     ///
     /// Hashes both the uncompressed and compressed byte streams in the *same*
@@ -185,37 +248,9 @@ impl<'a> NixStore<'a> {
         let spool = tempfile::NamedTempFile::new().wrap_err("creating a spool file")?;
         let sink = tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
 
-        // `HashReader`/`HashWriter` (digest-io) hash a stream as it passes
-        // through; `ZstdEncoder` (async-compression) compresses one as it's
-        // written. Stacking them turns the whole dump -> hash -> compress ->
-        // hash -> spool pipeline into a single `tokio::io::copy`, with no
-        // manual buffering.
-        let mut nar_reader = HashReader::<Sha256, _>::new(stdout);
-        let file_writer = HashWriter::<Sha256, _>::new(sink);
-        let mut encoder =
-            ZstdEncoder::with_quality(file_writer, async_compression::Level::Precise(3));
-
-        let nar_size = tokio::io::copy(&mut nar_reader, &mut encoder)
+        let (nar_hash, nar_size, file_hash, file_size) = Self::dump_hash_and_compress(stdout, sink)
             .await
             .wrap_err_with(|| format!("dumping {store_path}"))?;
-        // Flushes zstd's trailing frame bytes through the `HashWriter` — must
-        // happen before the file hash/size below are read.
-        encoder
-            .shutdown()
-            .await
-            .wrap_err("flushing the compressor")?;
-        let file_writer = encoder.into_inner();
-
-        let nar_hash = nar_reader.finalize();
-        let (file_hasher, mut sink) = file_writer.into_parts();
-        sink.flush().await.wrap_err("flushing the spool file")?;
-        let file_hash = file_hasher.finalize();
-        let file_size = sink
-            .metadata()
-            .await
-            .wrap_err("reading the spool file's size")?
-            .len();
-        drop(sink);
 
         let mut stderr = String::new();
         if let Some(mut pipe) = child.stderr.take() {
@@ -458,7 +493,7 @@ impl<'a> NixStore<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{log_key, nar_key};
+    use super::{NixStore, log_key, nar_key};
     use kubernix_types::{ObjectKey, StorePath, TenantId};
 
     const P: &str = "21d91afy6vgw4l00yzy92kp92b1w3cdm-kxs-testfile.txt";
@@ -502,5 +537,49 @@ mod tests {
         assert_eq!(bad.hash_part(), None);
         assert_eq!(StorePath::new("notapath").hash_part(), None);
         assert_eq!(nar_key(&t("tenant-1"), &bad), None);
+    }
+
+    // `dump_hash_and_compress` needs no subprocess to exercise: it is generic
+    // over its source and sink, so a plain in-memory buffer stands in for a
+    // `nix store dump-path` child's stdout and the spool file.
+
+    #[tokio::test]
+    async fn hashes_and_compresses_a_stream() {
+        let nar = b"hello kubernix, this is a fake nar".repeat(100);
+        let mut sink = Vec::new();
+
+        let (nar_hash, nar_size, file_hash, file_size) =
+            NixStore::dump_hash_and_compress(nar.as_slice(), &mut sink)
+                .await
+                .unwrap();
+
+        // The uncompressed hash/size describe `nar` itself.
+        assert_eq!(nar_size, nar.len() as u64);
+        assert_eq!(nar_hash, <sha2::Sha256 as sha2::Digest>::digest(&nar));
+
+        // The compressed hash/size describe what actually landed in `sink` —
+        // proof `file_size` (counted via `InspectWriter`, not read back from
+        // the sink) agrees with what was really written.
+        assert_eq!(file_size, sink.len() as u64);
+        assert_eq!(file_hash, <sha2::Sha256 as sha2::Digest>::digest(&sink));
+
+        // And `sink` holds something a real client can actually decompress
+        // back to the original bytes — the whole point of the pipeline.
+        let decompressed = zstd::stream::decode_all(sink.as_slice()).unwrap();
+        assert_eq!(decompressed, nar);
+    }
+
+    #[tokio::test]
+    async fn an_empty_stream_still_produces_a_valid_compressed_object() {
+        let mut sink = Vec::new();
+        let (nar_hash, nar_size, _file_hash, file_size) =
+            NixStore::dump_hash_and_compress(&b""[..], &mut sink)
+                .await
+                .unwrap();
+
+        assert_eq!(nar_size, 0);
+        assert_eq!(nar_hash, <sha2::Sha256 as sha2::Digest>::digest(b""));
+        assert_eq!(file_size, sink.len() as u64);
+        assert_eq!(zstd::stream::decode_all(sink.as_slice()).unwrap(), b"");
     }
 }

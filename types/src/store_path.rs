@@ -161,3 +161,36 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // `StorePath::new` validates nothing — see its doc comment — so
+        // `to_full`/`from_full` need to agree for any bare name and any
+        // store directory, not just ones that look like a real Nix path.
+        // This is the general form of `to_full_reconstructs_the_printed_path`
+        // and `from_full_strips_the_store_dir` above.
+        #[test]
+        fn to_full_and_from_full_round_trip(
+            store_dir in "[a-zA-Z0-9/_.-]{0,32}",
+            bare in "[a-zA-Z0-9/_.-]{0,64}",
+        ) {
+            let full = StorePath::new(bare.clone()).to_full(&store_dir);
+            prop_assert_eq!(
+                StorePath::from_full(&store_dir, &full),
+                Some(StorePath::new(bare))
+            );
+        }
+
+        // `from_full` must never panic, whatever it's handed — including
+        // inputs shorter than `store_dir`, or ones that share only a partial
+        // prefix with it.
+        #[test]
+        fn from_full_never_panics(store_dir in ".{0,16}", full in ".{0,64}") {
+            let _ = StorePath::from_full(&store_dir, &full);
+        }
+    }
+}

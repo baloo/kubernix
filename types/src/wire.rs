@@ -138,3 +138,74 @@ mod tests {
         assert!(Reader::new(&buf).string().is_err());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // A `Reader` over an arbitrary sequence of writes must read back
+        // exactly what was written, in order — the general form of
+        // `round_trips_integers_and_strings` above, covering shapes a
+        // hand-picked example list would not: odd lengths, non-ASCII bytes,
+        // long runs of zeros, and everything in between.
+        #[test]
+        fn round_trips_any_sequence_of_fields(
+            fields in proptest::collection::vec(
+                prop_oneof![
+                    any::<u64>().prop_map(Field::U64),
+                    proptest::collection::vec(any::<u8>(), 0..256).prop_map(Field::Bytes),
+                ],
+                0..32,
+            )
+        ) {
+            let mut buf = Vec::new();
+            for field in &fields {
+                match field {
+                    Field::U64(v) => write_u64(&mut buf, *v),
+                    Field::Bytes(b) => write_bytes(&mut buf, b),
+                }
+            }
+
+            let mut r = Reader::new(&buf);
+            for field in &fields {
+                match field {
+                    Field::U64(v) => prop_assert_eq!(r.u64().unwrap(), *v),
+                    Field::Bytes(b) => {
+                        // Mirrors exactly what `write_bytes` wrote: a u64
+                        // length prefix, then that many bytes (`Reader::bytes`
+                        // skips the padding `write_bytes` added itself).
+                        let len = r.u64().unwrap() as usize;
+                        prop_assert_eq!(len, b.len());
+                        prop_assert_eq!(r.bytes(len).unwrap(), b.as_slice());
+                    }
+                }
+            }
+        }
+
+        // The property the module doc and `serve.rs`'s own comments worry
+        // about most: a `Reader` fed completely arbitrary — not just
+        // truncated — bytes must never panic, only ever return `Ok` or
+        // `Err`. This is what would have caught an off-by-one in the
+        // padding arithmetic before it ever reached a real, harder-to-debug
+        // desynchronised stream.
+        #[test]
+        fn never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let mut r = Reader::new(&bytes);
+            // Drain it as a real caller would: alternating length-prefixed
+            // reads until one fails, rather than one fixed call shape.
+            for _ in 0..16 {
+                if r.string().is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum Field {
+        U64(u64),
+        Bytes(Vec<u8>),
+    }
+}
