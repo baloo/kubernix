@@ -123,182 +123,205 @@ async fn request_urls(
     Ok(urls)
 }
 
-/// Dump a store path as a NAR, compress it, and PUT it to `url`.
-///
-/// Hashes both the uncompressed and compressed byte streams in the *same* pass:
-/// buffering the whole NAR to hash it afterwards would defeat the point for a
-/// large closure.
-pub async fn upload_output(
-    http: &reqwest::Client,
-    url: &str,
-    key: ObjectKey,
-    store_path: &StorePath,
-    nix_store: &str,
-    nix_cli: &str,
-    store_uri: Option<&str>,
-    store_dir: &str,
-) -> eyre::Result<OutputArtifact> {
-    // `nix store dump-path`, not `nix-store --dump`: the latter takes a
-    // *filesystem* path and ignores --store entirely, so it cannot find an
-    // output living under a chroot store root.
-    let mut command = Command::new(nix_cli);
-    command.arg("store").arg("dump-path");
-    if let Some(uri) = store_uri {
-        command.arg("--store").arg(uri);
-    }
-    let mut child = command
-        .arg(store_path.to_full(store_dir))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .wrap_err_with(|| format!("spawning {nix_cli} store dump-path"))?;
-
-    let stdout = child.stdout.take().expect("piped");
-    // Compressed as the NAR arrives, into a temporary file rather than memory,
-    // so nothing here scales with the size of the output. Both hashes are
-    // computed in the same pass — buffering to hash afterwards would defeat the
-    // point for a large closure.
-    //
-    // Why a file and not a streaming request body: a pre-signed PUT is signed
-    // for a specific request, and a streaming body means chunked
-    // transfer-encoding with no `Content-Length`, which S3 rejects outright
-    // (`HTTP 400`). Spooling to disk gives a length to declare while keeping
-    // *memory* flat, which is what actually mattered.
-    let spool = tempfile::NamedTempFile::new().wrap_err("creating a spool file")?;
-    let sink = tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
-
-    // `HashReader`/`HashWriter` (digest-io) hash a stream as it passes
-    // through; `ZstdEncoder` (async-compression) compresses one as it's
-    // written. Stacking them turns the whole dump -> hash -> compress ->
-    // hash -> spool pipeline into a single `tokio::io::copy`, with no manual
-    // buffering.
-    let mut nar_reader = HashReader::<Sha256, _>::new(stdout);
-    let file_writer = HashWriter::<Sha256, _>::new(sink);
-    let mut encoder = ZstdEncoder::with_quality(file_writer, async_compression::Level::Precise(3));
-
-    let nar_size = tokio::io::copy(&mut nar_reader, &mut encoder)
-        .await
-        .wrap_err_with(|| format!("dumping {store_path}"))?;
-    // Flushes zstd's trailing frame bytes through the `HashWriter` — must
-    // happen before the file hash/size below are read.
-    encoder.shutdown().await.wrap_err("flushing the compressor")?;
-    let file_writer = encoder.into_inner();
-
-    let nar_hash = nar_reader.finalize();
-    let (file_hasher, mut sink) = file_writer.into_parts();
-    sink.flush().await.wrap_err("flushing the spool file")?;
-    let file_hash = file_hasher.finalize();
-    let file_size = sink
-        .metadata()
-        .await
-        .wrap_err("reading the spool file's size")?
-        .len();
-    drop(sink);
-
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr).await;
-    }
-    let status = child.wait().await.wrap_err("waiting for dump-path")?;
-    if !status.success() {
-        bail!("dumping {store_path}: {} ({status})", stderr.trim());
-    }
-
-    // Streamed from disk with the length declared, so the request is one the
-    // pre-signed URL will accept.
-    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(
-        tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?),
-    ));
-    let response = http
-        .put(url)
-        .header("content-type", "application/x-nix-nar-zstd")
-        .header(reqwest::header::CONTENT_LENGTH, file_size)
-        .body(body)
-        .send()
-        .await
-        .wrap_err_with(|| format!("uploading {key}"))?;
-    if !response.status().is_success() {
-        bail!("uploading {key}: HTTP {}", response.status());
-    }
-
-    let (references, deriver) =
-        query_path_metadata(nix_store, store_path, store_uri, store_dir).await?;
-
-    Ok(OutputArtifact {
-        store_path: store_path.clone(),
-        nar_hash,
-        nar_size,
-        file_hash,
-        file_size,
-        key,
-        references,
-        deriver,
-    })
+/// Where and how to invoke the local Nix CLI/daemon, and the store directory
+/// it and every wire path agree on. Bundled because every path-touching
+/// worker operation — importing an input, dumping an output, querying
+/// metadata — needs the same handful of scalars, sourced once from the
+/// worker's environment in `main()`.
+#[derive(Clone, Copy)]
+pub struct NixStore<'a> {
+    pub nix_store: &'a str,
+    pub nix_cli: &'a str,
+    pub store_uri: Option<&'a str>,
+    pub store_dir: &'a str,
 }
 
-/// Fetch a staged input and import it into the local store.
-///
-/// The object is a zstd-compressed *bare NAR* -- the same shape every artifact
-/// has. `--import` needs an export stream, so the wrapping is added here, which
-/// is why the references and deriver travel alongside the key rather than being
-/// stored a second time.
-///
-/// Streamed end to end: fetched, decompressed and piped into the child a chunk
-/// at a time, so peak memory does not scale with the size of the input.
-pub async fn fetch_input(
-    http: &reqwest::Client,
-    url: &str,
-    store_path: &StorePath,
-    references: &[StorePath],
-    deriver: &StorePath,
-    nix_store: &str,
-    store_uri: Option<&str>,
-    store_dir: &str,
-) -> eyre::Result<()> {
-    let response = http
-        .get(url)
-        .send()
-        .await
-        .wrap_err_with(|| format!("fetching {store_path}"))?;
-    if !response.status().is_success() {
-        bail!("fetching {store_path}: HTTP {}", response.status());
-    }
+impl<'a> NixStore<'a> {
+    /// Dump a store path as a NAR, compress it, and PUT it to `url`.
+    ///
+    /// Hashes both the uncompressed and compressed byte streams in the *same*
+    /// pass: buffering the whole NAR to hash it afterwards would defeat the
+    /// point for a large closure.
+    pub async fn upload_output(
+        &self,
+        http: &reqwest::Client,
+        url: &str,
+        key: ObjectKey,
+        store_path: &StorePath,
+    ) -> eyre::Result<OutputArtifact> {
+        // `nix store dump-path`, not `nix-store --dump`: the latter takes a
+        // *filesystem* path and ignores --store entirely, so it cannot find an
+        // output living under a chroot store root.
+        let mut command = Command::new(self.nix_cli);
+        command.arg("store").arg("dump-path");
+        if let Some(uri) = self.store_uri {
+            command.arg("--store").arg(uri);
+        }
+        let mut child = command
+            .arg(store_path.to_full(self.store_dir))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .wrap_err_with(|| format!("spawning {} store dump-path", self.nix_cli))?;
 
-    let mut command = Command::new(nix_store);
-    if let Some(uri) = store_uri {
-        command.arg("--store").arg(uri);
-    }
-    let mut child = command
-        .arg("--import")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .wrap_err_with(|| format!("spawning {nix_store} --import"))?;
+        let stdout = child.stdout.take().expect("piped");
+        // Compressed as the NAR arrives, into a temporary file rather than
+        // memory, so nothing here scales with the size of the output. Both
+        // hashes are computed in the same pass — buffering to hash afterwards
+        // would defeat the point for a large closure.
+        //
+        // Why a file and not a streaming request body: a pre-signed PUT is
+        // signed for a specific request, and a streaming body means chunked
+        // transfer-encoding with no `Content-Length`, which S3 rejects
+        // outright (`HTTP 400`). Spooling to disk gives a length to declare
+        // while keeping *memory* flat, which is what actually mattered.
+        let spool = tempfile::NamedTempFile::new().wrap_err("creating a spool file")?;
+        let sink =
+            tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
 
-    {
-        use futures_util::StreamExt as _;
-        use std::io::Write as _;
+        // `HashReader`/`HashWriter` (digest-io) hash a stream as it passes
+        // through; `ZstdEncoder` (async-compression) compresses one as it's
+        // written. Stacking them turns the whole dump -> hash -> compress ->
+        // hash -> spool pipeline into a single `tokio::io::copy`, with no
+        // manual buffering.
+        let mut nar_reader = HashReader::<Sha256, _>::new(stdout);
+        let file_writer = HashWriter::<Sha256, _>::new(sink);
+        let mut encoder =
+            ZstdEncoder::with_quality(file_writer, async_compression::Level::Precise(3));
 
-        let mut stdin = child.stdin.take().expect("piped");
-
-        // The object is a bare NAR; `--import` wants an export stream. The
-        // wrapping is built here rather than stored, so the object store holds
-        // one representation of a path rather than two — see `nar_export`.
-        stdin
-            .write_all(&crate::nar_export::header())
+        let nar_size = tokio::io::copy(&mut nar_reader, &mut encoder)
             .await
-            .wrap_err("writing the export header")?;
+            .wrap_err_with(|| format!("dumping {store_path}"))?;
+        // Flushes zstd's trailing frame bytes through the `HashWriter` — must
+        // happen before the file hash/size below are read.
+        encoder.shutdown().await.wrap_err("flushing the compressor")?;
+        let file_writer = encoder.into_inner();
 
-        // Decompressed as it arrives rather than in one piece: peak memory is a
-        // chunk, not the whole NAR. `zstd`'s streaming writer is enough for
-        // this, so it needs no additional dependency.
-        let mut decoder =
-            zstd::stream::write::Decoder::new(Vec::new()).wrap_err("starting decompression")?;
-        let mut body = response.bytes_stream();
-        while let Some(chunk) = body.next().await {
+        let nar_hash = nar_reader.finalize();
+        let (file_hasher, mut sink) = file_writer.into_parts();
+        sink.flush().await.wrap_err("flushing the spool file")?;
+        let file_hash = file_hasher.finalize();
+        let file_size = sink
+            .metadata()
+            .await
+            .wrap_err("reading the spool file's size")?
+            .len();
+        drop(sink);
+
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr).await;
+        }
+        let status = child.wait().await.wrap_err("waiting for dump-path")?;
+        if !status.success() {
+            bail!("dumping {store_path}: {} ({status})", stderr.trim());
+        }
+
+        // Streamed from disk with the length declared, so the request is one
+        // the pre-signed URL will accept.
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(
+            tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?),
+        ));
+        let response = http
+            .put(url)
+            .header("content-type", "application/x-nix-nar-zstd")
+            .header(reqwest::header::CONTENT_LENGTH, file_size)
+            .body(body)
+            .send()
+            .await
+            .wrap_err_with(|| format!("uploading {key}"))?;
+        if !response.status().is_success() {
+            bail!("uploading {key}: HTTP {}", response.status());
+        }
+
+        let (references, deriver) = self.query_path_metadata(store_path).await?;
+
+        Ok(OutputArtifact {
+            store_path: store_path.clone(),
+            nar_hash,
+            nar_size,
+            file_hash,
+            file_size,
+            key,
+            references,
+            deriver,
+        })
+    }
+
+    /// Fetch a staged input and import it into the local store.
+    ///
+    /// The object is a zstd-compressed *bare NAR* -- the same shape every
+    /// artifact has. `--import` needs an export stream, so the wrapping is
+    /// added here, which is why the references and deriver travel alongside
+    /// the key rather than being stored a second time.
+    ///
+    /// Streamed end to end: fetched, decompressed and piped into the child a
+    /// chunk at a time, so peak memory does not scale with the size of the
+    /// input.
+    pub async fn fetch_input(
+        &self,
+        http: &reqwest::Client,
+        url: &str,
+        store_path: &StorePath,
+        references: &[StorePath],
+        deriver: &StorePath,
+    ) -> eyre::Result<()> {
+        let response = http
+            .get(url)
+            .send()
+            .await
+            .wrap_err_with(|| format!("fetching {store_path}"))?;
+        if !response.status().is_success() {
+            bail!("fetching {store_path}: HTTP {}", response.status());
+        }
+
+        let mut command = Command::new(self.nix_store);
+        if let Some(uri) = self.store_uri {
+            command.arg("--store").arg(uri);
+        }
+        let mut child = command
+            .arg("--import")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .wrap_err_with(|| format!("spawning {} --import", self.nix_store))?;
+
+        {
+            use futures_util::StreamExt as _;
+            use std::io::Write as _;
+
+            let mut stdin = child.stdin.take().expect("piped");
+
+            // The object is a bare NAR; `--import` wants an export stream. The
+            // wrapping is built here rather than stored, so the object store
+            // holds one representation of a path rather than two — see
+            // `nar_export`.
+            stdin
+                .write_all(&crate::nar_export::header())
+                .await
+                .wrap_err("writing the export header")?;
+
+            // Decompressed as it arrives rather than in one piece: peak
+            // memory is a chunk, not the whole NAR. `zstd`'s streaming writer
+            // is enough for this, so it needs no additional dependency.
+            let mut decoder = zstd::stream::write::Decoder::new(Vec::new())
+                .wrap_err("starting decompression")?;
+            let mut body = response.bytes_stream();
+            while let Some(chunk) = body.next().await {
+                decoder
+                    .write_all(&chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
+                    .wrap_err_with(|| format!("decompressing {store_path}"))?;
+                let decoded = std::mem::take(decoder.get_mut());
+                if !decoded.is_empty() {
+                    stdin
+                        .write_all(&decoded)
+                        .await
+                        .wrap_err("writing to nix-store --import")?;
+                }
+            }
             decoder
-                .write_all(&chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
+                .flush()
                 .wrap_err_with(|| format!("decompressing {store_path}"))?;
             let decoded = std::mem::take(decoder.get_mut());
             if !decoded.is_empty() {
@@ -307,36 +330,34 @@ pub async fn fetch_input(
                     .await
                     .wrap_err("writing to nix-store --import")?;
             }
-        }
-        decoder.flush().wrap_err_with(|| format!("decompressing {store_path}"))?;
-        let decoded = std::mem::take(decoder.get_mut());
-        if !decoded.is_empty() {
+
             stdin
-                .write_all(&decoded)
+                .write_all(&crate::nar_export::trailer(
+                    store_path,
+                    references,
+                    deriver,
+                    self.store_dir,
+                ))
                 .await
-                .wrap_err("writing to nix-store --import")?;
+                .wrap_err("writing the export trailer")?;
+            stdin
+                .shutdown()
+                .await
+                .wrap_err("closing nix-store --import's stdin")?;
         }
 
-        stdin
-            .write_all(&crate::nar_export::trailer(
-                store_path, references, deriver, store_dir,
-            ))
+        let output = child
+            .wait_with_output()
             .await
-            .wrap_err("writing the export trailer")?;
-        stdin.shutdown().await.wrap_err("closing nix-store --import's stdin")?;
+            .wrap_err("waiting for nix-store --import")?;
+        if !output.status.success() {
+            bail!(
+                "importing {store_path}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .wrap_err("waiting for nix-store --import")?;
-    if !output.status.success() {
-        bail!(
-            "importing {store_path}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
 }
 
 /// Upload the build log.
@@ -364,58 +385,60 @@ pub async fn upload_log(
     Ok(())
 }
 
-async fn query_path_metadata(
-    nix_store: &str,
-    store_path: &StorePath,
-    store_uri: Option<&str>,
-    store_dir: &str,
-) -> eyre::Result<(Vec<StorePath>, StorePath)> {
-    let with_store = |cmd: &str| {
-        let mut c = Command::new(nix_store);
-        if let Some(uri) = store_uri {
-            c.arg("--store").arg(uri);
-        }
-        c.arg(cmd);
-        c
-    };
+impl<'a> NixStore<'a> {
+    async fn query_path_metadata(
+        &self,
+        store_path: &StorePath,
+    ) -> eyre::Result<(Vec<StorePath>, StorePath)> {
+        let with_store = |cmd: &str| {
+            let mut c = Command::new(self.nix_store);
+            if let Some(uri) = self.store_uri {
+                c.arg("--store").arg(uri);
+            }
+            c.arg(cmd);
+            c
+        };
 
-    let references = with_store("--query")
-        .arg("--references")
-        .arg(store_path.to_full(store_dir))
-        .output()
-        .await
-        .wrap_err_with(|| format!("querying references of {store_path}"))?;
-    // `nix-store --query` prints full paths, rooted at whatever store
-    // directory the local `nix-store` is actually configured for. A mismatch
-    // against `store_dir` means this worker's `KUBERNIX_STORE_DIR` disagrees
-    // with its real store — a misconfiguration worth failing loudly on
-    // rather than silently corrupting every path derived from it.
-    let references = String::from_utf8_lossy(&references.stdout)
-        .lines()
-        .map(|s| {
-            StorePath::from_full(store_dir, s)
+        let references = with_store("--query")
+            .arg("--references")
+            .arg(store_path.to_full(self.store_dir))
+            .output()
+            .await
+            .wrap_err_with(|| format!("querying references of {store_path}"))?;
+        // `nix-store --query` prints full paths, rooted at whatever store
+        // directory the local `nix-store` is actually configured for. A
+        // mismatch against `store_dir` means this worker's
+        // `KUBERNIX_STORE_DIR` disagrees with its real store — a
+        // misconfiguration worth failing loudly on rather than silently
+        // corrupting every path derived from it.
+        let store_dir = self.store_dir;
+        let references = String::from_utf8_lossy(&references.stdout)
+            .lines()
+            .map(|s| {
+                StorePath::from_full(store_dir, s)
+                    .ok_or_eyre("not rooted at KUBERNIX_STORE_DIR")
+                    .wrap_err_with(|| format!("{s} (store dir {store_dir})"))
+            })
+            .collect::<eyre::Result<_>>()?;
+
+        let deriver = with_store("--query")
+            .arg("--deriver")
+            .arg(store_path.to_full(self.store_dir))
+            .output()
+            .await
+            .wrap_err_with(|| format!("querying the deriver of {store_path}"))?;
+        let deriver = String::from_utf8_lossy(&deriver.stdout).trim().to_string();
+        // `--query --deriver` prints "unknown-deriver" when there is none.
+        let deriver = if deriver == "unknown-deriver" {
+            StorePath::default()
+        } else {
+            StorePath::from_full(self.store_dir, &deriver)
                 .ok_or_eyre("not rooted at KUBERNIX_STORE_DIR")
-                .wrap_err_with(|| format!("{s} (store dir {store_dir})"))
-        })
-        .collect::<eyre::Result<_>>()?;
+                .wrap_err_with(|| format!("{deriver} (store dir {store_dir})"))?
+        };
 
-    let deriver = with_store("--query")
-        .arg("--deriver")
-        .arg(store_path.to_full(store_dir))
-        .output()
-        .await
-        .wrap_err_with(|| format!("querying the deriver of {store_path}"))?;
-    let deriver = String::from_utf8_lossy(&deriver.stdout).trim().to_string();
-    // `--query --deriver` prints "unknown-deriver" when there is none.
-    let deriver = if deriver == "unknown-deriver" {
-        StorePath::default()
-    } else {
-        StorePath::from_full(store_dir, &deriver)
-            .ok_or_eyre("not rooted at KUBERNIX_STORE_DIR")
-            .wrap_err_with(|| format!("{deriver} (store dir {store_dir})"))?
-    };
-
-    Ok((references, deriver))
+        Ok((references, deriver))
+    }
 }
 
 #[cfg(test)]

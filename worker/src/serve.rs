@@ -73,6 +73,58 @@ impl BuildOutcome {
     }
 }
 
+/// Little-endian u64s, written to whatever the serve protocol's stdin is.
+trait WireWrite {
+    async fn write_wire_u64(&mut self, value: u64) -> std::io::Result<()>;
+
+    /// A length-prefixed string, zero-padded to a multiple of eight.
+    async fn write_wire_str(&mut self, value: &[u8]) -> std::io::Result<()>;
+}
+
+impl WireWrite for ChildStdin {
+    async fn write_wire_u64(&mut self, value: u64) -> std::io::Result<()> {
+        self.write_all(&value.to_le_bytes()).await
+    }
+
+    async fn write_wire_str(&mut self, value: &[u8]) -> std::io::Result<()> {
+        self.write_wire_u64(value.len() as u64).await?;
+        self.write_all(value).await?;
+        let padding = (8 - value.len() % 8) % 8;
+        if padding > 0 {
+            self.write_all(&[0u8; 8][..padding]).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Little-endian u64s, read from whatever the serve protocol's stdout is.
+trait WireRead {
+    async fn read_wire_u64(&mut self) -> std::io::Result<u64>;
+    async fn read_wire_string(&mut self) -> std::io::Result<String>;
+}
+
+impl WireRead for ChildStdout {
+    async fn read_wire_u64(&mut self) -> std::io::Result<u64> {
+        let mut buf = [0u8; 8];
+        self.read_exact(&mut buf).await?;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    async fn read_wire_string(&mut self) -> std::io::Result<String> {
+        let len = self.read_wire_u64().await? as usize;
+        let mut buf = vec![0u8; len];
+        self.read_exact(&mut buf).await?;
+
+        // Skip the padding, or every later field is misaligned.
+        let padding = (8 - len % 8) % 8;
+        if padding > 0 {
+            let mut discard = [0u8; 8];
+            self.read_exact(&mut discard[..padding]).await?;
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+}
+
 /// A running `nix-store --serve --write`.
 pub struct ServeConnection {
     child: Child,
@@ -111,21 +163,25 @@ impl ServeConnection {
 
         // The client writes both words before reading; the server answers with
         // its own pair. See `lix/legacy/nix-store.cc:933`.
-        write_u64(&mut stdin, MAGIC_1)
+        stdin
+            .write_wire_u64(MAGIC_1)
             .await
             .wrap_err("writing the serve protocol greeting")?;
-        write_u64(&mut stdin, PROTOCOL_VERSION)
+        stdin
+            .write_wire_u64(PROTOCOL_VERSION)
             .await
             .wrap_err("writing the serve protocol greeting")?;
         stdin.flush().await.wrap_err("flushing the greeting")?;
 
-        let magic = read_u64(&mut stdout)
+        let magic = stdout
+            .read_wire_u64()
             .await
             .wrap_err("reading the serve protocol greeting")?;
         if magic != MAGIC_2 {
             bail!("serve protocol mismatch: got {magic:#x}");
         }
-        let remote_version = read_u64(&mut stdout)
+        let remote_version = stdout
+            .read_wire_u64()
             .await
             .wrap_err("reading the serve protocol version")?;
         if remote_version & 0xff00 != PROTOCOL_VERSION & 0xff00 {
@@ -149,10 +205,12 @@ impl ServeConnection {
     /// `drv` is passed through byte for byte: it is already `serializeDerivation`
     /// output, which is exactly what the far side's `readDerivation` expects.
     pub async fn build_derivation(&mut self, drv_path: &str, drv: &[u8]) -> eyre::Result<BuildOutcome> {
-        write_u64(&mut self.stdin, CMD_BUILD_DERIVATION)
+        self.stdin
+            .write_wire_u64(CMD_BUILD_DERIVATION)
             .await
             .wrap_err("sending the build command")?;
-        write_str(&mut self.stdin, drv_path.as_bytes())
+        self.stdin
+            .write_wire_str(drv_path.as_bytes())
             .await
             .wrap_err("sending the derivation path")?;
         self.stdin
@@ -164,38 +222,42 @@ impl ServeConnection {
         // this order (`nix-store.cc:952`). Omitting one desynchronises the
         // stream rather than being ignored.
         let settings = async {
-            write_u64(&mut self.stdin, 0).await?; // maxSilentTime: no limit
-            write_u64(&mut self.stdin, 0).await?; // buildTimeout: no limit
-            write_u64(&mut self.stdin, 0).await?; // maxLogSize: no limit
-            write_u64(&mut self.stdin, 0).await?; // buildRepeat, unsupported upstream
-            write_u64(&mut self.stdin, 0).await?; // enforceDeterminism, ignored
-            write_u64(&mut self.stdin, 0).await?; // keepFailed (minor >= 7)
+            self.stdin.write_wire_u64(0).await?; // maxSilentTime: no limit
+            self.stdin.write_wire_u64(0).await?; // buildTimeout: no limit
+            self.stdin.write_wire_u64(0).await?; // maxLogSize: no limit
+            self.stdin.write_wire_u64(0).await?; // buildRepeat, unsupported upstream
+            self.stdin.write_wire_u64(0).await?; // enforceDeterminism, ignored
+            self.stdin.write_wire_u64(0).await?; // keepFailed (minor >= 7)
             self.stdin.flush().await
         };
         settings.await.wrap_err("sending build settings")?;
 
-        let status = read_u64(&mut self.stdout)
+        let status = self
+            .stdout
+            .read_wire_u64()
             .await
             .wrap_err("reading the build status")?;
-        let error_msg = read_string(&mut self.stdout)
+        let error_msg = self
+            .stdout
+            .read_wire_string()
             .await
             .wrap_err("reading the build error message")?;
 
         // Protocol 2.7 always carries these; reading them keeps the stream in
         // step even though we only report status and message.
         let drained = async {
-            read_u64(&mut self.stdout).await?; // times built
-            read_u64(&mut self.stdout).await?; // non-deterministic
-            read_u64(&mut self.stdout).await?; // start time
-            read_u64(&mut self.stdout).await?; // stop time
+            self.stdout.read_wire_u64().await?; // times built
+            self.stdout.read_wire_u64().await?; // non-deterministic
+            self.stdout.read_wire_u64().await?; // start time
+            self.stdout.read_wire_u64().await?; // stop time
 
             // `builtOutputs`, a map of realisations. Empty for input-addressed
             // derivations, which is everything we build today — but it has to
             // be drained regardless.
-            let realisations = read_u64(&mut self.stdout).await?;
+            let realisations = self.stdout.read_wire_u64().await?;
             for _ in 0..realisations {
-                read_string(&mut self.stdout).await?; // DrvOutput
-                read_string(&mut self.stdout).await?; // Realisation
+                self.stdout.read_wire_string().await?; // DrvOutput
+                self.stdout.read_wire_string().await?; // Realisation
             }
             std::io::Result::Ok(())
         };
@@ -216,41 +278,6 @@ impl ServeConnection {
         }
         Ok(())
     }
-}
-
-async fn write_u64(out: &mut ChildStdin, value: u64) -> std::io::Result<()> {
-    out.write_all(&value.to_le_bytes()).await
-}
-
-/// A length-prefixed string, zero-padded to a multiple of eight.
-async fn write_str(out: &mut ChildStdin, value: &[u8]) -> std::io::Result<()> {
-    write_u64(out, value.len() as u64).await?;
-    out.write_all(value).await?;
-    let padding = (8 - value.len() % 8) % 8;
-    if padding > 0 {
-        out.write_all(&[0u8; 8][..padding]).await?;
-    }
-    Ok(())
-}
-
-async fn read_u64(input: &mut ChildStdout) -> std::io::Result<u64> {
-    let mut buf = [0u8; 8];
-    input.read_exact(&mut buf).await?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-async fn read_string(input: &mut ChildStdout) -> std::io::Result<String> {
-    let len = read_u64(input).await? as usize;
-    let mut buf = vec![0u8; len];
-    input.read_exact(&mut buf).await?;
-
-    // Skip the padding, or every later field is misaligned.
-    let padding = (8 - len % 8) % 8;
-    if padding > 0 {
-        let mut discard = [0u8; 8];
-        input.read_exact(&mut discard[..padding]).await?;
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[cfg(test)]

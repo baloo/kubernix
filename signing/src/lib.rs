@@ -47,24 +47,27 @@ pub struct Fingerprint<'a> {
     pub store_dir: &'a str,
 }
 
-/// What a signature is computed over.
-///
-/// Every field a client verifies is in here, which is the point: a signature
-/// that covered less would let the uncovered part be altered freely.
-pub fn fingerprint(f: &Fingerprint<'_>) -> String {
-    let references = f
-        .references
-        .iter()
-        .map(|r| r.to_full(f.store_dir))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "1;{};sha256:{};{};{}",
-        f.path,
-        base32_encode(f.nar_hash),
-        f.nar_size,
-        references
-    )
+impl<'a> Fingerprint<'a> {
+    /// What a signature is computed over.
+    ///
+    /// Every field a client verifies is in here, which is the point: a
+    /// signature that covered less would let the uncovered part be altered
+    /// freely.
+    pub fn compute(&self) -> String {
+        let references = self
+            .references
+            .iter()
+            .map(|r| r.to_full(self.store_dir))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "1;{};sha256:{};{};{}",
+            self.path,
+            base32_encode(self.nar_hash),
+            self.nar_size,
+            references
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,7 +106,7 @@ pub trait Signer: Send + Sync {
 
     /// Sign a path's fingerprint, returning the `Sig:` field's value.
     async fn sign_path(&self, f: &Fingerprint<'_>) -> Result<String, SignError> {
-        let signature = self.sign(fingerprint(f).as_bytes()).await?;
+        let signature = self.sign(f.compute().as_bytes()).await?;
         Ok(format!(
             "{}:{}",
             self.key_name(),
@@ -241,7 +244,7 @@ mod tests {
         // any drift makes every signature we produce invalid rather than wrong
         // in some tolerable way.
         let refs = refs();
-        let fingerprint = fingerprint(&subject(&refs));
+        let fingerprint = subject(&refs).compute();
 
         assert!(fingerprint.starts_with(&format!("1;{PATH};")));
         assert!(
@@ -266,22 +269,22 @@ mod tests {
         // If a field were left out, it could be altered without invalidating the
         // signature — which is the failure mode signing exists to prevent.
         let refs = refs();
-        let base = fingerprint(&subject(&refs));
+        let base = subject(&refs).compute();
 
         let mut other = subject(&refs);
         other.path = "/nix/store/00000000000000000000000000000000-other";
-        assert_ne!(base, fingerprint(&other));
+        assert_ne!(base, other.compute());
 
         let mut other = subject(&refs);
         other.nar_hash = &[0xcd; 32];
-        assert_ne!(base, fingerprint(&other));
+        assert_ne!(base, other.compute());
 
         let mut other = subject(&refs);
         other.nar_size = 9999;
-        assert_ne!(base, fingerprint(&other));
+        assert_ne!(base, other.compute());
 
         let fewer = vec![StorePath::new(REFS[0])];
-        assert_ne!(base, fingerprint(&subject(&fewer)));
+        assert_ne!(base, subject(&fewer).compute());
     }
 
     #[tokio::test]
@@ -292,7 +295,7 @@ mod tests {
 
         assert!(sig.starts_with("kubernix-test-1:"));
         assert!(verify(
-            &fingerprint(&subject(&refs)),
+            &subject(&refs).compute(),
             &sig,
             &signer.public_key()
         ));
@@ -306,7 +309,7 @@ mod tests {
 
         let mut tampered = subject(&refs);
         tampered.nar_size = 1;
-        assert!(!verify(&fingerprint(&tampered), &sig, &signer.public_key()));
+        assert!(!verify(&tampered.compute(), &sig, &signer.public_key()));
     }
 
     #[tokio::test]
@@ -318,7 +321,7 @@ mod tests {
         let sig = alice.sign_path(&subject(&refs)).await.expect("signable");
 
         assert!(!verify(
-            &fingerprint(&subject(&refs)),
+            &subject(&refs).compute(),
             &sig,
             &bob.public_key()
         ));
@@ -338,7 +341,7 @@ mod tests {
 
         let sig = restored.sign_path(&subject(&refs)).await.expect("signable");
         assert!(verify(
-            &fingerprint(&subject(&refs)),
+            &subject(&refs).compute(),
             &sig,
             &original.public_key()
         ));
@@ -378,7 +381,7 @@ mod tests {
         let refs = refs();
         let key = LocalSigner::generate("k").public_key();
         for bad in ["", "no-colon", "k:not-base64!!", "k:c2hvcnQ="] {
-            assert!(!verify(&fingerprint(&subject(&refs)), bad, &key));
+            assert!(!verify(&subject(&refs).compute(), bad, &key));
         }
     }
 

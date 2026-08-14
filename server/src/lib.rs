@@ -30,6 +30,7 @@ pub mod kubernix_capnp {
 }
 
 pub mod capability;
+mod capnp_ext;
 pub mod daemon_rpc;
 pub mod gc;
 pub mod http;

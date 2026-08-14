@@ -6,7 +6,7 @@
 //! not expressible — see PLAN.md Phase 9.
 //!
 //! Ported from `lix/libstore/store-api.cc`. The shapes, all of which feed the
-//! same [`make_store_path`]:
+//! same [`StoreDir::make_store_path`]:
 //!
 //! | method | type string | hashed |
 //! | --- | --- | --- |
@@ -57,89 +57,96 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `Store::makeStorePath`: `<type>:<hash>:<storeDir>:<name>`, sha256'd,
-/// compressed to 20 bytes, base32'd. `store_dir` only feeds the hash — Nix's
-/// formula folds it in — the returned string is the bare `<hash>-<name>`.
-pub fn make_store_path(store_dir: &str, ty: &str, hash_hex: &str, name: &str) -> String {
-    let s = format!("{ty}:{hash_hex}:{store_dir}:{name}");
-    let digest = Sha256::digest(s.as_bytes());
-    let compressed = compress_hash(&digest, 20);
-    format!("{}-{name}", base32_encode(&compressed))
-}
+/// The store directory a client prepends to every path it sends or expects on
+/// the wire — see [`kubernix_types::StorePath`]'s doc comment for why the type
+/// itself never carries it. Borrowed, not owned: every caller already has a
+/// `&str` or `String` in scope for the lifetime of these calls.
+#[derive(Clone, Copy)]
+pub struct StoreDir<'a>(pub &'a str);
 
-/// Stuff references into the type string, as `makeType` does.
-///
-/// A bit hacky, and deliberately so upstream: they cannot go anywhere else in
-/// the grammar without becoming ambiguous.
-fn make_type(store_dir: &str, base: &str, references: &[StorePath], self_ref: bool) -> String {
-    let mut ty = base.to_string();
-    for reference in references {
-        ty.push(':');
-        ty.push_str(&reference.to_full(store_dir));
+impl<'a> StoreDir<'a> {
+    /// `Store::makeStorePath`: `<type>:<hash>:<storeDir>:<name>`, sha256'd,
+    /// compressed to 20 bytes, base32'd. `store_dir` only feeds the hash —
+    /// Nix's formula folds it in — the returned string is the bare
+    /// `<hash>-<name>`.
+    pub fn make_store_path(&self, ty: &str, hash_hex: &str, name: &str) -> String {
+        let s = format!("{ty}:{hash_hex}:{}:{name}", self.0);
+        let digest = Sha256::digest(s.as_bytes());
+        let compressed = compress_hash(&digest, 20);
+        format!("{}-{name}", base32_encode(&compressed))
     }
-    if self_ref {
-        ty.push_str(":self");
-    }
-    ty
-}
 
-/// The store path content with this address belongs at.
-///
-/// `hash` is the raw digest bytes of whatever the method hashes — the file
-/// contents for `Text` and `Flat`, the NAR for `Recursive`.
-///
-/// Returns `None` for combinations Nix itself refuses: a non-sha256 fixed output
-/// carrying references, which has nowhere to put them.
-pub fn store_path_for(
-    store_dir: &str,
-    name: &str,
-    method: CaMethod,
-    hash_algo: &str,
-    hash: &[u8],
-    references: &[StorePath],
-) -> Option<StorePath> {
-    match method {
-        CaMethod::Text => {
-            // `makeTextPath` asserts sha256; anything else is not a text CA.
-            if hash_algo != "sha256" {
-                return None;
-            }
-            let ty = make_type(store_dir, "text", references, false);
-            Some(StorePath::new(make_store_path(
-                store_dir,
-                &ty,
-                &format!("sha256:{}", hex(hash)),
-                name,
-            )))
+    /// Stuff references into the type string, as `makeType` does.
+    ///
+    /// A bit hacky, and deliberately so upstream: they cannot go anywhere else
+    /// in the grammar without becoming ambiguous.
+    fn make_type(&self, base: &str, references: &[StorePath], self_ref: bool) -> String {
+        let mut ty = base.to_string();
+        for reference in references {
+            ty.push(':');
+            ty.push_str(&reference.to_full(self.0));
         }
-        CaMethod::Recursive if hash_algo == "sha256" => {
-            let ty = make_type(store_dir, "source", references, false);
-            Some(StorePath::new(make_store_path(
-                store_dir,
-                &ty,
-                &format!("sha256:{}", hex(hash)),
-                name,
-            )))
+        if self_ref {
+            ty.push_str(":self");
         }
-        // The long form: hash the description of the fixed output, then use
-        // *that* as the store path's hash.
-        CaMethod::Flat | CaMethod::Recursive => {
-            if !references.is_empty() {
-                return None;
+        ty
+    }
+
+    /// The store path content with this address belongs at.
+    ///
+    /// `hash` is the raw digest bytes of whatever the method hashes — the file
+    /// contents for `Text` and `Flat`, the NAR for `Recursive`.
+    ///
+    /// Returns `None` for combinations Nix itself refuses: a non-sha256 fixed
+    /// output carrying references, which has nowhere to put them.
+    pub fn store_path_for(
+        &self,
+        name: &str,
+        method: CaMethod,
+        hash_algo: &str,
+        hash: &[u8],
+        references: &[StorePath],
+    ) -> Option<StorePath> {
+        match method {
+            CaMethod::Text => {
+                // `makeTextPath` asserts sha256; anything else is not a text CA.
+                if hash_algo != "sha256" {
+                    return None;
+                }
+                let ty = self.make_type("text", references, false);
+                Some(StorePath::new(self.make_store_path(
+                    &ty,
+                    &format!("sha256:{}", hex(hash)),
+                    name,
+                )))
             }
-            let prefix = if method == CaMethod::Recursive {
-                "r:"
-            } else {
-                ""
-            };
-            let inner = format!("fixed:out:{prefix}{hash_algo}:{}:", hex(hash));
-            let digest = Sha256::digest(inner.as_bytes());
-            Some(StorePath::new(make_store_path(
-                store_dir,
-                "output:out",
-                &format!("sha256:{}", hex(&digest)),
-                name,
-            )))
+            CaMethod::Recursive if hash_algo == "sha256" => {
+                let ty = self.make_type("source", references, false);
+                Some(StorePath::new(self.make_store_path(
+                    &ty,
+                    &format!("sha256:{}", hex(hash)),
+                    name,
+                )))
+            }
+            // The long form: hash the description of the fixed output, then use
+            // *that* as the store path's hash.
+            CaMethod::Flat | CaMethod::Recursive => {
+                if !references.is_empty() {
+                    return None;
+                }
+                let prefix = if method == CaMethod::Recursive {
+                    "r:"
+                } else {
+                    ""
+                };
+                let inner = format!("fixed:out:{prefix}{hash_algo}:{}:", hex(hash));
+                let digest = Sha256::digest(inner.as_bytes());
+                Some(StorePath::new(self.make_store_path(
+                    "output:out",
+                    &format!("sha256:{}", hex(&digest)),
+                    name,
+                )))
+            }
         }
     }
 }
@@ -157,43 +164,40 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Recompute a fixed-output derivation output's store path from its declared
-/// `algo`/`hash`, entirely ignoring whatever `path` the `.drv` itself claims —
-/// mirroring how a real Nix daemon's `buildDerivation` handles a `CAFixed`
-/// output: `parseDerivationOutput` (`lix/libstore/derivations.cc:223-256`)
-/// discards the wire's `path` field for this case and derives the true one
-/// from the content address alone. PLAN.md Phase 14.
-///
-/// `algo` is the wire's `Output.algo` field: bare `"<hash-algo>"` selects
-/// [`CaMethod::Flat`], `"r:<hash-algo>"` selects [`CaMethod::Recursive`] —
-/// Nix's `ContentAddressMethod::parsePrefix` convention. Returns `None` for
-/// malformed hex, or any shape [`store_path_for`] itself refuses.
-pub fn verify_fixed_output(
-    drv_name: &str,
-    output_name: &str,
-    algo: &str,
-    hash_hex: &str,
-    store_dir: &str,
-) -> Option<StorePath> {
-    let (method, hash_algo) = match algo.strip_prefix("r:") {
-        Some(rest) => (CaMethod::Recursive, rest),
-        None => (CaMethod::Flat, algo),
-    };
-    // `outputPathName`: the "out" output reuses the derivation's own name
-    // bare; every other output is suffixed with its own name.
-    let output_path_name = if output_name == "out" {
-        drv_name.to_string()
-    } else {
-        format!("{drv_name}-{output_name}")
-    };
-    store_path_for(
-        store_dir,
-        &output_path_name,
-        method,
-        hash_algo,
-        &unhex(hash_hex)?,
-        &[],
-    )
+impl<'a> StoreDir<'a> {
+    /// Recompute a fixed-output derivation output's store path from its
+    /// declared `algo`/`hash`, entirely ignoring whatever `path` the `.drv`
+    /// itself claims — mirroring how a real Nix daemon's `buildDerivation`
+    /// handles a `CAFixed` output: `parseDerivationOutput`
+    /// (`lix/libstore/derivations.cc:223-256`) discards the wire's `path`
+    /// field for this case and derives the true one from the content address
+    /// alone. PLAN.md Phase 14.
+    ///
+    /// `algo` is the wire's `Output.algo` field: bare `"<hash-algo>"` selects
+    /// [`CaMethod::Flat`], `"r:<hash-algo>"` selects [`CaMethod::Recursive`] —
+    /// Nix's `ContentAddressMethod::parsePrefix` convention. Returns `None`
+    /// for malformed hex, or any shape [`StoreDir::store_path_for`] itself
+    /// refuses.
+    pub fn verify_fixed_output(
+        &self,
+        drv_name: &str,
+        output_name: &str,
+        algo: &str,
+        hash_hex: &str,
+    ) -> Option<StorePath> {
+        let (method, hash_algo) = match algo.strip_prefix("r:") {
+            Some(rest) => (CaMethod::Recursive, rest),
+            None => (CaMethod::Flat, algo),
+        };
+        // `outputPathName`: the "out" output reuses the derivation's own name
+        // bare; every other output is suffixed with its own name.
+        let output_path_name = if output_name == "out" {
+            drv_name.to_string()
+        } else {
+            format!("{drv_name}-{output_name}")
+        };
+        self.store_path_for(&output_path_name, method, hash_algo, &unhex(hash_hex)?, &[])
+    }
 }
 
 /// A content address as it arrives on the wire.
@@ -230,62 +234,65 @@ impl std::fmt::Display for Rejection {
     }
 }
 
-/// Check that `nar` really is the content addressed by `ca` at `path`.
-///
-/// This is the whole point of the tiering: a path that passes here was *derived*
-/// from its bytes rather than asserted, so a client cannot register content at a
-/// path that is not its own. See PLAN.md Phase 9.
-///
-/// Two independent things are checked, and both matter. The hash must match the
-/// bytes — otherwise the address is simply false — *and* the resulting path must
-/// match the one claimed, which is what stops a client presenting honest content
-/// under someone else's name.
-pub fn verify(
-    path: &StorePath,
-    store_dir: &str,
-    ca: &ContentAddress,
-    references: &[StorePath],
-    nar: &[u8],
-) -> std::result::Result<(), Rejection> {
-    let name = path
-        .name()
-        .ok_or(Rejection::Unverifiable("not a store path"))?;
+impl<'a> StoreDir<'a> {
+    /// Check that `nar` really is the content addressed by `ca` at `path`.
+    ///
+    /// This is the whole point of the tiering: a path that passes here was
+    /// *derived* from its bytes rather than asserted, so a client cannot
+    /// register content at a path that is not its own. See PLAN.md Phase 9.
+    ///
+    /// Two independent things are checked, and both matter. The hash must
+    /// match the bytes — otherwise the address is simply false — *and* the
+    /// resulting path must match the one claimed, which is what stops a
+    /// client presenting honest content under someone else's name.
+    pub fn verify(
+        &self,
+        path: &StorePath,
+        ca: &ContentAddress,
+        references: &[StorePath],
+        nar: &[u8],
+    ) -> std::result::Result<(), Rejection> {
+        let name = path
+            .name()
+            .ok_or(Rejection::Unverifiable("not a store path"))?;
 
-    if ca.algo != "sha256" {
-        // Everything a Lix client produces is sha256. Refusing the rest is not a
-        // limitation worth lifting speculatively — it would mean hashing with an
-        // algorithm nothing uses.
-        return Err(Rejection::Unverifiable("only sha256 is checked"));
-    }
-
-    // What gets hashed depends on the method: the NAR as a whole, or the single
-    // file inside it.
-    let actual: Vec<u8> = match ca.method {
-        CaMethod::Recursive => Sha256::digest(nar).to_vec(),
-        CaMethod::Text | CaMethod::Flat => {
-            let contents = regular_file_contents(nar)
-                .ok_or(Rejection::Unverifiable("not a single regular file"))?;
-            Sha256::digest(contents).to_vec()
+        if ca.algo != "sha256" {
+            // Everything a Lix client produces is sha256. Refusing the rest is
+            // not a limitation worth lifting speculatively — it would mean
+            // hashing with an algorithm nothing uses.
+            return Err(Rejection::Unverifiable("only sha256 is checked"));
         }
-    };
 
-    if actual != ca.hash {
-        return Err(Rejection::HashMismatch {
-            declared: hex(&ca.hash),
-            actual: hex(&actual),
-        });
+        // What gets hashed depends on the method: the NAR as a whole, or the
+        // single file inside it.
+        let actual: Vec<u8> = match ca.method {
+            CaMethod::Recursive => Sha256::digest(nar).to_vec(),
+            CaMethod::Text | CaMethod::Flat => {
+                let contents = regular_file_contents(nar)
+                    .ok_or(Rejection::Unverifiable("not a single regular file"))?;
+                Sha256::digest(contents).to_vec()
+            }
+        };
+
+        if actual != ca.hash {
+            return Err(Rejection::HashMismatch {
+                declared: hex(&ca.hash),
+                actual: hex(&actual),
+            });
+        }
+
+        let computed = self
+            .store_path_for(name, ca.method, &ca.algo, &actual, references)
+            .ok_or(Rejection::Unverifiable("no path for this address"))?;
+
+        if &computed != path {
+            return Err(Rejection::WrongPath {
+                claimed: path.to_string(),
+                computed: computed.to_string(),
+            });
+        }
+        Ok(())
     }
-
-    let computed = store_path_for(store_dir, name, ca.method, &ca.algo, &actual, references)
-        .ok_or(Rejection::Unverifiable("no path for this address"))?;
-
-    if &computed != path {
-        return Err(Rejection::WrongPath {
-            claimed: path.to_string(),
-            computed: computed.to_string(),
-        });
-    }
-    Ok(())
 }
 
 /// Contents of a NAR holding exactly one regular file.
@@ -345,6 +352,8 @@ fn read_token<'a>(nar: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
 mod tests {
     use super::*;
 
+    const DIR: StoreDir = StoreDir("/nix/store");
+
     /// sha256 of `"hello content addressing\n"`, i.e. the file the expected
     /// paths below were produced from.
     const FLAT_HASH: &str = "4e5b6af479ac8a11c0d7e256cf774ac9a1087605837b44e9c95f528d04df5156";
@@ -386,16 +395,9 @@ mod tests {
         let nar = nar_of(b"hello content addressing\n");
         let nar_hash = Sha256::digest(&nar);
         assert_eq!(
-            store_path_for(
-                "/nix/store",
-                "f.txt",
-                CaMethod::Recursive,
-                "sha256",
-                &nar_hash,
-                &[],
-            )
-            .as_ref()
-            .map(StorePath::as_str),
+            DIR.store_path_for("f.txt", CaMethod::Recursive, "sha256", &nar_hash, &[],)
+                .as_ref()
+                .map(StorePath::as_str),
             Some("cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt")
         );
     }
@@ -405,16 +407,9 @@ mod tests {
         // $ nix-store --add-fixed sha256 f.txt
         // /nix/store/6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt
         assert_eq!(
-            store_path_for(
-                "/nix/store",
-                "f.txt",
-                CaMethod::Flat,
-                "sha256",
-                &unhex(FLAT_HASH),
-                &[],
-            )
-            .as_ref()
-            .map(StorePath::as_str),
+            DIR.store_path_for("f.txt", CaMethod::Flat, "sha256", &unhex(FLAT_HASH), &[],)
+                .as_ref()
+                .map(StorePath::as_str),
             Some("6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt")
         );
     }
@@ -425,16 +420,9 @@ mod tests {
         // "/nix/store/ik0brqacj8rn97il4ygixp855xyh64ld-greeting"
         let hash = Sha256::digest(b"round trip");
         assert_eq!(
-            store_path_for(
-                "/nix/store",
-                "greeting",
-                CaMethod::Text,
-                "sha256",
-                &hash,
-                &[]
-            )
-            .as_ref()
-            .map(StorePath::as_str),
+            DIR.store_path_for("greeting", CaMethod::Text, "sha256", &hash, &[])
+                .as_ref()
+                .map(StorePath::as_str),
             Some("ik0brqacj8rn97il4ygixp855xyh64ld-greeting")
         );
     }
@@ -446,7 +434,7 @@ mod tests {
         // "out" output funnels through the same makeFixedOutputPath formula as
         // `nix-store --add-fixed sha256 f.txt`.
         assert_eq!(
-            verify_fixed_output("f.txt", "out", "sha256", FLAT_HASH, "/nix/store")
+            DIR.verify_fixed_output("f.txt", "out", "sha256", FLAT_HASH)
                 .as_ref()
                 .map(StorePath::as_str),
             Some("6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt")
@@ -460,7 +448,7 @@ mod tests {
         let nar = nar_of(b"hello content addressing\n");
         let nar_hash = hex(&Sha256::digest(&nar));
         assert_eq!(
-            verify_fixed_output("f.txt", "out", "r:sha256", &nar_hash, "/nix/store")
+            DIR.verify_fixed_output("f.txt", "out", "r:sha256", &nar_hash)
                 .as_ref()
                 .map(StorePath::as_str),
             Some("cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt")
@@ -472,9 +460,11 @@ mod tests {
         // outputPathName: a non-"out" output is suffixed with its own name
         // rather than reusing the derivation's name bare, so it must land at a
         // different path from "out".
-        let named = verify_fixed_output("f.txt", "dev", "sha256", FLAT_HASH, "/nix/store")
+        let named = DIR
+            .verify_fixed_output("f.txt", "dev", "sha256", FLAT_HASH)
             .expect("well-formed");
-        let bare = verify_fixed_output("f.txt", "out", "sha256", FLAT_HASH, "/nix/store")
+        let bare = DIR
+            .verify_fixed_output("f.txt", "out", "sha256", FLAT_HASH)
             .expect("well-formed");
         assert_ne!(named, bare);
         assert_eq!(named.name(), Some("f.txt-dev"));
@@ -483,11 +473,11 @@ mod tests {
     #[test]
     fn verify_fixed_output_rejects_malformed_hex() {
         assert_eq!(
-            verify_fixed_output("f.txt", "out", "sha256", "not-hex", "/nix/store"),
+            DIR.verify_fixed_output("f.txt", "out", "sha256", "not-hex"),
             None
         );
         assert_eq!(
-            verify_fixed_output("f.txt", "out", "sha256", "abc", "/nix/store"), // odd length
+            DIR.verify_fixed_output("f.txt", "out", "sha256", "abc"), // odd length
             None
         );
     }
@@ -498,9 +488,8 @@ mod tests {
         // different path — which is the point: the reference set is part of what
         // the content addresses.
         let hash = Sha256::digest(b"x");
-        let bare = store_path_for("/nix/store", "n", CaMethod::Text, "sha256", &hash, &[]);
-        let with = store_path_for(
-            "/nix/store",
+        let bare = DIR.store_path_for("n", CaMethod::Text, "sha256", &hash, &[]);
+        let with = DIR.store_path_for(
             "n",
             CaMethod::Text,
             "sha256",
@@ -520,8 +509,7 @@ mod tests {
         // one the content belongs at.
         let hash = Sha256::digest(b"x");
         assert_eq!(
-            store_path_for(
-                "/nix/store",
+            DIR.store_path_for(
                 "n",
                 CaMethod::Flat,
                 "sha256",
@@ -537,7 +525,7 @@ mod tests {
     #[test]
     fn text_requires_sha256() {
         assert_eq!(
-            store_path_for("/nix/store", "n", CaMethod::Text, "sha1", &[0; 20], &[]),
+            DIR.store_path_for("n", CaMethod::Text, "sha1", &[0; 20], &[]),
             None
         );
     }
@@ -571,7 +559,7 @@ mod tests {
     #[test]
     fn accepts_content_that_matches_its_address() {
         let (path, ca, nar) = honest_push();
-        assert_eq!(verify(&path, "/nix/store", &ca, &[], &nar), Ok(()));
+        assert_eq!(DIR.verify(&path, &ca, &[], &nar), Ok(()));
     }
 
     #[test]
@@ -580,7 +568,7 @@ mod tests {
         let (path, ca, mut nar) = honest_push();
         nar.extend_from_slice(b"tampered");
         assert!(matches!(
-            verify(&path, "/nix/store", &ca, &[], &nar),
+            DIR.verify(&path, &ca, &[], &nar),
             Err(Rejection::HashMismatch { .. })
         ));
     }
@@ -592,7 +580,7 @@ mod tests {
         // catches this — the hash check alone passes.
         let (_, ca, nar) = honest_push();
         let claimed = StorePath::new("00000000000000000000000000000000-bash");
-        match verify(&claimed, "/nix/store", &ca, &[], &nar) {
+        match DIR.verify(&claimed, &ca, &[], &nar) {
             Err(Rejection::WrongPath { computed, .. }) => {
                 assert_ne!(computed, claimed.to_string());
                 // The name is itself part of what is hashed, so the content does
@@ -614,7 +602,7 @@ mod tests {
             "00000000000000000000000000000000-dep",
         )];
         assert!(matches!(
-            verify(&path, "/nix/store", &ca, &refs, &nar),
+            DIR.verify(&path, &ca, &refs, &nar),
             Err(Rejection::WrongPath { .. })
         ));
     }
@@ -630,9 +618,8 @@ mod tests {
             hash: Sha256::digest(contents).to_vec(),
         };
         assert_eq!(
-            verify(
+            DIR.verify(
                 &StorePath::new("ik0brqacj8rn97il4ygixp855xyh64ld-greeting"),
-                "/nix/store",
                 &ca,
                 &[],
                 &nar_of(contents),
@@ -649,14 +636,14 @@ mod tests {
         // waved through as verified.
         ca.algo = "sha512".to_string();
         assert!(matches!(
-            verify(&path, "/nix/store", &ca, &[], &nar),
+            DIR.verify(&path, &ca, &[], &nar),
             Err(Rejection::Unverifiable(_))
         ));
 
         // Nor may a non-store path.
         let (_, ca, nar) = honest_push();
         assert!(matches!(
-            verify(&StorePath::new("not-a-store-path"), "/nix/store", &ca, &[], &nar),
+            DIR.verify(&StorePath::new("not-a-store-path"), &ca, &[], &nar),
             Err(Rejection::Unverifiable(_))
         ));
     }
