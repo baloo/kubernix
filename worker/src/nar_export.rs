@@ -28,22 +28,10 @@
 //! then a final `u64 0`.
 
 use kubernix_types::StorePath;
+use kubernix_types::wire::{write_bytes as write_str, write_u64};
 
 /// `lix/libstore/store-api.hh:107`.
 const EXPORT_MAGIC: u64 = 0x4558_494e;
-
-/// Integers are little-endian u64; strings are a u64 length followed by the
-/// bytes, zero-padded to a multiple of 8.
-fn write_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn write_str(out: &mut Vec<u8>, value: &[u8]) {
-    write_u64(out, value.len() as u64);
-    out.extend_from_slice(value);
-    let padding = (8 - (value.len() % 8)) % 8;
-    out.extend(std::iter::repeat_n(0u8, padding));
-}
 
 /// The bytes that follow a NAR to make it an importable export stream.
 ///

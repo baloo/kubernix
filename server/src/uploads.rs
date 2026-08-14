@@ -267,7 +267,7 @@ impl UploadSigner {
         Ok(())
     }
 
-    async fn handle(&self, payload: &[u8], store: &dyn Store) -> Result<Vec<String>, String> {
+    async fn handle(&self, payload: &[u8], store: &dyn Store) -> Result<Vec<String>, UploadError> {
         // Decode to owned values first. capnp readers are !Send, and holding one
         // across the presigning awaits would make this future !Send — which it
         // cannot be, since it runs under tokio::spawn.
@@ -278,7 +278,7 @@ impl UploadSigner {
         // or mistrust (PLAN.md Phase 14).
         let Some(capability) = Capability::verify(&token, store).await else {
             tracing::warn!(%job_id, "refusing url request with an unverifiable capability token");
-            return Err("invalid or missing capability token".to_string());
+            return Err(UploadError::UnverifiedToken);
         };
         let tenant = &capability.tenant;
 
@@ -288,7 +288,7 @@ impl UploadSigner {
             for key in &keys {
                 if !key_is_permitted(key, download, tenant) {
                     tracing::warn!(%job_id, %tenant, %key, "refusing download url for disallowed key");
-                    return Err(format!("key not permitted: {key}"));
+                    return Err(UploadError::KeyNotPermitted(key.clone()));
                 }
             }
         } else {
@@ -308,7 +308,7 @@ impl UploadSigner {
                         %job_id, %tenant, %key,
                         "refusing upload url for a key outside this job's verified outputs"
                     );
-                    return Err(format!("key not permitted: {key}"));
+                    return Err(UploadError::KeyNotPermitted(key.clone()));
                 }
             }
         }
@@ -320,7 +320,8 @@ impl UploadSigner {
             } else {
                 self.presign_put(key).await
             }
-            .map_err(to_worker_error)?;
+            .map_err(to_worker_error)
+            .map_err(UploadError::Internal)?;
             urls.push(url);
         }
 
@@ -333,6 +334,29 @@ impl UploadSigner {
         );
         Ok(urls)
     }
+}
+
+/// Why an upload/download URL request was refused, or failed for an internal
+/// reason a worker can only be told about generically.
+///
+/// A single enum rather than building a message at each call site: what
+/// reaches the worker (via `Display`, in [`encode_response`]) is guaranteed
+/// to cover every failure mode this function has, and the compiler checks any
+/// call site pattern-matching on it is exhaustive too.
+#[derive(Debug, thiserror::Error)]
+enum UploadError {
+    #[error("undecodable request: {0}")]
+    UndecodableRequest(String),
+    #[error("invalid or missing capability token")]
+    UnverifiedToken,
+    #[error("key not permitted: {0}")]
+    KeyNotPermitted(ObjectKey),
+    /// An internal failure already reduced to a worker-safe message by
+    /// [`to_worker_error`] (presigning failed, or some other S3/internal
+    /// error) — this variant's job is only to carry that message onward, not
+    /// to sanitise it again.
+    #[error("{0}")]
+    Internal(String),
 }
 
 /// Turn an internal error into what a worker sees over the wire.
@@ -351,13 +375,17 @@ fn to_worker_error(report: eyre::Report) -> String {
 
 type UrlRequest = (String, Vec<ObjectKey>, bool, CapabilityToken);
 
-fn decode_request(payload: &[u8]) -> Result<UrlRequest, String> {
+fn decode_request(payload: &[u8]) -> Result<UrlRequest, UploadError> {
+    fn undecodable(e: impl std::fmt::Display) -> UploadError {
+        UploadError::UndecodableRequest(e.to_string())
+    }
+
     let mut cursor = payload;
     let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
-        .map_err(|e| format!("undecodable request: {e}"))?;
+        .map_err(undecodable)?;
     let request = reader
         .get_root::<kubernix_capnp::upload_url_request::Reader>()
-        .map_err(|e| format!("undecodable request: {e}"))?;
+        .map_err(undecodable)?;
 
     let job_id = request
         .get_job_id()
@@ -366,20 +394,18 @@ fn decode_request(payload: &[u8]) -> Result<UrlRequest, String> {
         .unwrap_or_default();
 
     let mut keys = Vec::new();
-    for key in request.get_keys().map_err(|e| e.to_string())?.iter() {
+    for key in request.get_keys().map_err(undecodable)?.iter() {
         keys.push(ObjectKey::new(
-            key.map_err(|e| e.to_string())?
-                .to_string()
-                .map_err(|e| e.to_string())?,
+            key.map_err(undecodable)?.to_string().map_err(undecodable)?,
         ));
     }
 
-    let token = CapabilityToken::new(request.get_token().map_err(|e| e.to_string())?.to_vec());
+    let token = CapabilityToken::new(request.get_token().map_err(undecodable)?.to_vec());
 
     Ok((job_id, keys, request.get_download(), token))
 }
 
-fn encode_response(response: &Result<Vec<String>, String>) -> capnp::Result<Vec<u8>> {
+fn encode_response(response: &Result<Vec<String>, UploadError>) -> capnp::Result<Vec<u8>> {
     let mut message = capnp::message::Builder::new_default();
     {
         let mut builder = message.init_root::<kubernix_capnp::upload_url_response::Builder>();
@@ -390,7 +416,7 @@ fn encode_response(response: &Result<Vec<String>, String>) -> capnp::Result<Vec<
                     list.set(i as u32, url.as_str());
                 }
             }
-            Err(message) => builder.set_error_msg(message.as_str()),
+            Err(e) => builder.set_error_msg(e.to_string()),
         }
     }
     let mut payload = Vec::new();

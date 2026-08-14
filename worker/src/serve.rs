@@ -25,6 +25,7 @@
 use std::process::Stdio;
 
 use eyre::{Context as _, OptionExt as _, bail};
+use kubernix_types::wire::padding;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
@@ -89,7 +90,7 @@ impl WireWrite for ChildStdin {
     async fn write_wire_str(&mut self, value: &[u8]) -> std::io::Result<()> {
         self.write_wire_u64(value.len() as u64).await?;
         self.write_all(value).await?;
-        let padding = (8 - value.len() % 8) % 8;
+        let padding = padding(value.len());
         if padding > 0 {
             self.write_all(&[0u8; 8][..padding]).await?;
         }
@@ -116,7 +117,7 @@ impl WireRead for ChildStdout {
         self.read_exact(&mut buf).await?;
 
         // Skip the padding, or every later field is misaligned.
-        let padding = (8 - len % 8) % 8;
+        let padding = padding(len);
         if padding > 0 {
             let mut discard = [0u8; 8];
             self.read_exact(&mut discard[..padding]).await?;

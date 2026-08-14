@@ -11,6 +11,14 @@
 /// than trusting the identity to be well-formed, callers are expected to
 /// either derive one from a known-safe shape ([`TenantId::from_parts`]) or
 /// validate one that arrived over the wire ([`TenantId::from_wire`]).
+///
+/// Deliberately narrower than this crate's other string newtypes
+/// ([`crate::ObjectKey`], [`crate::StorePath`], [`crate::System`]): no
+/// `Default` (there is no safe "empty" tenant to fall back to), and no
+/// `From<String>`/`AsRef<str>` (either would let an unvalidated string become
+/// a `TenantId` without going through [`TenantId::from_wire`], which is the
+/// one thing this type exists to prevent). [`std::str::FromStr`] is the
+/// exception — it validates the same as `from_wire`, just via `.parse()`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TenantId(String);
 
@@ -52,6 +60,22 @@ impl std::fmt::Display for TenantId {
     }
 }
 
+/// Why a candidate string was refused by [`TenantId::from_wire`]/`FromStr`.
+#[derive(Debug, thiserror::Error)]
+#[error("not a well-formed tenant id: {0:?}")]
+pub struct InvalidTenantId(String);
+
+impl std::str::FromStr for TenantId {
+    type Err = InvalidTenantId;
+
+    /// Same validation as [`TenantId::from_wire`], via `.parse()` — useful
+    /// wherever generic parsing code expects `FromStr` rather than a
+    /// bespoke constructor (e.g. CLI/config argument parsing).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        TenantId::from_wire(s).ok_or_else(|| InvalidTenantId(s.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +93,12 @@ mod tests {
         let id = TenantId::from_parts("user-alice", "dabd1db8d35ab131");
         assert_eq!(id.as_str(), "user-alice-dabd1db8d35ab131");
         assert!(TenantId::from_wire(id.as_str()).is_some());
+    }
+
+    #[test]
+    fn from_str_agrees_with_from_wire() {
+        let id: TenantId = "user-alice-dabd1db8d35ab131".parse().unwrap();
+        assert_eq!(id, TenantId::from_wire("user-alice-dabd1db8d35ab131").unwrap());
+        assert!("../other".parse::<TenantId>().is_err());
     }
 }

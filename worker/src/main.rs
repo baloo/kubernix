@@ -209,7 +209,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         if let Err(report) = job.fetch_inputs(&client, &http, nix).await {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
             let outcome = Outcome::Failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
-            if let Err(e) = job.publish_result(&jetstream, &outcome, &[], &ObjectKey::default()).await {
+            if let Err(e) = job.publish_result(&jetstream, &outcome, &[], None).await {
                 tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
             }
             if let Err(e) = message.ack().await {
@@ -225,9 +225,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
                 tracing::error!(job_id = %job.job_id, error = ?report, "undecodable derivation");
                 let outcome =
                     Outcome::Failed(infra_failure_message(&job.job_id, "reading the derivation failed"));
-                if let Err(e) =
-                    job.publish_result(&jetstream, &outcome, &[], &ObjectKey::default()).await
-                {
+                if let Err(e) = job.publish_result(&jetstream, &outcome, &[], None).await {
                     tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
                 }
                 if let Err(e) = message.ack().await {
@@ -249,11 +247,11 @@ async fn main() -> color_eyre::eyre::Result<()> {
             Err(report) => {
                 tracing::error!(job_id = %job.job_id, error = ?report, "artifact upload failed");
                 outcome = Outcome::Failed(infra_failure_message(&job.job_id, "uploading artifacts failed"));
-                (Vec::new(), ObjectKey::default())
+                (Vec::new(), None)
             }
         };
 
-        if let Err(e) = job.publish_result(&jetstream, &outcome, &artifacts, &log_key).await {
+        if let Err(e) = job.publish_result(&jetstream, &outcome, &artifacts, log_key.as_ref()).await {
             tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
             // Not acked: let it be redelivered rather than lose the job.
             continue;
@@ -344,7 +342,7 @@ impl Job {
         outcome: &Outcome,
         log: Vec<u8>,
         nix: upload::NixStore<'_>,
-    ) -> eyre::Result<(Vec<upload::OutputArtifact>, ObjectKey)> {
+    ) -> eyre::Result<(Vec<upload::OutputArtifact>, Option<ObjectKey>)> {
         let outputs: Vec<StorePath> = match outcome {
             Outcome::Completed(paths) => paths.clone(),
             Outcome::Failed(_) => Vec::new(),
@@ -374,12 +372,12 @@ impl Job {
         // report no key.
         let log_key = if log.is_empty() {
             tracing::debug!(job_id = %self.job_id, "build produced no log; not uploading one");
-            ObjectKey::default()
+            None
         } else {
             upload::upload_log(http, &urls[0], &log_key, log)
                 .await
                 .wrap_err("uploading the build log")?;
-            log_key
+            Some(log_key)
         };
 
         let mut artifacts = Vec::new();
@@ -514,13 +512,18 @@ impl Job {
         jetstream: &jetstream::Context,
         outcome: &Outcome,
         artifacts: &[upload::OutputArtifact],
-        log_key: &ObjectKey,
+        log_key: Option<&ObjectKey>,
     ) -> eyre::Result<()> {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut result = message.init_root::<kubernix_capnp::job_result::Builder>();
             result.set_job_id(self.job_id.as_str());
-            result.set_log_key(log_key.as_str());
+            // The wire has no "absent" representation of its own — an empty
+            // string is how "no log was uploaded" travels — but the type here
+            // makes that meaning explicit at every call site instead of
+            // relying on callers to remember that `ObjectKey::default()` is
+            // the sentinel for absence.
+            result.set_log_key(log_key.map(ObjectKey::as_str).unwrap_or(""));
 
             match outcome {
                 Outcome::Completed(outputs) => {
@@ -546,7 +549,7 @@ impl Job {
                 out.set_file_size(artifact.file_size);
                 out.set_key(artifact.key.as_str());
                 out.set_compression("zstd");
-                out.set_deriver(artifact.deriver.as_str());
+                out.set_deriver(artifact.deriver.as_ref().map(StorePath::as_str).unwrap_or(""));
                 let mut refs = out
                     .reborrow()
                     .init_references(artifact.references.len() as u32);

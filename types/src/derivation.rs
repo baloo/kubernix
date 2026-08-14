@@ -25,6 +25,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::wire;
 use crate::{StorePath, System};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,51 +49,17 @@ pub struct BasicDerivation {
     pub env: BTreeMap<String, String>,
 }
 
-/// Reader for the wire framing: little-endian u64, strings length-prefixed and
-/// zero-padded to a multiple of 8.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error("malformed derivation: {0}")]
 pub struct ParseError(String);
 
-type Result<T> = std::result::Result<T, ParseError>;
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
-    }
-
-    fn u64(&mut self) -> Result<u64> {
-        let end = self.pos + 8;
-        if end > self.bytes.len() {
-            return Err(ParseError(format!("truncated integer at {}", self.pos)));
-        }
-        let value = u64::from_le_bytes(self.bytes[self.pos..end].try_into().unwrap());
-        self.pos = end;
-        Ok(value)
-    }
-
-    fn string(&mut self) -> Result<String> {
-        let len = self.u64()? as usize;
-        let end = self.pos + len;
-        if end > self.bytes.len() {
-            return Err(ParseError(format!("truncated string at {}", self.pos)));
-        }
-        let value = String::from_utf8_lossy(&self.bytes[self.pos..end]).into_owned();
-        // Skip the padding that rounds the field up to 8 bytes.
-        self.pos = end + (8 - (len % 8)) % 8;
-        Ok(value)
-    }
-
-    fn strings(&mut self) -> Result<Vec<String>> {
-        let count = self.u64()? as usize;
-        (0..count).map(|_| self.string()).collect()
+impl From<wire::Truncated> for ParseError {
+    fn from(e: wire::Truncated) -> Self {
+        ParseError(e.to_string())
     }
 }
+
+type Result<T> = std::result::Result<T, ParseError>;
 
 /// Decode the `drv :Data` field of a build request.
 ///
@@ -100,16 +67,14 @@ impl<'a> Reader<'a> {
 /// wire form carries — the client's `serializeDerivation` always writes them
 /// full.
 pub fn parse(bytes: &[u8], store_dir: &str) -> Result<BasicDerivation> {
-    let mut reader = Reader::new(bytes);
+    let mut reader = wire::Reader::new(bytes);
 
     // A path in this wire form that is not rooted at `store_dir` means the
     // client and the frontend disagree about the store directory — refused
     // rather than silently reinterpreted, the same as at the daemon protocol
     // boundary this feeds.
-    let rooted = |s: String| {
-        StorePath::from_full(store_dir, &s)
-            .ok_or_else(|| ParseError(format!("{s} is not rooted at {store_dir}")))
-    };
+    let rooted =
+        |s: String| StorePath::from_full_or_err(store_dir, &s).map_err(|e| ParseError(e.to_string()));
 
     let output_count = reader.u64()? as usize;
     let mut outputs = Vec::with_capacity(output_count);
@@ -151,15 +116,10 @@ pub fn parse(bytes: &[u8], store_dir: &str) -> Result<BasicDerivation> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn write_u64(out: &mut Vec<u8>, value: u64) {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
+    use crate::wire::{write_bytes, write_u64};
 
     fn write_str(out: &mut Vec<u8>, value: &str) {
-        write_u64(out, value.len() as u64);
-        out.extend_from_slice(value.as_bytes());
-        out.extend(std::iter::repeat_n(0u8, (8 - (value.len() % 8)) % 8));
+        write_bytes(out, value.as_bytes());
     }
 
     fn sample_wire() -> Vec<u8> {

@@ -16,9 +16,10 @@ mod object_key;
 mod store_path;
 mod system;
 mod tenant;
+pub mod wire;
 
 pub use capability_token::CapabilityToken;
 pub use object_key::ObjectKey;
-pub use store_path::StorePath;
+pub use store_path::{NotRooted, StorePath};
 pub use system::System;
 pub use tenant::TenantId;

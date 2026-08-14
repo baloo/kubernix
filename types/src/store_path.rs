@@ -21,6 +21,15 @@
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorePath(String);
 
+/// [`StorePath::from_full_or_err`]'s failure: `full` was not actually rooted
+/// at `store_dir`.
+#[derive(Debug, thiserror::Error)]
+#[error("{full} is not rooted at {store_dir}")]
+pub struct NotRooted {
+    store_dir: String,
+    full: String,
+}
+
 impl StorePath {
     pub fn new(path: impl Into<String>) -> Self {
         StorePath(path.into())
@@ -43,6 +52,19 @@ impl StorePath {
     /// Reconstruct the full printed path: `<store_dir>/<hash>-<name>`.
     pub fn to_full(&self, store_dir: &str) -> String {
         format!("{store_dir}/{}", self.0)
+    }
+
+    /// [`Self::from_full`], but refusing rather than merely failing to
+    /// match — this is the same "reject a peer whose store directory does
+    /// not match ours" check that shows up independently wherever a full
+    /// path arrives from outside kubernix's control (a derivation's wire
+    /// bytes, `nix-store --query`'s output, the daemon protocol). Centralised
+    /// here so that check, and its message, is written once.
+    pub fn from_full_or_err(store_dir: &str, full: &str) -> Result<Self, NotRooted> {
+        Self::from_full(store_dir, full).ok_or_else(|| NotRooted {
+            store_dir: store_dir.to_string(),
+            full: full.to_string(),
+        })
     }
 
     pub fn as_str(&self) -> &str {

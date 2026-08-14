@@ -29,12 +29,6 @@ impl From<String> for System {
     }
 }
 
-impl From<&str> for System {
-    fn from(system: &str) -> Self {
-        System(system.to_string())
-    }
-}
-
 impl AsRef<str> for System {
     fn as_ref(&self) -> &str {
         &self.0

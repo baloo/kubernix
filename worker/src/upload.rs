@@ -8,7 +8,7 @@ use std::process::Stdio;
 
 use async_compression::tokio::write::ZstdEncoder;
 use digest_io::{HashReader, HashWriter};
-use eyre::{Context as _, OptionExt as _, bail};
+use eyre::{Context as _, bail};
 use sha2::{Digest, Sha256, digest::Output};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -29,7 +29,9 @@ pub struct OutputArtifact {
     pub file_size: u64,
     pub key: ObjectKey,
     pub references: Vec<StorePath>,
-    pub deriver: StorePath,
+    /// `None` for a path with no deriver — `nix-store --query --deriver`
+    /// prints `unknown-deriver` for those, rather than a path in `store_dir`.
+    pub deriver: Option<StorePath>,
 }
 
 /// Artifact keys are tenant-scoped: the frontend signs a key only for the
@@ -402,7 +404,7 @@ impl<'a> NixStore<'a> {
     async fn query_path_metadata(
         &self,
         store_path: &StorePath,
-    ) -> eyre::Result<(Vec<StorePath>, StorePath)> {
+    ) -> eyre::Result<(Vec<StorePath>, Option<StorePath>)> {
         let with_store = |cmd: &str| {
             let mut c = Command::new(self.nix_store);
             if let Some(uri) = self.store_uri {
@@ -424,15 +426,11 @@ impl<'a> NixStore<'a> {
         // `KUBERNIX_STORE_DIR` disagrees with its real store — a
         // misconfiguration worth failing loudly on rather than silently
         // corrupting every path derived from it.
-        let store_dir = self.store_dir;
         let references = String::from_utf8_lossy(&references.stdout)
             .lines()
-            .map(|s| {
-                StorePath::from_full(store_dir, s)
-                    .ok_or_eyre("not rooted at KUBERNIX_STORE_DIR")
-                    .wrap_err_with(|| format!("{s} (store dir {store_dir})"))
-            })
-            .collect::<eyre::Result<_>>()?;
+            .map(|s| StorePath::from_full_or_err(self.store_dir, s))
+            .collect::<Result<_, _>>()
+            .wrap_err("KUBERNIX_STORE_DIR does not match the local store's own idea of it")?;
 
         let deriver = with_store("--query")
             .arg("--deriver")
@@ -443,11 +441,12 @@ impl<'a> NixStore<'a> {
         let deriver = String::from_utf8_lossy(&deriver.stdout).trim().to_string();
         // `--query --deriver` prints "unknown-deriver" when there is none.
         let deriver = if deriver == "unknown-deriver" {
-            StorePath::default()
+            None
         } else {
-            StorePath::from_full(self.store_dir, &deriver)
-                .ok_or_eyre("not rooted at KUBERNIX_STORE_DIR")
-                .wrap_err_with(|| format!("{deriver} (store dir {store_dir})"))?
+            Some(
+                StorePath::from_full_or_err(self.store_dir, &deriver)
+                    .wrap_err("KUBERNIX_STORE_DIR does not match the local store's own idea of it")?,
+            )
         };
 
         Ok((references, deriver))
