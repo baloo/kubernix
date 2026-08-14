@@ -20,12 +20,14 @@ use sha2::{Sha256, digest::Output};
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+use crate::jobs::JobOutcome;
 use crate::store::{
     ClientOptions, Hash, HashType, MissingPaths, PathInfo, RemoteObject, Result, Store, StoreError,
     Tier,
 };
 use kubernix_signing::{KIND_LOCAL_ED25519, LocalSigner, Signer, key_name_for};
 use kubernix_types::{ObjectKey, StorePath};
+use uuid::Uuid;
 
 use crate::tenant::{Tenant, TenantId};
 
@@ -510,6 +512,58 @@ impl Store for PostgresStore {
             tracing::warn!(error = %e, %tenant, %path, "recording access failed");
         }
     }
+
+    /// Insert one `jobs` row for a terminal outcome. Best-effort, like
+    /// [`Self::record_access`] — see the trait doc comment for why this is
+    /// insert-only rather than insert-then-update.
+    async fn record_job_outcome(
+        &self,
+        tenant: &TenantId,
+        job_id: Uuid,
+        derivation_path: &StorePath,
+        system: &str,
+        outcome: &JobOutcome,
+    ) {
+        if let Err(e) = self.ensure_tenant_id(tenant).await {
+            tracing::warn!(error = %e, %tenant, %job_id, "recording job outcome failed");
+            return;
+        }
+
+        let (status, error_msg, output_paths, log_key): (&str, Option<&str>, Vec<&str>, &str) =
+            match outcome {
+                JobOutcome::Completed {
+                    outputs, log_key, ..
+                } => (
+                    "completed",
+                    None,
+                    outputs.iter().map(StorePath::as_str).collect(),
+                    log_key,
+                ),
+                JobOutcome::Failed { message, log_key } => {
+                    ("failed", Some(message.as_str()), Vec::new(), log_key)
+                }
+            };
+
+        if let Err(e) = sqlx::query(
+            "INSERT INTO jobs (
+                 id, tenant, derivation_path, system, status, error_msg,
+                 output_paths, log_key, finished_at
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())",
+        )
+        .bind(job_id)
+        .bind(tenant.as_str())
+        .bind(derivation_path.as_str())
+        .bind(system)
+        .bind(status)
+        .bind(error_msg)
+        .bind(&output_paths)
+        .bind(log_key)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(error = %e, %tenant, %job_id, "recording job outcome failed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -897,6 +951,81 @@ mod tests {
         let bobs_view = store.output_object(&bob, &p()).await.unwrap();
         assert_eq!(bobs_view.file_size, 111);
         assert_eq!(bobs_view.file_hash, Output::<Sha256>::from([1u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn a_completed_job_outcome_round_trips() {
+        let Some(store) = db().await else { return };
+        let t = tenant("job-completed");
+        let job_id = uuid::Uuid::new_v4();
+        let drv = StorePath::new(format!(
+            "/nix/store/00000000000000000000000000000000-{job_id}.drv"
+        ));
+
+        store
+            .record_job_outcome(
+                &t,
+                job_id,
+                &drv,
+                "x86_64-linux",
+                &JobOutcome::Completed {
+                    outputs: vec![p()],
+                    infos: Vec::new(),
+                    log_key: format!("{t}/log/{job_id}"),
+                },
+            )
+            .await;
+
+        let row = sqlx::query(
+            "SELECT status, error_msg, output_paths, log_key, finished_at IS NOT NULL AS has_finished_at
+               FROM jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "completed");
+        assert!(row.get::<Option<String>, _>("error_msg").is_none());
+        assert_eq!(row.get::<Vec<String>, _>("output_paths"), vec![P]);
+        assert_eq!(row.get::<String, _>("log_key"), format!("{t}/log/{job_id}"));
+        assert!(row.get::<bool, _>("has_finished_at"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_outcome_round_trips() {
+        let Some(store) = db().await else { return };
+        let t = tenant("job-failed");
+        let job_id = uuid::Uuid::new_v4();
+        let drv = StorePath::new(format!(
+            "/nix/store/00000000000000000000000000000000-{job_id}.drv"
+        ));
+
+        store
+            .record_job_outcome(
+                &t,
+                job_id,
+                &drv,
+                "x86_64-linux",
+                &JobOutcome::Failed {
+                    message: "builder exited with 1".to_string(),
+                    log_key: format!("{t}/log/{job_id}"),
+                },
+            )
+            .await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        let error_msg: Option<String> =
+            sqlx::query_scalar("SELECT error_msg FROM jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(error_msg.as_deref(), Some("builder exited with 1"));
     }
 
     #[tokio::test]

@@ -167,6 +167,27 @@ in {
         '';
       };
     };
+
+    jobRetention = {
+      logAfter = mkOption {
+        type = types.ints.positive;
+        default = 7 * 24 * 3600;
+        description = ''
+          Seconds after a build job finishes before its archived log is
+          deleted from the object store.
+        '';
+      };
+      rowAfter = mkOption {
+        type = types.ints.positive;
+        default = 90 * 24 * 3600;
+        description = ''
+          Seconds after a build job finishes before its `jobs` row is
+          deleted. Must be at least `logAfter` to mean anything: a row is
+          never deleted while it still names a log object, so if this is
+          shorter the row simply waits for the log to catch up.
+        '';
+      };
+    };
   } // s3Options;
 
   options.services.kubernix-worker = {
@@ -269,6 +290,8 @@ in {
           KUBERNIX_GC_CUTOFF_VERIFIED = toString cfg_gc.cutoffs.verified;
           KUBERNIX_GC_CUTOFF_BUILT = toString cfg_gc.cutoffs.built;
           KUBERNIX_GC_CUTOFF_QUARANTINED = toString cfg_gc.cutoffs.quarantined;
+          KUBERNIX_GC_JOB_LOG_CUTOFF = toString cfg_gc.jobRetention.logAfter;
+          KUBERNIX_GC_JOB_ROW_CUTOFF = toString cfg_gc.jobRetention.rowAfter;
           RUST_LOG = "debug";
         } // s3Env cfg_gc;
 

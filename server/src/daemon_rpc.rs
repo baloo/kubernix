@@ -1106,10 +1106,11 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 )));
             };
 
+            let job_id = Uuid::new_v4();
             let job = BuildJob {
-                job_id: Uuid::new_v4(),
+                job_id,
                 derivation_path: path.clone(),
-                system,
+                system: system.clone(),
                 drv,
                 inputs: staged,
                 tenant: tenant.clone(),
@@ -1118,6 +1119,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             let outcome = dispatch(&queue, job, &logger)
                 .await
                 .map_err(|e| rpc_error::failed(e.to_string()))?;
+
+            store
+                .record_job_outcome(&tenant, job_id, &path, system.as_str(), &outcome)
+                .await;
 
             let mut result = results.get().init_result();
             match outcome {

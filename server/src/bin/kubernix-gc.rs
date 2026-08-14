@@ -14,10 +14,12 @@
 //!   `KUBERNIX_GC_CUTOFF_VERIFIED`    seconds a verified path may go unread (default 30 days)
 //!   `KUBERNIX_GC_CUTOFF_BUILT`       seconds a built path may go unread (default 30 days)
 //!   `KUBERNIX_GC_CUTOFF_QUARANTINED` seconds a quarantined path may go unread (default 1 day)
+//!   `KUBERNIX_GC_JOB_LOG_CUTOFF`     seconds after a job finishes before its log is deleted (default 7 days)
+//!   `KUBERNIX_GC_JOB_ROW_CUTOFF`     seconds after a job finishes before its row is deleted (default 90 days)
 
 use std::time::Duration;
 
-use kubernix_server::gc::{self, TierCutoffs};
+use kubernix_server::gc::{self, JobRetention, TierCutoffs};
 use kubernix_server::postgres_store::PostgresStore;
 use kubernix_server::uploads::UploadSigner;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -68,20 +70,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             TierCutoffs::default().quarantined,
         ),
     };
+    let job_retention = JobRetention {
+        log_after: env_secs(
+            "KUBERNIX_GC_JOB_LOG_CUTOFF",
+            JobRetention::default().log_after,
+        ),
+        row_after: env_secs(
+            "KUBERNIX_GC_JOB_ROW_CUTOFF",
+            JobRetention::default().row_after,
+        ),
+    };
     let batch_size: i64 = std::env::var("KUBERNIX_GC_BATCH")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
     let interval = env_secs("KUBERNIX_GC_INTERVAL", Duration::from_secs(300));
 
-    tracing::info!(?cutoffs, batch_size, ?interval, "kubernix-gc starting");
+    tracing::info!(
+        ?cutoffs,
+        ?job_retention,
+        batch_size,
+        ?interval,
+        "kubernix-gc starting"
+    );
 
     let mut ticker = tokio::time::interval(interval);
     // The first tick fires immediately; running a pass right at startup is
     // the right default rather than waiting out a full interval first.
     loop {
         ticker.tick().await;
-        match gc::run_gc_pass(&store, &uploader, &cutoffs, batch_size).await {
+        match gc::run_gc_pass(&store, &uploader, &cutoffs, &job_retention, batch_size).await {
             Ok(stats) if stats.ran => tracing::info!(?stats, "gc pass ran"),
             Ok(_) => tracing::debug!("gc pass skipped: another collector holds the lock"),
             Err(e) => tracing::error!(error = %e, "gc pass failed"),

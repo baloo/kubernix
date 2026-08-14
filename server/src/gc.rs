@@ -28,6 +28,7 @@ use std::time::Duration;
 use sqlx::postgres::{PgConnection, PgPool};
 
 use kubernix_types::ObjectKey;
+use uuid::Uuid;
 
 use crate::postgres_store::PostgresStore;
 use crate::uploads::UploadSigner;
@@ -57,6 +58,31 @@ impl Default for TierCutoffs {
     }
 }
 
+/// How long a terminal job's archived log, and then the job's own metadata
+/// row, survive after `finished_at` (PLAN.md Phase 12).
+///
+/// Two cutoffs rather than one because the two things being retained cost
+/// different amounts: the log is the heavy, rarely-needed-again part, the row
+/// is a few bytes of "what happened". `log_after` should be shorter than
+/// `row_after` — `reap_jobs` will not delete a row whose log has not been
+/// swept yet (see its doc comment), so if the two are configured backwards
+/// the row simply waits for the log to catch up rather than losing track of
+/// the object.
+#[derive(Clone, Copy, Debug)]
+pub struct JobRetention {
+    pub log_after: Duration,
+    pub row_after: Duration,
+}
+
+impl Default for JobRetention {
+    fn default() -> Self {
+        Self {
+            log_after: Duration::from_secs(7 * 24 * 3600),
+            row_after: Duration::from_secs(90 * 24 * 3600),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GcStats {
     /// Whether this call actually ran the passes, or found the advisory lock
@@ -66,6 +92,9 @@ pub struct GcStats {
     pub paths_marked: u64,
     pub objects_deleted: u64,
     pub paths_reaped: u64,
+    pub job_logs_marked: u64,
+    pub job_logs_purged: u64,
+    pub jobs_reaped: u64,
 }
 
 #[derive(Debug)]
@@ -114,15 +143,17 @@ pub async fn run_gc_pass(
     store: &PostgresStore,
     uploader: &UploadSigner,
     cutoffs: &TierCutoffs,
+    job_retention: &JobRetention,
     batch_size: i64,
 ) -> Result<GcStats> {
-    run_gc_pass_on(&store.pool, uploader, cutoffs, batch_size).await
+    run_gc_pass_on(&store.pool, uploader, cutoffs, job_retention, batch_size).await
 }
 
 async fn run_gc_pass_on(
     pool: &PgPool,
     uploader: &UploadSigner,
     cutoffs: &TierCutoffs,
+    job_retention: &JobRetention,
     batch_size: i64,
 ) -> Result<GcStats> {
     let mut conn = pool.acquire().await?;
@@ -136,7 +167,7 @@ async fn run_gc_pass_on(
         return Ok(GcStats::default());
     }
 
-    let result = run_locked(&mut conn, uploader, cutoffs, batch_size).await;
+    let result = run_locked(&mut conn, uploader, cutoffs, job_retention, batch_size).await;
 
     // Unlock regardless of how the pass above went, so a mid-pass error does
     // not strand the lock until this connection happens to close.
@@ -155,17 +186,25 @@ async fn run_locked(
     conn: &mut PgConnection,
     uploader: &UploadSigner,
     cutoffs: &TierCutoffs,
+    job_retention: &JobRetention,
     batch_size: i64,
 ) -> Result<GcStats> {
     let access_marks_drained = drain_access_queue(conn, batch_size).await?;
     let paths_marked = mark_expired(conn, cutoffs).await?;
     let (objects_deleted, paths_reaped) = sweep_and_reap(conn, uploader).await?;
 
+    let job_logs_marked = mark_expired_job_logs(conn, job_retention.log_after).await?;
+    let job_logs_purged = sweep_job_logs(conn, uploader).await?;
+    let jobs_reaped = reap_jobs(conn, job_retention.row_after).await?;
+
     tracing::info!(
         access_marks_drained,
         paths_marked,
         objects_deleted,
         paths_reaped,
+        job_logs_marked,
+        job_logs_purged,
+        jobs_reaped,
         "gc pass complete"
     );
 
@@ -175,6 +214,9 @@ async fn run_locked(
         paths_marked,
         objects_deleted,
         paths_reaped,
+        job_logs_marked,
+        job_logs_purged,
+        jobs_reaped,
     })
 }
 
@@ -337,6 +379,96 @@ pub(crate) async fn sweep_and_reap(
     Ok((objects_deleted, reaped.rows_affected()))
 }
 
+/// Flip `present -> marked` for a terminal job's log once it is past
+/// `log_after` old, counted from `finished_at`.
+///
+/// Mirrors [`mark_expired`]'s role for `store_paths`: this only stages the
+/// log for deletion, it does not touch the object store or the job row
+/// itself, so a crash between here and [`sweep_job_logs`] leaves nothing
+/// inconsistent — the row is simply `marked` again on the next pass.
+pub(crate) async fn mark_expired_job_logs(
+    conn: &mut PgConnection,
+    log_after: Duration,
+) -> Result<u64> {
+    let updated = sqlx::query(
+        "UPDATE jobs
+            SET log_state = 'marked'
+          WHERE log_state = 'present'
+            AND finished_at IS NOT NULL
+            AND finished_at < NOW() - make_interval(secs => $1::double precision)",
+    )
+    .bind(log_after.as_secs_f64())
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(updated.rows_affected())
+}
+
+/// Delete the archived log object for every `marked` job, then clear
+/// `log_key` and flip the row to `purged`.
+///
+/// The object goes before the row is updated, same ordering `sweep_and_reap`
+/// uses and for the same reason: a crash between the two leaves a `marked`
+/// row whose `log_key` is still known, which the next pass retries — S3
+/// `DeleteObject` is idempotent, so retrying a delete that already succeeded
+/// is harmless. What must never happen is the row losing track of `log_key`
+/// before the object is confirmably gone: nothing here lists the bucket, so
+/// that key would be unrecoverable.
+pub(crate) async fn sweep_job_logs(
+    conn: &mut PgConnection,
+    uploader: &UploadSigner,
+) -> Result<u64> {
+    let marked: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, log_key FROM jobs WHERE log_state = 'marked'")
+            .fetch_all(&mut *conn)
+            .await?;
+
+    let mut purged = 0u64;
+    for (id, log_key) in marked {
+        let key = ObjectKey::new(log_key);
+
+        if let Err(e) = uploader.delete_object(&key).await {
+            tracing::error!(error = %e, %key, job_id = %id, "failed to delete job log; will retry next pass");
+            continue;
+        }
+
+        sqlx::query(
+            "UPDATE jobs SET log_state = 'purged', log_key = NULL
+              WHERE id = $1 AND log_state = 'marked'",
+        )
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+        purged += 1;
+    }
+
+    Ok(purged)
+}
+
+/// Delete terminal job rows once past `row_after` old — but only once their
+/// log has actually been swept.
+///
+/// `log_state = 'purged'` is the load-bearing part of this query, not an
+/// optimisation: a row is the only record of its `log_key`'s existence, so
+/// deleting it while the log is still `present` or `marked` would orphan
+/// that object with no way to ever find it again (this collector never lists
+/// the bucket). If `row_after` is configured shorter than `log_after`, or a
+/// delete keeps failing, this simply reaps nothing for that row until the log
+/// catches up on a later pass — a wait, not a leak.
+pub(crate) async fn reap_jobs(conn: &mut PgConnection, row_after: Duration) -> Result<u64> {
+    let reaped = sqlx::query(
+        "DELETE FROM jobs
+          WHERE finished_at IS NOT NULL
+            AND finished_at < NOW() - make_interval(secs => $1::double precision)
+            AND log_state = 'purged'",
+    )
+    .bind(row_after.as_secs_f64())
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(reaped.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +565,46 @@ mod tests {
             built: Duration::from_secs(60),
             quarantined: Duration::from_secs(60),
         }
+    }
+
+    fn tight_job_retention() -> JobRetention {
+        JobRetention {
+            log_after: Duration::from_secs(60),
+            row_after: Duration::from_secs(60),
+        }
+    }
+
+    /// Push a job's `finished_at` into the past, same purpose as [`age`] but
+    /// for `jobs` rather than `store_paths`.
+    async fn age_job(pool: &PgPool, job_id: Uuid, seconds_ago: i64) {
+        sqlx::query(
+            "UPDATE jobs SET finished_at = NOW() - make_interval(secs => $2) WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind(seconds_ago as f64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Record a terminal job outcome via the `Store` trait, same as
+    /// production code does, rather than inserting the row directly.
+    async fn record_job(store: &PostgresStore, t: &TenantId, job_id: Uuid, log_key: &str) {
+        let drv = kubernix_types::StorePath::new(format!(
+            "/nix/store/00000000000000000000000000000000-{job_id}.drv"
+        ));
+        store
+            .record_job_outcome(
+                t,
+                job_id,
+                &drv,
+                "x86_64-linux",
+                &crate::jobs::JobOutcome::Failed {
+                    message: "test outcome".to_string(),
+                    log_key: log_key.to_string(),
+                },
+            )
+            .await;
     }
 
     #[tokio::test]
@@ -672,9 +844,15 @@ mod tests {
         // isolation and never sweeps) — that is correct behaviour, not
         // pollution, and asserting exact totals here would make this test
         // depend on what else happens to run in the same suite.
-        let stats = run_gc_pass(&store, &uploader, &tight_cutoffs(), 1000)
-            .await
-            .unwrap();
+        let stats = run_gc_pass(
+            &store,
+            &uploader,
+            &tight_cutoffs(),
+            &tight_job_retention(),
+            1000,
+        )
+        .await
+        .unwrap();
         assert!(stats.ran);
         assert!(stats.paths_marked >= 1);
         assert!(stats.objects_deleted >= 1);
@@ -705,9 +883,15 @@ mod tests {
             .unwrap();
         assert!(locked, "test setup: expected to take the lock first");
 
-        let stats = run_gc_pass(&store, &uploader, &tight_cutoffs(), 1000)
-            .await
-            .unwrap();
+        let stats = run_gc_pass(
+            &store,
+            &uploader,
+            &tight_cutoffs(),
+            &tight_job_retention(),
+            1000,
+        )
+        .await
+        .unwrap();
         assert!(!stats.ran, "a second collector must not also run the pass");
 
         sqlx::query("SELECT pg_advisory_unlock($1)")
@@ -715,5 +899,168 @@ mod tests {
             .execute(&mut *holder)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_fresh_terminal_jobs_log_survives() {
+        let Some(store) = db().await else { return };
+        let t = tenant("job-fresh");
+        let job_id = Uuid::new_v4();
+        record_job(&store, &t, job_id, &format!("{t}/log/fresh")).await;
+        // Deliberately not aged: finished_at is ~now.
+
+        let marked = mark_expired_job_logs(
+            &mut store.pool.acquire().await.unwrap(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(marked, 0, "a job that just finished must not be marked yet");
+
+        let log_state: String = sqlx::query_scalar("SELECT log_state FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(log_state, "present");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_aged_job_log_is_marked_then_swept() {
+        let Some(store) = db().await else { return };
+        let Some(uploader) = s3().await else { return };
+        let t = tenant("job-sweep");
+        let job_id = Uuid::new_v4();
+        let key = format!("{t}/log/gc-job-sweep-test");
+
+        uploader
+            .put_object(&ObjectKey::new(key.clone()), b"log output".to_vec())
+            .await
+            .expect("seed the log object this test deletes");
+        record_job(&store, &t, job_id, &key).await;
+        age_job(&store.pool, job_id, 3600).await;
+
+        let marked = mark_expired_job_logs(
+            &mut store.pool.acquire().await.unwrap(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(marked, 1);
+
+        let purged = sweep_job_logs(&mut store.pool.acquire().await.unwrap(), &uploader)
+            .await
+            .unwrap();
+        assert_eq!(purged, 1);
+
+        let log_state: String = sqlx::query_scalar("SELECT log_state FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(log_state, "purged");
+        let log_key: Option<String> = sqlx::query_scalar("SELECT log_key FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(log_key.is_none());
+        assert!(
+            uploader.get_object(&ObjectKey::new(key)).await.is_err(),
+            "the log's bytes must actually be deleted from S3"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_job_row_survives_reap_until_its_log_is_purged() {
+        let Some(store) = db().await else { return };
+        let Some(uploader) = s3().await else { return };
+        let t = tenant("job-reap-order");
+        let job_id = Uuid::new_v4();
+        let key = format!("{t}/log/gc-job-reap-order-test");
+
+        uploader
+            .put_object(&ObjectKey::new(key.clone()), b"log output".to_vec())
+            .await
+            .unwrap();
+        record_job(&store, &t, job_id, &key).await;
+        age_job(&store.pool, job_id, 3600).await;
+
+        mark_expired_job_logs(
+            &mut store.pool.acquire().await.unwrap(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        // The row is well past its own row cutoff, but the log has only been
+        // marked, not swept: reaping now must not lose track of `log_key`.
+        let reaped = reap_jobs(
+            &mut store.pool.acquire().await.unwrap(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reaped, 0,
+            "a row must not be reaped while its log is still marked"
+        );
+
+        sweep_job_logs(&mut store.pool.acquire().await.unwrap(), &uploader)
+            .await
+            .unwrap();
+
+        let reaped = reap_jobs(
+            &mut store.pool.acquire().await.unwrap(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reaped, 1, "once purged, the row is free to be reaped");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_gc_pass_also_retires_terminal_jobs_end_to_end() {
+        let Some(store) = db().await else { return };
+        let Some(uploader) = s3().await else { return };
+        let t = tenant("job-full-pass");
+        let job_id = Uuid::new_v4();
+        let key = format!("{t}/log/gc-job-full-pass-test");
+
+        uploader
+            .put_object(&ObjectKey::new(key.clone()), b"log output".to_vec())
+            .await
+            .unwrap();
+        record_job(&store, &t, job_id, &key).await;
+        age_job(&store.pool, job_id, 3600).await;
+
+        let stats = run_gc_pass(
+            &store,
+            &uploader,
+            &tight_cutoffs(),
+            &tight_job_retention(),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert!(stats.ran);
+        assert!(stats.job_logs_marked >= 1);
+        assert!(stats.job_logs_purged >= 1);
+        assert!(stats.jobs_reaped >= 1);
+
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "this test's own job row must have been reaped"
+        );
+        assert!(uploader.get_object(&ObjectKey::new(key)).await.is_err());
     }
 }

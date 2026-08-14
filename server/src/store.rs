@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use kubernix_signing::{LocalSigner, Signer, key_name_for};
 use kubernix_types::{ObjectKey, StorePath};
 use sha2::{Sha256, digest::Output};
+use uuid::Uuid;
 
+use crate::jobs::JobOutcome;
 use crate::tenant::TenantId;
 
 /// Hash algorithms the daemon protocol can carry.
@@ -246,6 +248,27 @@ pub trait Store: Send + Sync {
     /// passes that consume this are Postgres-only (`server/src/gc.rs`), not
     /// part of this trait.
     async fn record_access(&self, _tenant: &TenantId, _path: &StorePath) {}
+
+    /// Record a job's terminal outcome — PLAN.md Phase 12's job/log retention.
+    ///
+    /// Called once, when `dispatch()` returns, never on submission: nothing
+    /// today needs to observe an in-flight job, and a "pending" row that a
+    /// crash or timeout leaves unresolved would just be more state to reason
+    /// about for no current benefit. A job lost before an outcome is relayed
+    /// is simply not recorded, same as every job before this existed.
+    ///
+    /// Best-effort, like [`Self::record_access`]: a lost history row does not
+    /// affect anything on the serving path, only how much there is to collect
+    /// later.
+    async fn record_job_outcome(
+        &self,
+        _tenant: &TenantId,
+        _job_id: Uuid,
+        _derivation_path: &StorePath,
+        _system: &str,
+        _outcome: &JobOutcome,
+    ) {
+    }
 
     /// Note that a tenant exists, with the identity it presented.
     ///
