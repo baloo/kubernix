@@ -132,9 +132,26 @@ pkgs.testers.nixosTest {
       # been built there, and an input can only have arrived through kubernix.
       store = "local?root=/var/lib/kubernix-worker/store";
     };
+
+    # A short interval and short cutoffs so the "garbage collection" subtest
+    # below does not have to wait out a production-sized retention window —
+    # it ages a row directly via SQL and just needs the next pass to see it.
+    services.kubernix-gc = {
+      enable = true;
+      package = kubernix-server;
+      databaseUrl = "postgres://postgres@127.0.0.1:5432/kubernix";
+      interval = 2;
+      cutoffs = {
+        verified = 60;
+        built = 60;
+        quarantined = 60;
+      };
+    };
   };
 
   testScript = ''
+    import time
+
     plugin = "${kubernix-plugin}/lib/lix/plugins/kubernix.so"
     ssh_opts = "${sshOpts}"
 
@@ -146,6 +163,7 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("kubernix-sshd.service")
     machine.wait_for_unit("kubernix-cache.service")
     machine.wait_for_unit("kubernix-worker.service")
+    machine.wait_for_unit("kubernix-gc.service")
     machine.wait_for_open_port(2222)
     machine.wait_for_open_port(3000)
 
@@ -270,5 +288,44 @@ pkgs.testers.nixosTest {
             f"http://127.0.0.1:3000/{other}/{hash_part}.narinfo"
         ).strip()
         assert status == "404", f"cross-tenant read should 404, got {status}"
+
+
+    with subtest("garbage collection removes an aged, unreferenced path"):
+        # Last of all, deliberately: this consumes the path built in the very
+        # first subtest, which every subtest above depends on still existing.
+        #
+        # Forcing `last_access` into the past is what a real deployment's clock
+        # would do over the retention window; there is no `Store` method for
+        # this on purpose; see PLAN.md Phase 12.
+        machine.succeed(
+            "psql -U postgres -h 127.0.0.1 kubernix -c "
+            f"\"UPDATE store_paths SET last_access = NOW() - INTERVAL '1 hour' "
+            f"WHERE path = '{out}'\""
+        )
+
+        # kubernix-gc's drain -> mark -> sweep -> reap all happen within one
+        # pass, on a 2s interval here, so the next tick is enough -- poll
+        # rather than sleep a fixed amount, in case the pass lands mid-poll.
+        hash_part = out.split("/")[-1].split("-")[0]
+        deadline = time.time() + 30
+        state = "not checked yet"
+        while time.time() < deadline:
+            state = machine.succeed(
+                "psql -U postgres -h 127.0.0.1 kubernix -tAc "
+                f"\"SELECT coalesce(state, 'gone') FROM store_paths "
+                f"WHERE path = '{out}'\""
+            ).strip()
+            if state in ("", "gone"):
+                break
+            time.sleep(1)
+        assert state in ("", "gone"), f"row was not reaped in time, last state={state!r}"
+
+        # And the cache agrees: a collected path is not distinguishable from
+        # one that was never pushed.
+        status = machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' "
+            f"http://127.0.0.1:3000/{tenant}/{hash_part}.narinfo"
+        ).strip()
+        assert status == "404", f"a collected path should not be served, got {status}"
   '';
 }

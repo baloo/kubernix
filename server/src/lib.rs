@@ -30,6 +30,7 @@ pub mod kubernix_capnp {
 }
 
 pub mod daemon_rpc;
+pub mod gc;
 pub mod http;
 pub mod jobs;
 pub mod postgres_store;

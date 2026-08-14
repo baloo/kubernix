@@ -6,6 +6,7 @@ let
   cfg_sshd = config.services.kubernix-sshd;
   cfg_cache = config.services.kubernix-cache;
   cfg_worker = config.services.kubernix-worker;
+  cfg_gc = config.services.kubernix-gc;
 
   # Credentials for the object store. Only the frontend and the cache hold
   # these; workers receive pre-signed URLs instead, which is the whole point of
@@ -113,6 +114,61 @@ in {
     };
   } // s3Options;
 
+  # Retention and garbage collection (PLAN.md Phase 12). Its own service,
+  # deliberately: it deletes things, on a timer, and neither the read path
+  # (kubernix-cache) nor the write path (kubernix-sshd) should carry that
+  # blast radius. Safe to run more than one replica of, but there is no
+  # throughput reason to.
+  options.services.kubernix-gc = {
+    enable = mkEnableOption "Kubernix retention and garbage collection";
+
+    package = mkOption {
+      type = types.package;
+      description = "The kubernix-server package (provides kubernix-gc).";
+    };
+
+    databaseUrl = mkOption {
+      type = types.str;
+      default = "postgres://postgres@localhost:5432/kubernix";
+      description = "PostgreSQL connection string.";
+    };
+
+    interval = mkOption {
+      type = types.ints.positive;
+      default = 300;
+      description = "Seconds between garbage collection passes.";
+    };
+
+    batchSize = mkOption {
+      type = types.ints.positive;
+      default = 10000;
+      description = "Access marks drained from the queue per pass.";
+    };
+
+    cutoffs = {
+      verified = mkOption {
+        type = types.ints.positive;
+        default = 30 * 24 * 3600;
+        description = "Seconds a verified path may go unread before it is eligible for collection.";
+      };
+      built = mkOption {
+        type = types.ints.positive;
+        default = 30 * 24 * 3600;
+        description = "Seconds a built path may go unread before it is eligible for collection.";
+      };
+      quarantined = mkOption {
+        type = types.ints.positive;
+        default = 24 * 3600;
+        description = ''
+          Seconds a quarantined path may go unread before it is eligible for
+          collection. Shorter than the other tiers by default: a quarantined
+          path is unverifiable, unshared and unservable, so there is less
+          reason to keep it around.
+        '';
+      };
+    };
+  } // s3Options;
+
   options.services.kubernix-worker = {
     enable = mkEnableOption "Kubernix Worker";
 
@@ -194,6 +250,30 @@ in {
 
         serviceConfig = {
           ExecStart = "${cfg_cache.package}/bin/kubernix-server";
+          Restart = "always";
+          DynamicUser = true;
+        };
+      };
+    })
+
+    (mkIf cfg_gc.enable {
+      systemd.services.kubernix-gc = {
+        description = "Kubernix retention and garbage collection";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" "postgresql.service" "rustfs.service" ];
+
+        environment = {
+          DATABASE_URL = cfg_gc.databaseUrl;
+          KUBERNIX_GC_INTERVAL = toString cfg_gc.interval;
+          KUBERNIX_GC_BATCH = toString cfg_gc.batchSize;
+          KUBERNIX_GC_CUTOFF_VERIFIED = toString cfg_gc.cutoffs.verified;
+          KUBERNIX_GC_CUTOFF_BUILT = toString cfg_gc.cutoffs.built;
+          KUBERNIX_GC_CUTOFF_QUARANTINED = toString cfg_gc.cutoffs.quarantined;
+          RUST_LOG = "debug";
+        } // s3Env cfg_gc;
+
+        serviceConfig = {
+          ExecStart = "${cfg_gc.package}/bin/kubernix-gc";
           Restart = "always";
           DynamicUser = true;
         };

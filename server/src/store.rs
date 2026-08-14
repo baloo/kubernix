@@ -235,6 +235,18 @@ pub trait Store: Send + Sync {
 
     async fn set_options(&self, tenant: &TenantId, options: ClientOptions);
 
+    /// Note that a path was read — either its metadata (`queryPathInfo`, a
+    /// narinfo) or its bytes (`narFromPath`, a NAR fetch). PLAN.md Phase 12:
+    /// this is what retention ages against, so both count, and missing either
+    /// would open a window where a client is handed a narinfo for a path that
+    /// then gets collected before the bytes are fetched.
+    ///
+    /// A no-op by default. Only `PostgresStore` has anything to age —
+    /// `MemoryStore` has no real garbage problem, and the drain/mark/sweep
+    /// passes that consume this are Postgres-only (`server/src/gc.rs`), not
+    /// part of this trait.
+    async fn record_access(&self, _tenant: &TenantId, _path: &StorePath) {}
+
     /// Note that a tenant exists, with the identity it presented.
     ///
     /// Called once per connection. A no-op for stores that need no tenant

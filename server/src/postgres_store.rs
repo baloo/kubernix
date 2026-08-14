@@ -30,7 +30,10 @@ use kubernix_types::{ObjectKey, StorePath};
 use crate::tenant::{Tenant, TenantId};
 
 pub struct PostgresStore {
-    pool: PgPool,
+    // `pub(crate)` rather than private: `crate::gc` runs its own statements
+    // (advisory lock, drain/mark/sweep) directly against the pool, which is
+    // GC-specific enough that it does not belong on the `Store` trait.
+    pub(crate) pool: PgPool,
 }
 
 /// `/nix/store/<32-char hash>-<name>` → `<32-char hash>`.
@@ -192,7 +195,16 @@ impl PostgresStore {
                  refs = EXCLUDED.refs,
                  sigs = EXCLUDED.sigs,
                  object_key = EXCLUDED.object_key,
-                 tier = EXCLUDED.tier",
+                 tier = EXCLUDED.tier,
+                 -- A path being (re-)recorded is evidence it is wanted right
+                 -- now — most commonly a worker rebuilding an output GC had
+                 -- already marked. Without this the row would stay 'marked'
+                 -- and the next sweep could delete bytes that were just
+                 -- written. PLAN.md Phase 12's resurrection rule applies here
+                 -- too, not only on the read path.
+                 last_access = NOW(),
+                 state = 'live',
+                 marked_at = NULL",
         )
         .bind(tenant.as_str())
         .bind(info.path.as_str())
@@ -219,7 +231,7 @@ impl PostgresStore {
 #[async_trait::async_trait]
 impl Store for PostgresStore {
     async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool {
-        sqlx::query("SELECT 1 FROM store_paths WHERE tenant = $1 AND path = $2")
+        sqlx::query("SELECT 1 FROM store_paths_live WHERE tenant = $1 AND path = $2")
             .bind(tenant.as_str())
             .bind(path.as_str())
             .fetch_optional(&self.pool)
@@ -233,22 +245,23 @@ impl Store for PostgresStore {
 
     async fn query_valid_paths(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath> {
         let raw: Vec<&str> = paths.iter().map(StorePath::as_str).collect();
-        let rows: Vec<String> =
-            sqlx::query_scalar("SELECT path FROM store_paths WHERE tenant = $1 AND path = ANY($2)")
-                .bind(tenant.as_str())
-                .bind(&raw)
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "queryValidPaths failed");
-                    Vec::new()
-                });
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT path FROM store_paths_live WHERE tenant = $1 AND path = ANY($2)",
+        )
+        .bind(tenant.as_str())
+        .bind(&raw)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "queryValidPaths failed");
+            Vec::new()
+        });
         rows.into_iter().map(StorePath::new).collect()
     }
 
     async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<StorePath> {
         let rows: Vec<String> =
-            sqlx::query_scalar("SELECT path FROM store_paths WHERE tenant = $1")
+            sqlx::query_scalar("SELECT path FROM store_paths_live WHERE tenant = $1")
                 .bind(tenant.as_str())
                 .fetch_all(&self.pool)
                 .await
@@ -260,7 +273,7 @@ impl Store for PostgresStore {
     }
 
     async fn query_path_info(&self, tenant: &TenantId, path: &StorePath) -> Option<PathInfo> {
-        sqlx::query("SELECT * FROM store_paths WHERE tenant = $1 AND path = $2")
+        sqlx::query("SELECT * FROM store_paths_live WHERE tenant = $1 AND path = $2")
             .bind(tenant.as_str())
             .bind(path.as_str())
             .fetch_optional(&self.pool)
@@ -278,7 +291,7 @@ impl Store for PostgresStore {
         hash_part: &str,
     ) -> Option<StorePath> {
         sqlx::query_scalar::<_, String>(
-            "SELECT path FROM store_paths WHERE tenant = $1 AND hash_part = $2",
+            "SELECT path FROM store_paths_live WHERE tenant = $1 AND hash_part = $2",
         )
         .bind(tenant.as_str())
         .bind(hash_part)
@@ -294,7 +307,7 @@ impl Store for PostgresStore {
     async fn query_referrers(&self, tenant: &TenantId, path: &StorePath) -> Vec<StorePath> {
         // `@>` is the array-containment operator the GIN index answers.
         let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT path FROM store_paths WHERE tenant = $1 AND refs @> ARRAY[$2]",
+            "SELECT path FROM store_paths_live WHERE tenant = $1 AND refs @> ARRAY[$2]",
         )
         .bind(tenant.as_str())
         .bind(path.as_str())
@@ -327,7 +340,7 @@ impl Store for PostgresStore {
     async fn output_object(&self, tenant: &TenantId, path: &StorePath) -> Option<RemoteObject> {
         let row = sqlx::query(
             "SELECT o.key, o.file_size, o.file_hash
-               FROM store_paths sp JOIN objects o ON o.key = sp.object_key
+               FROM store_paths_live sp JOIN objects o ON o.key = sp.object_key
               WHERE sp.tenant = $1 AND sp.path = $2",
         )
         .bind(tenant.as_str())
@@ -455,7 +468,7 @@ impl Store for PostgresStore {
 
     async fn tier(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier> {
         sqlx::query_scalar::<_, String>(
-            "SELECT tier FROM store_paths WHERE tenant = $1 AND path = $2",
+            "SELECT tier FROM store_paths_live WHERE tenant = $1 AND path = $2",
         )
         .bind(tenant.as_str())
         .bind(path.as_str())
@@ -475,6 +488,27 @@ impl Store for PostgresStore {
         // because that is where the RPC layer could reach them; that is a wart
         // worth undoing when something actually consumes them.
         tracing::debug!(%tenant, ?options, "client options");
+    }
+
+    /// Append to `path_access` — deliberately not an `UPDATE store_paths SET
+    /// last_access = ...`. See `server/migrations/20260814_retention_and_gc.sql`
+    /// and `crate::gc` for why: a direct update would make the store's
+    /// hottest-read rows also its most-written, and `crate::gc`'s drain pass
+    /// is what folds this queue into `last_access` in batches.
+    ///
+    /// Best-effort: a lost access mark only makes a path look slightly less
+    /// recently used than it was, which is a stricter retention outcome, not
+    /// an unsafe one, so a failure here is logged rather than propagated to
+    /// callers that only wanted to read a path.
+    async fn record_access(&self, tenant: &TenantId, path: &StorePath) {
+        if let Err(e) = sqlx::query("INSERT INTO path_access (tenant, path) VALUES ($1, $2)")
+            .bind(tenant.as_str())
+            .bind(path.as_str())
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!(error = %e, %tenant, %path, "recording access failed");
+        }
     }
 }
 

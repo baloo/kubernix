@@ -193,6 +193,27 @@ impl UploadSigner {
         Ok(bytes.to_vec())
     }
 
+    /// Delete an object outright.
+    ///
+    /// Only PLAN.md Phase 12's sweep calls this — nothing on the serving path
+    /// ever removes bytes. S3 `DeleteObject` is idempotent (deleting an
+    /// already-absent key is not an error), which matters here: a sweep that
+    /// crashed after deleting the object but before deleting its `objects`
+    /// row will call this again on retry, and that must not fail.
+    pub async fn delete_object(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.s3
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key.as_str())
+            .send()
+            .await?;
+        tracing::debug!(%key, "deleted object");
+        Ok(())
+    }
+
     /// The same capability model in the read direction: workers fetch staged
     /// inputs with these rather than holding credentials.
     pub async fn presign_get(

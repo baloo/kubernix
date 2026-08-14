@@ -162,6 +162,12 @@ async fn narinfo(
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
     };
 
+    // PLAN.md Phase 12: a narinfo fetch counts as an access in its own
+    // right, ahead of whatever `GET /nar/…` fetch follows it — that route
+    // never touches `store_paths` at all (see `nar()` below), so this is the
+    // only mark either request produces.
+    state.store.record_access(&tenant, &path).await;
+
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
@@ -243,6 +249,15 @@ fn object_key_basename(key: &str) -> &str {
 ///
 /// The same reasoning as uploads (PLAN.md Phase 6b): keeping the frontend off
 /// the data path is what stops it capping the throughput of everything else.
+///
+/// **Does not call `record_access`.** This route never looks the path up in
+/// `store_paths` at all — the object key is rebuilt directly from the tenant
+/// and filename, deliberately, so there is no row here to mark. That is fine:
+/// a client fetches `<hash>.narinfo` before `.nar` (that is the only way it
+/// learns the URL to redirect from), and `narinfo` already records the
+/// access. PLAN.md Phase 12's note that both the narinfo lookup and the byte
+/// fetch count is about not missing the *earlier* half of that pair, not
+/// about needing both marked independently.
 async fn nar(
     State(state): State<HttpState>,
     Path((tenant, file)): Path<(String, String)>,

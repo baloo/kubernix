@@ -747,7 +747,14 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             let path = read_store_path(params.get()?.get_path()?)?;
             let mut result = results.get().init_result();
             match store.query_path_info(&tenant, &path).await {
-                Some(info) => write_path_info(result.init_some(), &info),
+                Some(info) => {
+                    // A narinfo is the earlier half of "fetch metadata, then
+                    // fetch bytes" — PLAN.md Phase 12 counts it as an access
+                    // in its own right so a path is not collected in the
+                    // window between the two.
+                    store.record_access(&tenant, &path).await;
+                    write_path_info(result.init_some(), &info)
+                }
                 None => result.set_none(()),
             }
             Ok(())
@@ -946,6 +953,9 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             let Some(remote) = store.output_object(&tenant, &path).await else {
                 return Err(store_err(StoreError::NotFound(path.to_string())));
             };
+            // The byte fetch itself, not just the narinfo lookup that usually
+            // precedes it — PLAN.md Phase 12.
+            store.record_access(&tenant, &path).await;
             let uploader = uploader.as_ref().ok_or_else(|| {
                 rpc_error::failed(format!(
                     "kubernix: {path} is in the object store but no S3 client is configured"
