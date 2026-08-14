@@ -374,6 +374,40 @@ impl Store for PostgresStore {
             .is_some()
     }
 
+    async fn find_verified_by_hash_part(
+        &self,
+        hash_part: &str,
+    ) -> Option<(PathInfo, RemoteObject)> {
+        // No `tenant` predicate at all — deliberately, like `object_known`.
+        // Content-addressing means any tenant's `Verified` row for this hash
+        // part is provably identical to any other's, so the first one found
+        // answers for all. PLAN.md Phase 9c step two.
+        let row = sqlx::query(
+            "SELECT sp.*, o.key AS obj_key, o.file_size AS obj_file_size,
+                    o.file_hash AS obj_file_hash
+               FROM store_paths_live sp JOIN objects o ON o.key = sp.object_key
+              WHERE sp.tier = 'verified' AND sp.hash_part = $1
+              LIMIT 1",
+        )
+        .bind(hash_part)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, %hash_part, "cross-tenant verified lookup failed");
+            None
+        })?;
+
+        let object = RemoteObject {
+            key: ObjectKey::new(row.get::<String, _>("obj_key")),
+            file_size: row.get::<i64, _>("obj_file_size") as u64,
+            file_hash: Output::<Sha256>::try_from(
+                row.get::<Vec<u8>, _>("obj_file_hash").as_slice(),
+            )
+            .expect("file_hash column is always a sha256 digest"),
+        };
+        Some((Self::row_to_info(&row), object))
+    }
+
     async fn add_signatures(
         &self,
         tenant: &TenantId,
@@ -906,6 +940,90 @@ mod tests {
         assert_eq!(
             store.output_object(&bob, &p()).await.unwrap().key.as_str(),
             shared_key
+        );
+    }
+
+    // `find_verified_by_hash_part` is deliberately *not* tenant-scoped, unlike
+    // every other method in this file — so unlike them it cannot share `P`
+    // with the rest of the suite: any other test recording `P` as `Verified`
+    // (there are several) would make these races against whichever one the
+    // database happens to run first. Each test below gets its own hash part.
+
+    #[tokio::test]
+    async fn find_verified_by_hash_part_answers_for_a_row_the_caller_never_wrote() {
+        // PLAN.md Phase 9c step two: the read this is built for. Alice pushes;
+        // the lookup by hash part alone (no tenant argument) must find it.
+        let Some(store) = db().await else { return };
+        let alice = tenant("find-verified-alice");
+        let path = "/nix/store/22222222222222222222222222222222-thing";
+        store
+            .record_path(
+                &alice,
+                info(path),
+                object("nar/find-verified.nar.zst"),
+                Tier::Verified,
+            )
+            .await
+            .unwrap();
+
+        let (found_info, found_object) = store
+            .find_verified_by_hash_part("22222222222222222222222222222222")
+            .await
+            .expect("some tenant's verified row");
+        assert_eq!(found_info.path, StorePath::new(path));
+        assert_eq!(found_object.key.as_str(), "nar/find-verified.nar.zst");
+    }
+
+    #[tokio::test]
+    async fn find_verified_by_hash_part_ignores_built_and_quarantined() {
+        // Only `Verified` is provably identical across tenants; `Built` and
+        // `Quarantined` rows at the same hash part must not answer this
+        // lookup, even though they exist.
+        let Some(store) = db().await else { return };
+        let alice = tenant("find-verified-built");
+        let path = "/nix/store/33333333333333333333333333333333-thing";
+        store
+            .record_path(&alice, info(path), object("alice/nar/x"), Tier::Built)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .find_verified_by_hash_part("33333333333333333333333333333333")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn find_verified_by_hash_part_ignores_a_marked_or_purging_row() {
+        // Mirrors every other read here going through `store_paths_live`
+        // (PLAN.md Phase 12): a row on its way out must not be handed to a
+        // second tenant as something worth materializing a fresh copy of.
+        let Some(store) = db().await else { return };
+        let alice = tenant("find-verified-marked");
+        let path = "/nix/store/44444444444444444444444444444444-thing";
+        store
+            .record_path(
+                &alice,
+                info(path),
+                object("nar/marked.nar.zst"),
+                Tier::Verified,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE store_paths SET state = 'marked' WHERE tenant = $1 AND path = $2")
+            .bind(alice.as_str())
+            .bind(path)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .find_verified_by_hash_part("44444444444444444444444444444444")
+                .await
+                .is_none()
         );
     }
 

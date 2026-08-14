@@ -213,6 +213,17 @@ pub trait Store: Send + Sync {
     /// correct either way, so this is an optimisation, not a safety check.
     async fn object_known(&self, key: &ObjectKey) -> bool;
 
+    /// Any tenant's `Verified` row for this hash part.
+    ///
+    /// Tenant-agnostic like [`Self::object_known`] — content-addressing means
+    /// two tenants' `Verified` rows for the same hash part are provably
+    /// identical, so any one of them answers for all. PLAN.md Phase 9c step
+    /// two: this is a *read*, and callers still need to write their own,
+    /// tenant-signed row before the path becomes valid for them — see
+    /// `daemon_rpc::resolve_verified`, the only writer that consults this.
+    async fn find_verified_by_hash_part(&self, hash_part: &str)
+    -> Option<(PathInfo, RemoteObject)>;
+
     async fn add_signatures(
         &self,
         tenant: &TenantId,
@@ -463,6 +474,30 @@ impl Store for MemoryStore {
         self.objects.lock().unwrap().contains_key(key)
     }
 
+    async fn find_verified_by_hash_part(
+        &self,
+        hash_part: &str,
+    ) -> Option<(PathInfo, RemoteObject)> {
+        let inner = self.inner.lock().unwrap();
+        for partition in inner.values() {
+            let Some((path, info)) = partition
+                .paths
+                .iter()
+                .find(|(p, _)| p.hash_part() == Some(hash_part))
+            else {
+                continue;
+            };
+            if partition.tiers.get(path) != Some(&Tier::Verified) {
+                continue;
+            }
+            let Some(object) = partition.remote.get(path).cloned() else {
+                continue;
+            };
+            return Some((info.clone(), object));
+        }
+        None
+    }
+
     async fn add_signatures(
         &self,
         tenant: &TenantId,
@@ -630,6 +665,46 @@ mod tests {
     async fn an_unknown_path_has_no_object() {
         let store = MemoryStore::new();
         assert!(store.output_object(&tenant("alice"), &p()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_verified_by_hash_part_scans_across_tenants() {
+        // PLAN.md Phase 9c step two: the tenant-agnostic read, mirroring
+        // `object_known`. `daemon_rpc::resolve_verified` is what actually
+        // materializes a caller's own row from this; the trait method itself
+        // is a pure lookup.
+        let store = MemoryStore::new();
+        let alice = tenant("alice");
+        store
+            .record_path(&alice, info(P), object("nar/x"), Tier::Verified)
+            .await
+            .unwrap();
+
+        let (found_info, found_object) = store
+            .find_verified_by_hash_part(&"0".repeat(32))
+            .await
+            .expect("alice's verified row");
+        assert_eq!(found_info.path, p());
+        assert_eq!(found_object.key.as_str(), "nar/x");
+
+        assert!(store.find_verified_by_hash_part("deadbeef").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_verified_by_hash_part_ignores_built_and_quarantined() {
+        let store = MemoryStore::new();
+        let alice = tenant("alice");
+        store
+            .record_path(&alice, info(P), object("alice/nar/x"), Tier::Built)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .find_verified_by_hash_part(&"0".repeat(32))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

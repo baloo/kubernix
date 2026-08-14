@@ -141,7 +141,7 @@ async fn realise(
         ));
     }
 
-    if store.is_valid_path(tenant, path).await {
+    if is_valid_path_anywhere(store, tenant, path).await {
         Ok(())
     } else {
         Err(rpc_error::failed(format!(
@@ -230,6 +230,61 @@ async fn sign_if_vouchable(store: &dyn Store, tenant: &TenantId, info: &mut Path
             tracing::error!(path = %info.path, error = %e, "signing failed; storing unsigned")
         }
     }
+}
+
+/// If `tenant` doesn't already have a row for this hash part, but some other
+/// tenant's `Verified` push does, copy it in — signed with `tenant`'s own key,
+/// never anyone else's. PLAN.md Phase 9c step two.
+///
+/// Deliberately only reachable from the daemon protocol (this module), never
+/// from the HTTP cache: it writes, and the write path is where writes belong.
+/// A cross-tenant path only becomes visible to a tenant's HTTP cache once its
+/// own daemon-protocol traffic — a build depending on it, `nix copy`, etc. —
+/// has materialized a row for it here, exactly as if that tenant had pushed
+/// it directly.
+async fn resolve_verified(
+    store: &dyn Store,
+    tenant: &TenantId,
+    hash_part: &str,
+) -> Option<StorePath> {
+    if let Some(path) = store.query_path_from_hash_part(tenant, hash_part).await {
+        return Some(path);
+    }
+    let (mut info, object) = store.find_verified_by_hash_part(hash_part).await?;
+    let path = info.path.clone();
+    // Drop whichever tenant's signature `find_verified_by_hash_part` happened
+    // to return: this is a fresh row for `tenant`, and its only signature
+    // should be its own — not a mix that quietly says another tenant also
+    // vouched for it.
+    info.sigs.clear();
+    sign_if_vouchable(store, tenant, &mut info, Tier::Verified).await;
+    if let Err(e) = store
+        .record_path(tenant, info, object, Tier::Verified)
+        .await
+    {
+        tracing::error!(
+            %path, %tenant, error = %e,
+            "failed to materialize a cross-tenant verified path"
+        );
+        return None;
+    }
+    tracing::info!(%path, %tenant, "materialized a cross-tenant verified path");
+    Some(path)
+}
+
+/// [`Store::is_valid_path`], falling back to [`resolve_verified`] on a local
+/// miss. The two callers (`isValidPath` itself, and `realise`'s check for an
+/// opaque `buildPaths` dependency) both need this, not just the RPC entry
+/// point — an opaque dependency that only another tenant has pushed is
+/// exactly the case sharing exists for.
+async fn is_valid_path_anywhere(store: &dyn Store, tenant: &TenantId, path: &StorePath) -> bool {
+    if store.is_valid_path(tenant, path).await {
+        return true;
+    }
+    let Some(hash_part) = path.hash_part() else {
+        return false;
+    };
+    resolve_verified(store, tenant, hash_part).await.as_ref() == Some(path)
 }
 
 fn store_err(e: StoreError) -> capnp::Error {
@@ -702,7 +757,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             let path = read_store_path(params.get()?.get_path()?)?;
             results
                 .get()
-                .set_result(store.is_valid_path(&tenant, &path).await);
+                .set_result(is_valid_path_anywhere(&*store, &tenant, &path).await);
             Ok(())
         }
     }
@@ -716,7 +771,18 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         let tenant = self.tenant.id.clone();
         async move {
             let paths = read_store_paths(params.get()?.get_paths()?)?;
-            let valid = store.query_valid_paths(&tenant, &paths).await;
+            let mut valid = store.query_valid_paths(&tenant, &paths).await;
+            for path in &paths {
+                if valid.contains(path) {
+                    continue;
+                }
+                let Some(hash_part) = path.hash_part() else {
+                    continue;
+                };
+                if resolve_verified(&*store, &tenant, hash_part).await.as_ref() == Some(path) {
+                    valid.push(path.clone());
+                }
+            }
             write_store_paths(results.get().init_result(valid.len() as u32), &valid);
             Ok(())
         }
@@ -746,7 +812,16 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         async move {
             let path = read_store_path(params.get()?.get_path()?)?;
             let mut result = results.get().init_result();
-            match store.query_path_info(&tenant, &path).await {
+            let mut info = store.query_path_info(&tenant, &path).await;
+            if info.is_none()
+                && let Some(hash_part) = path.hash_part()
+                && resolve_verified(&*store, &tenant, hash_part)
+                    .await
+                    .is_some()
+            {
+                info = store.query_path_info(&tenant, &path).await;
+            }
+            match info {
                 Some(info) => {
                     // A narinfo is the earlier half of "fetch metadata, then
                     // fetch bytes" — PLAN.md Phase 12 counts it as an access
@@ -771,7 +846,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         async move {
             let hash_part = String::from_utf8_lossy(params.get()?.get_hash_part()?).into_owned();
             let mut result = results.get().init_result();
-            match store.query_path_from_hash_part(&tenant, &hash_part).await {
+            match resolve_verified(&*store, &tenant, &hash_part).await {
                 Some(path) => result.init_some().set_raw(path.as_str().as_bytes()),
                 None => result.set_none(()),
             }
@@ -1454,6 +1529,103 @@ mod tests {
         assert!(
             traces.iter().any(|t| t.contains("--builders")),
             "the traces should point at the form that works, got {traces:?}"
+        );
+    }
+
+    fn bob() -> crate::tenant::TenantId {
+        crate::tenant::Tenant::from_ssh("bob", None, false).id
+    }
+
+    // PLAN.md Phase 9c step two. `tenant()` (defined above) is reused as
+    // "alice" — the first, pushing tenant.
+
+    #[tokio::test]
+    async fn resolve_verified_materializes_a_copy_signed_with_the_caller_s_own_key() {
+        let store = MemoryStore::new();
+        let (alice, bob) = (tenant(), bob());
+
+        let mut pushed = info(OUT);
+        sign_if_vouchable(&*store, &alice, &mut pushed, Tier::Verified).await;
+        store
+            .record_path(&alice, pushed, object("k"), Tier::Verified)
+            .await
+            .unwrap();
+
+        // Bob never pushed or built this path.
+        assert!(!store.is_valid_path(&bob, &StorePath::new(OUT)).await);
+
+        let hash_part = StorePath::new(OUT).hash_part().unwrap().to_string();
+        let resolved = resolve_verified(&*store, &bob, &hash_part).await;
+        assert_eq!(resolved, Some(StorePath::new(OUT)));
+
+        // Bob now has his own row, not a view onto Alice's.
+        assert!(store.is_valid_path(&bob, &StorePath::new(OUT)).await);
+        let bob_info = store
+            .query_path_info(&bob, &StorePath::new(OUT))
+            .await
+            .expect("materialized");
+        let alice_info = store
+            .query_path_info(&alice, &StorePath::new(OUT))
+            .await
+            .expect("still there");
+
+        assert_eq!(bob_info.sigs.len(), 1, "signed exactly once, by bob");
+        assert_ne!(
+            bob_info.sigs, alice_info.sigs,
+            "each tenant's signature comes from its own key, even over identical content"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_verified_finds_nothing_for_a_path_nobody_has() {
+        let store = MemoryStore::new();
+        let hash_part = StorePath::new(OUT).hash_part().unwrap().to_string();
+        assert_eq!(resolve_verified(&*store, &bob(), &hash_part).await, None);
+    }
+
+    #[tokio::test]
+    async fn is_valid_path_anywhere_falls_back_to_another_tenant_s_verified_push() {
+        let store = MemoryStore::new();
+        let (alice, bob) = (tenant(), bob());
+        store
+            .record_path(&alice, info(OUT), object("k"), Tier::Verified)
+            .await
+            .unwrap();
+
+        assert!(is_valid_path_anywhere(&*store, &bob, &StorePath::new(OUT)).await);
+    }
+
+    #[tokio::test]
+    async fn is_valid_path_anywhere_does_not_leak_built_or_quarantined_paths() {
+        let store = MemoryStore::new();
+        let (alice, bob) = (tenant(), bob());
+        store
+            .record_path(&alice, info(OUT), object("k"), Tier::Built)
+            .await
+            .unwrap();
+
+        // Only `Verified` is provably identical across tenants; `Built` stays
+        // strictly per-tenant, unaffected by this fallback.
+        assert!(!is_valid_path_anywhere(&*store, &bob, &StorePath::new(OUT)).await);
+    }
+
+    #[tokio::test]
+    async fn an_opaque_dependency_only_another_tenant_pushed_still_builds() {
+        // Mirrors the Phase 9 "quarantine does not break builds" case: a build
+        // depending on a path only a different tenant has needs `realise` (what
+        // `buildPaths`/`buildPathsWithResult` use for opaque paths) to resolve
+        // it, not just `isValidPath`.
+        let store = MemoryStore::new();
+        let (alice, bob) = (tenant(), bob());
+        store
+            .record_path(&alice, info(OUT), object("k"), Tier::Verified)
+            .await
+            .unwrap();
+
+        assert!(
+            realise(&*store, &bob, &StorePath::new(OUT), false)
+                .await
+                .is_ok()
         );
     }
 }
