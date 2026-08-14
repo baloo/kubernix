@@ -220,7 +220,11 @@ impl ServeConnection {
     /// TODO: same unbounded-hang risk as [`Self::open`] — no timeout on this
     /// exchange, same real fix (talk to the daemon socket directly rather
     /// than through this subprocess).
-    pub async fn build_derivation(&mut self, drv_path: &str, drv: &[u8]) -> eyre::Result<BuildOutcome> {
+    pub async fn build_derivation(
+        &mut self,
+        drv_path: &str,
+        drv: &[u8],
+    ) -> eyre::Result<BuildOutcome> {
         self.stdin
             .write_wire_u64(CMD_BUILD_DERIVATION)
             .await
@@ -288,7 +292,11 @@ impl ServeConnection {
     /// commands until EOF.
     pub async fn close(mut self) -> eyre::Result<()> {
         drop(self.stdin);
-        let status = self.child.wait().await.wrap_err("waiting for nix-store --serve")?;
+        let status = self
+            .child
+            .wait()
+            .await
+            .wrap_err("waiting for nix-store --serve")?;
         if !status.success() {
             tracing::warn!(?status, "nix-store --serve exited non-zero");
         }

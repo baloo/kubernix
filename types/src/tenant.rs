@@ -98,7 +98,10 @@ mod tests {
     #[test]
     fn from_str_agrees_with_from_wire() {
         let id: TenantId = "user-alice-dabd1db8d35ab131".parse().unwrap();
-        assert_eq!(id, TenantId::from_wire("user-alice-dabd1db8d35ab131").unwrap());
+        assert_eq!(
+            id,
+            TenantId::from_wire("user-alice-dabd1db8d35ab131").unwrap()
+        );
         assert!("../other".parse::<TenantId>().is_err());
     }
 }

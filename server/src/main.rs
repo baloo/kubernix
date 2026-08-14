@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use eyre::Context as _;
 use kubernix_server::http::{self, HttpState};
-use kubernix_server::postgres_store::PostgresStore;
+use kubernix_server::postgres_store::{PostgresStore, ServingRole};
 use kubernix_server::store::{MemoryStore, Store};
 use kubernix_server::uploads::UploadSigner;
 use tokio::net::TcpListener;
@@ -42,7 +42,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
     // is a row. Starting anyway would answer 404 to everything, which looks like
     // a cache miss rather than a misconfiguration — so say so loudly instead.
     let store: Arc<dyn Store> = match std::env::var("DATABASE_URL") {
-        Ok(url) => PostgresStore::connect(&url)
+        // Tenant-scoped, same as kubernix-sshd: every read here is already
+        // scoped to the URL's `{tenant}` path segment.
+        Ok(url) => PostgresStore::connect(&url, ServingRole::App)
             .await
             .wrap_err("connecting to PostgreSQL")?,
         Err(_) => {

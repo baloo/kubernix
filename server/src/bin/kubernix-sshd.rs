@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use eyre::Context as _;
 use kubernix_server::daemon_rpc::Config as RpcConfig;
-use kubernix_server::postgres_store::PostgresStore;
+use kubernix_server::postgres_store::{PostgresStore, ServingRole};
 use kubernix_server::ssh::{AuthPolicy, SshServer};
 use russh::server::Server as _;
 
@@ -74,7 +74,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     // Refusing to start would be worse for development, so this warns loudly
     // instead.
     match std::env::var("DATABASE_URL") {
-        Ok(url) => match PostgresStore::connect(&url).await {
+        Ok(url) => match PostgresStore::connect(&url, ServingRole::App).await {
             Ok(store) => rpc_config.store = store,
             Err(e) => {
                 tracing::error!(error = %e, "could not reach PostgreSQL");

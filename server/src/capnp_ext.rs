@@ -166,7 +166,10 @@ impl DerivedPathReaderExt for legacy_protocol::derived_path::Reader<'_> {
                 (opaque?.get_path()?.to_store_path(store_dir)?, false)
             }
             derived_path::raw::Which::Built(built) => (
-                built?.get_drv_path()?.get_path()?.to_store_path(store_dir)?,
+                built?
+                    .get_drv_path()?
+                    .get_path()?
+                    .to_store_path(store_dir)?,
                 true,
             ),
         })

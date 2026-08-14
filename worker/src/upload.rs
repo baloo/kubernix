@@ -183,8 +183,7 @@ impl<'a> NixStore<'a> {
         // outright (`HTTP 400`). Spooling to disk gives a length to declare
         // while keeping *memory* flat, which is what actually mattered.
         let spool = tempfile::NamedTempFile::new().wrap_err("creating a spool file")?;
-        let sink =
-            tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
+        let sink = tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
 
         // `HashReader`/`HashWriter` (digest-io) hash a stream as it passes
         // through; `ZstdEncoder` (async-compression) compresses one as it's
@@ -201,7 +200,10 @@ impl<'a> NixStore<'a> {
             .wrap_err_with(|| format!("dumping {store_path}"))?;
         // Flushes zstd's trailing frame bytes through the `HashWriter` — must
         // happen before the file hash/size below are read.
-        encoder.shutdown().await.wrap_err("flushing the compressor")?;
+        encoder
+            .shutdown()
+            .await
+            .wrap_err("flushing the compressor")?;
         let file_writer = encoder.into_inner();
 
         let nar_hash = nar_reader.finalize();
@@ -316,8 +318,8 @@ impl<'a> NixStore<'a> {
             // Decompressed as it arrives rather than in one piece: peak
             // memory is a chunk, not the whole NAR. `zstd`'s streaming writer
             // is enough for this, so it needs no additional dependency.
-            let mut decoder = zstd::stream::write::Decoder::new(Vec::new())
-                .wrap_err("starting decompression")?;
+            let mut decoder =
+                zstd::stream::write::Decoder::new(Vec::new()).wrap_err("starting decompression")?;
             let mut body = response.bytes_stream();
             while let Some(chunk) = body.next().await {
                 decoder
@@ -444,8 +446,9 @@ impl<'a> NixStore<'a> {
             None
         } else {
             Some(
-                StorePath::from_full_or_err(self.store_dir, &deriver)
-                    .wrap_err("KUBERNIX_STORE_DIR does not match the local store's own idea of it")?,
+                StorePath::from_full_or_err(self.store_dir, &deriver).wrap_err(
+                    "KUBERNIX_STORE_DIR does not match the local store's own idea of it",
+                )?,
             )
         };
 

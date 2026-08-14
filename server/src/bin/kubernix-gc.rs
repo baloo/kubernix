@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use eyre::{Context as _, OptionExt as _};
 use kubernix_server::gc::{self, JobRetention, TierCutoffs};
-use kubernix_server::postgres_store::PostgresStore;
+use kubernix_server::postgres_store::{PostgresStore, ServingRole};
 use kubernix_server::uploads::UploadSigner;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -56,7 +56,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let database_url = std::env::var("DATABASE_URL")
         .ok()
         .ok_or_eyre("DATABASE_URL must be set - nothing to collect without it")?;
-    let store = PostgresStore::connect(&database_url)
+    // `Gc`, not `App`: a collector has to see every tenant's rows at once to
+    // do reachability and referrer counting at all — see `gc`'s module doc.
+    let store = PostgresStore::connect(&database_url, ServingRole::Gc)
         .await
         .wrap_err("connecting to PostgreSQL")?;
 

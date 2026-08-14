@@ -319,6 +319,37 @@ pkgs.testers.nixosTest {
         assert status == "404", f"cross-tenant read should 404, got {status}"
 
 
+    with subtest("row-level security blocks a cross-tenant read even without an application predicate"):
+        # Every check above (including "tenants are isolated" just above)
+        # proves the *application*'s own `WHERE tenant = $1` isolates
+        # tenants. This proves the *database* does too — against the real
+        # `kubernix_app` role kubernix-sshd/kubernix-cache actually connect
+        # as after migrating (`server/migrations/20260814120000_row_level_
+        # security.sql`), not the `postgres` superuser every other `psql`
+        # call in this test uses, which always bypasses row-level security
+        # regardless of policy.
+        other = "user-nobody-0000000000000000"
+        result = machine.succeed(
+            "psql -U kubernix_app -h 127.0.0.1 kubernix -tAc "
+            f"\"SELECT set_config('app.current_tenant', '{other}', false); "
+            f"SELECT path FROM store_paths WHERE path = '{out_bare}'\""
+        ).strip()
+        assert result == "", (
+            f"kubernix_app scoped to a different tenant must not see this row "
+            f"from a query with no tenant predicate of its own, got: {result!r}"
+        )
+
+        # Sanity check on the same role, so the empty result above cannot be
+        # mistaken for "row-level security blocks everything": the owning
+        # tenant must still see its own row.
+        result = machine.succeed(
+            "psql -U kubernix_app -h 127.0.0.1 kubernix -tAc "
+            f"\"SELECT set_config('app.current_tenant', '{tenant}', false); "
+            f"SELECT path FROM store_paths WHERE path = '{out_bare}'\""
+        ).strip()
+        assert result == out_bare, f"the owning tenant must still see its own row, got: {result!r}"
+
+
     with subtest("the capability secret is provisioned and rotates"):
         # Proves the lazy-create-on-first-use path is actually live (not
         # skipped): by now `build_derivation` has minted and verified at least

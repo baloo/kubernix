@@ -43,4 +43,5 @@ pub mod ssh;
 pub mod store;
 pub mod store_path;
 pub mod tenant;
+pub mod tenant_view;
 pub mod uploads;

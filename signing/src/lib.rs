@@ -254,11 +254,7 @@ mod tests {
         assert!(fingerprint.contains(";1234;"), "nar size: {fingerprint}");
         assert!(
             fingerprint.ends_with(
-                &format!(
-                    "{STORE_DIR}/{};{STORE_DIR}/{}",
-                    REFS[0], REFS[1]
-                )
-                .replace(';', ",")
+                &format!("{STORE_DIR}/{};{STORE_DIR}/{}", REFS[0], REFS[1]).replace(';', ",")
             ),
             "references are comma separated, printed full: {fingerprint}"
         );
@@ -320,11 +316,7 @@ mod tests {
         let bob = LocalSigner::generate("kubernix-bob-1");
         let sig = alice.sign_path(&subject(&refs)).await.expect("signable");
 
-        assert!(!verify(
-            &subject(&refs).compute(),
-            &sig,
-            &bob.public_key()
-        ));
+        assert!(!verify(&subject(&refs).compute(), &sig, &bob.public_key()));
     }
 
     #[tokio::test]

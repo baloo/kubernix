@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use sha2::{Sha256, digest::Output};
 use sqlx::Row;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::jobs::JobOutcome;
 use crate::store::{
@@ -89,27 +89,117 @@ fn db_err(e: sqlx::Error) -> StoreError {
     StoreError::Other(format!("database: {e}"))
 }
 
+/// Which of the two low-privilege Postgres roles a connecting binary serves
+/// as — see `server/migrations/20260814120000_row_level_security.sql` for
+/// why there are two, not one, and what each is granted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServingRole {
+    /// kubernix-sshd, kubernix-cache: tenant-scoped, row-security-restricted
+    /// to whatever `app.current_tenant` a query has set (see
+    /// [`PostgresStore::tenant_scoped`]).
+    App,
+    /// kubernix-gc, kubernix-rotate-capability-secret: `BYPASSRLS`, because
+    /// these scan every tenant's rows by design — see `crate::gc`'s module
+    /// doc.
+    Gc,
+}
+
+impl ServingRole {
+    fn db_role(self) -> &'static str {
+        match self {
+            ServingRole::App => "kubernix_app",
+            ServingRole::Gc => "kubernix_gc",
+        }
+    }
+}
+
 impl PostgresStore {
-    /// Connect and apply the migrations.
-    pub async fn connect(url: &str) -> std::result::Result<Arc<Self>, sqlx::Error> {
-        tracing::info!("connecting to PostgreSQL");
-        let pool = PgPoolOptions::new()
-            .max_connections(16)
-            .connect(url)
-            .await?;
+    /// Connect, apply migrations, then reconnect as `role`'s own scoped
+    /// serving role.
+    ///
+    /// `url` is used twice, for two different purposes: first as a
+    /// privileged *bootstrap* connection — expected to authenticate as an
+    /// owner/superuser role able to run DDL (creating the `kubernix_app`/
+    /// `kubernix_gc` roles themselves, `ALTER TABLE ... ENABLE ROW LEVEL
+    /// SECURITY`, and so on) — which runs the migrations and is then
+    /// dropped; then again, with only its username swapped for `role`'s, to
+    /// open the actual serving pool this function returns. A fresh
+    /// deployment still needs no separate provisioning step (one URL, one
+    /// `connect` call) while the long-lived pool a compromised serving path
+    /// could misuse never holds more than `role`'s own narrow grants — see
+    /// the migration's doc comment for the full reasoning.
+    pub async fn connect(
+        url: &str,
+        role: ServingRole,
+    ) -> std::result::Result<Arc<Self>, sqlx::Error> {
+        tracing::info!("connecting to PostgreSQL to apply migrations");
+        let bootstrap = PgPoolOptions::new().max_connections(1).connect(url).await?;
 
         // Applied on startup rather than by a separate step so a fresh
         // deployment works without one.
         sqlx::migrate!("./migrations")
-            .run(&pool)
+            .run(&bootstrap)
             .await
             .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
+        bootstrap.close().await;
+
+        let db_role = role.db_role();
+        tracing::info!(
+            role = db_role,
+            "connecting to PostgreSQL as the serving role"
+        );
+        let opts: PgConnectOptions = url.parse()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(16)
+            .connect_with(opts.username(db_role))
+            .await?;
 
         tracing::info!("database ready");
         Ok(Arc::new(Self {
             pool,
             capability_secrets: tokio::sync::Mutex::new(CapabilitySecretCache::default()),
         }))
+    }
+
+    /// Begin a transaction with `app.current_tenant` set to `tenant` for its
+    /// duration — the connection-side half of the tenant-isolation policies
+    /// in `server/migrations/20260814120000_row_level_security.sql`. Every
+    /// method below that takes a `tenant: &TenantId` and touches
+    /// `store_paths`, `jobs`, or `path_access` goes through this rather than
+    /// a bare `&self.pool` query — otherwise its own `WHERE tenant = $1`
+    /// predicate would be the only thing enforcing isolation, exactly the
+    /// single point of failure row-level security exists to back up.
+    ///
+    /// A transaction, not a bare `SET`, because `set_config(..., true)` (the
+    /// "is_local" form — equivalent to `SET LOCAL`, but usable with a bound
+    /// parameter, which a literal `SET LOCAL` statement is not) only holds
+    /// for the duration of one; without a transaction wrapping it, the GUC
+    /// would leak onto whatever this pooled connection is checked out for
+    /// next.
+    async fn tenant_scoped(
+        &self,
+        tenant: &TenantId,
+    ) -> sqlx::Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(tenant.as_str())
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
+    }
+
+    /// Begin a transaction with the narrow cross-tenant carve-out
+    /// [`Self::find_verified_by_hash_part`] needs set for its duration — see
+    /// the `cross_tenant_verified_read` policy in the row-level-security
+    /// migration for exactly what this does and does not widen.
+    async fn cross_tenant_verified_read_scoped(
+        &self,
+    ) -> sqlx::Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('app.allow_cross_tenant_verified_read', 'true', true)")
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
     }
 
     /// Record a tenant so the foreign keys on `store_paths` and `jobs` resolve.
@@ -187,7 +277,7 @@ impl PostgresStore {
     ) -> Result<()> {
         self.ensure_tenant_id(tenant).await?;
 
-        let mut txn = self.pool.begin().await.map_err(db_err)?;
+        let mut txn = self.tenant_scoped(tenant).await.map_err(db_err)?;
 
         sqlx::query(
             "INSERT INTO objects (key, file_size, file_hash) VALUES ($1, $2, $3)
@@ -253,10 +343,14 @@ impl PostgresStore {
 #[async_trait::async_trait]
 impl Store for PostgresStore {
     async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
+            return false;
+        };
         sqlx::query("SELECT 1 FROM store_paths_live WHERE tenant = $1 AND path = $2")
             .bind(tenant.as_str())
             .bind(path.as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(error = %e, %path, "isValidPath query failed");
@@ -266,13 +360,17 @@ impl Store for PostgresStore {
     }
 
     async fn query_valid_paths(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath> {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, "could not open a tenant-scoped transaction");
+            return Vec::new();
+        };
         let raw: Vec<&str> = paths.iter().map(StorePath::as_str).collect();
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT path FROM store_paths_live WHERE tenant = $1 AND path = ANY($2)",
         )
         .bind(tenant.as_str())
         .bind(&raw)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "queryValidPaths failed");
@@ -282,10 +380,14 @@ impl Store for PostgresStore {
     }
 
     async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<StorePath> {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, "could not open a tenant-scoped transaction");
+            return Vec::new();
+        };
         let rows: Vec<String> =
             sqlx::query_scalar("SELECT path FROM store_paths_live WHERE tenant = $1")
                 .bind(tenant.as_str())
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::error!(error = %e, "queryAllValidPaths failed");
@@ -295,10 +397,14 @@ impl Store for PostgresStore {
     }
 
     async fn query_path_info(&self, tenant: &TenantId, path: &StorePath) -> Option<PathInfo> {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
+            return None;
+        };
         sqlx::query("SELECT * FROM store_paths_live WHERE tenant = $1 AND path = $2")
             .bind(tenant.as_str())
             .bind(path.as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(error = %e, %path, "queryPathInfo failed");
@@ -312,12 +418,16 @@ impl Store for PostgresStore {
         tenant: &TenantId,
         hash_part: &str,
     ) -> Option<StorePath> {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, "could not open a tenant-scoped transaction");
+            return None;
+        };
         sqlx::query_scalar::<_, String>(
             "SELECT path FROM store_paths_live WHERE tenant = $1 AND hash_part = $2",
         )
         .bind(tenant.as_str())
         .bind(hash_part)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "queryPathFromHashPart failed");
@@ -327,13 +437,17 @@ impl Store for PostgresStore {
     }
 
     async fn query_referrers(&self, tenant: &TenantId, path: &StorePath) -> Vec<StorePath> {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
+            return Vec::new();
+        };
         // `@>` is the array-containment operator the GIN index answers.
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT path FROM store_paths_live WHERE tenant = $1 AND refs @> ARRAY[$2]",
         )
         .bind(tenant.as_str())
         .bind(path.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, %path, "queryReferrers failed");
@@ -360,6 +474,11 @@ impl Store for PostgresStore {
     }
 
     async fn output_object(&self, tenant: &TenantId, path: &StorePath) -> Option<RemoteObject> {
+        let mut tx = self
+            .tenant_scoped(tenant)
+            .await
+            .inspect_err(|e| tracing::error!(error = %e, %tenant, %path, "could not open a tenant-scoped transaction"))
+            .ok()?;
         let row = sqlx::query(
             "SELECT o.key, o.file_size, o.file_hash
                FROM store_paths_live sp JOIN objects o ON o.key = sp.object_key
@@ -367,7 +486,7 @@ impl Store for PostgresStore {
         )
         .bind(tenant.as_str())
         .bind(path.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, %path, "object lookup failed");
@@ -402,6 +521,15 @@ impl Store for PostgresStore {
         // Content-addressing means any tenant's `Verified` row for this hash
         // part is provably identical to any other's, so the first one found
         // answers for all. PLAN.md Phase 9c step two.
+        //
+        // The narrow, audited exception to row-level security's tenant
+        // isolation — see `cross_tenant_verified_read` in the row-level-
+        // security migration, and `Self::cross_tenant_verified_read_scoped`.
+        let mut tx = self
+            .cross_tenant_verified_read_scoped()
+            .await
+            .inspect_err(|e| tracing::error!(error = %e, %hash_part, "could not open a cross-tenant-read transaction"))
+            .ok()?;
         let row = sqlx::query(
             "SELECT sp.*, o.key AS obj_key, o.file_size AS obj_file_size,
                     o.file_hash AS obj_file_hash
@@ -410,7 +538,7 @@ impl Store for PostgresStore {
               LIMIT 1",
         )
         .bind(hash_part)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, %hash_part, "cross-tenant verified lookup failed");
@@ -434,6 +562,7 @@ impl Store for PostgresStore {
         path: &StorePath,
         sigs: Vec<String>,
     ) -> Result<()> {
+        let mut tx = self.tenant_scoped(tenant).await.map_err(db_err)?;
         // Union in SQL so concurrent signers do not clobber each other, which a
         // read-modify-write would.
         let updated = sqlx::query(
@@ -444,13 +573,14 @@ impl Store for PostgresStore {
         .bind(tenant.as_str())
         .bind(path.as_str())
         .bind(&sigs)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
 
         if updated.rows_affected() == 0 {
             return Err(StoreError::NotFound(path.to_string()));
         }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -532,21 +662,22 @@ impl Store for PostgresStore {
             }
         }
 
-        let found = sqlx::query("SELECT kid, secret FROM capability_secrets ORDER BY kid DESC LIMIT 1")
-            .fetch_optional(&self.pool)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "could not read the current capability secret");
-                None
-            })
-            .and_then(|row| {
-                let kid: i64 = row.get("kid");
-                let secret: Vec<u8> = row.get("secret");
-                secret
-                    .try_into()
-                    .ok()
-                    .map(|secret: [u8; 32]| (kid as u64, secret))
-            });
+        let found =
+            sqlx::query("SELECT kid, secret FROM capability_secrets ORDER BY kid DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "could not read the current capability secret");
+                    None
+                })
+                .and_then(|row| {
+                    let kid: i64 = row.get("kid");
+                    let secret: Vec<u8> = row.get("secret");
+                    secret
+                        .try_into()
+                        .ok()
+                        .map(|secret: [u8; 32]| (kid as u64, secret))
+                });
 
         let (kid, secret) = match found {
             Some(found) => found,
@@ -556,10 +687,12 @@ impl Store for PostgresStore {
             // read just picks whichever now has the higher `kid`.
             None => {
                 let secret: [u8; 32] = rand::random();
-                match sqlx::query("INSERT INTO capability_secrets (secret) VALUES ($1) RETURNING kid")
-                    .bind(secret.as_slice())
-                    .fetch_one(&self.pool)
-                    .await
+                match sqlx::query(
+                    "INSERT INTO capability_secrets (secret) VALUES ($1) RETURNING kid",
+                )
+                .bind(secret.as_slice())
+                .fetch_one(&self.pool)
+                .await
                 {
                     Ok(row) => (row.get::<i64, _>("kid") as u64, secret),
                     Err(e) => {
@@ -573,7 +706,8 @@ impl Store for PostgresStore {
                         // non-persistent: no other replica (and not even this
                         // one, after the cache below expires and a fresh
                         // database read succeeds) will ever resolve it.
-                        let ephemeral_kid = 0x8000_0000_0000_0000u64 | u64::from(rand::random::<u32>());
+                        let ephemeral_kid =
+                            0x8000_0000_0000_0000u64 | u64::from(rand::random::<u32>());
                         (ephemeral_kid, secret)
                     }
                 }
@@ -615,12 +749,16 @@ impl Store for PostgresStore {
     }
 
     async fn tier(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier> {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
+            return None;
+        };
         sqlx::query_scalar::<_, String>(
             "SELECT tier FROM store_paths_live WHERE tenant = $1 AND path = $2",
         )
         .bind(tenant.as_str())
         .bind(path.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, %path, "tier lookup failed");
@@ -651,12 +789,23 @@ impl Store for PostgresStore {
     /// an unsafe one, so a failure here is logged rather than propagated to
     /// callers that only wanted to read a path.
     async fn record_access(&self, tenant: &TenantId, path: &StorePath) {
+        let mut tx = match self.tenant_scoped(tenant).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(error = %e, %tenant, %path, "recording access failed");
+                return;
+            }
+        };
         if let Err(e) = sqlx::query("INSERT INTO path_access (tenant, path) VALUES ($1, $2)")
             .bind(tenant.as_str())
             .bind(path.as_str())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
         {
+            tracing::warn!(error = %e, %tenant, %path, "recording access failed");
+            return;
+        }
+        if let Err(e) = tx.commit().await {
             tracing::warn!(error = %e, %tenant, %path, "recording access failed");
         }
     }
@@ -676,6 +825,14 @@ impl Store for PostgresStore {
             tracing::warn!(error = %e, %tenant, %job_id, "recording job outcome failed");
             return;
         }
+
+        let mut tx = match self.tenant_scoped(tenant).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(error = %e, %tenant, %job_id, "recording job outcome failed");
+                return;
+            }
+        };
 
         let (status, error_msg, output_paths, log_key): (&str, Option<&str>, Vec<&str>, &str) =
             match outcome {
@@ -706,9 +863,13 @@ impl Store for PostgresStore {
         .bind(error_msg)
         .bind(&output_paths)
         .bind(log_key)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         {
+            tracing::warn!(error = %e, %tenant, %job_id, "recording job outcome failed");
+            return;
+        }
+        if let Err(e) = tx.commit().await {
             tracing::warn!(error = %e, %tenant, %job_id, "recording job outcome failed");
         }
     }
@@ -751,13 +912,16 @@ mod tests {
     // and without needing to truncate between runs.
     // ---------------------------------------------------------------------
 
-    /// Connect, or return `None` after saying why.
+    /// Connect, or return `None` after saying why. `ServingRole::App` —
+    /// same role `kubernix-sshd`/`kubernix-cache` actually serve as, so
+    /// every test below exercises row-level security for real rather than
+    /// against a bypassing role.
     async fn db() -> Option<Arc<PostgresStore>> {
         let Ok(url) = std::env::var("KUBERNIX_TEST_DATABASE_URL") else {
             eprintln!("skipping: KUBERNIX_TEST_DATABASE_URL unset");
             return None;
         };
-        match PostgresStore::connect(&url).await {
+        match PostgresStore::connect(&url, ServingRole::App).await {
             Ok(store) => Some(store),
             Err(e) => panic!("KUBERNIX_TEST_DATABASE_URL is set but unusable: {e}"),
         }
@@ -978,6 +1142,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_level_security_blocks_a_query_with_no_tenant_predicate_of_its_own() {
+        // Every test above proves the *application's* `WHERE tenant = $1`
+        // isolates tenants. This one proves the *database* does too — a
+        // regression test for the policy in
+        // `server/migrations/20260814120000_row_level_security.sql`, not for
+        // application code, since the whole point of row-level security is
+        // to hold even when a query forgets its own predicate.
+        let Some(store) = db().await else { return };
+        let (alice, bob) = (tenant("rls-alice"), tenant("rls-bob"));
+        store
+            .record_path(&alice, info(P), object("rls/alice/x"), Tier::Built)
+            .await
+            .unwrap();
+
+        // A connection scoped to bob, running a query that — deliberately,
+        // unlike every real `PostgresStore` method — carries no `tenant`
+        // predicate at all. If row-level security is doing its job, bob's
+        // connection must not see alice's row regardless.
+        let mut tx = store.pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(bob.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let rows: Vec<String> = sqlx::query_scalar("SELECT path FROM store_paths WHERE path = $1")
+            .bind(P)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "bob's connection must not see alice's row even from a query with no \
+             tenant predicate of its own: {rows:?}"
+        );
+
+        // Sanity check on the same connection, so a failure above cannot be
+        // mistaken for "RLS blocks everything": alice's own row must still
+        // be visible once scoped to alice.
+        sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(alice.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let rows: Vec<String> = sqlx::query_scalar("SELECT path FROM store_paths WHERE path = $1")
+            .bind(P)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![P.to_string()],
+            "alice must still see her own row"
+        );
+    }
+
+    #[tokio::test]
     async fn a_tier_survives_the_round_trip() {
         // The tier decides whether a path may ever be signed or served, so a
         // column that read back wrong would quietly make quarantined content
@@ -1190,9 +1410,7 @@ mod tests {
         let Some(store) = db().await else { return };
         let t = tenant("job-completed");
         let job_id = uuid::Uuid::new_v4();
-        let drv = StorePath::new(format!(
-            "00000000000000000000000000000000-{job_id}.drv"
-        ));
+        let drv = StorePath::new(format!("00000000000000000000000000000000-{job_id}.drv"));
 
         store
             .record_job_outcome(
@@ -1228,9 +1446,7 @@ mod tests {
         let Some(store) = db().await else { return };
         let t = tenant("job-failed");
         let job_id = uuid::Uuid::new_v4();
-        let drv = StorePath::new(format!(
-            "00000000000000000000000000000000-{job_id}.drv"
-        ));
+        let drv = StorePath::new(format!("00000000000000000000000000000000-{job_id}.drv"));
 
         store
             .record_job_outcome(

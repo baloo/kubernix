@@ -208,7 +208,8 @@ async fn main() -> color_eyre::eyre::Result<()> {
 
         if let Err(report) = job.fetch_inputs(&client, &http, nix).await {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
-            let outcome = Outcome::Failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
+            let outcome =
+                Outcome::Failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
             if let Err(e) = job.publish_result(&jetstream, &outcome, &[], None).await {
                 tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
             }
@@ -223,8 +224,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
             Ok(outputs) => outputs,
             Err(report) => {
                 tracing::error!(job_id = %job.job_id, error = ?report, "undecodable derivation");
-                let outcome =
-                    Outcome::Failed(infra_failure_message(&job.job_id, "reading the derivation failed"));
+                let outcome = Outcome::Failed(infra_failure_message(
+                    &job.job_id,
+                    "reading the derivation failed",
+                ));
                 if let Err(e) = job.publish_result(&jetstream, &outcome, &[], None).await {
                     tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
                 }
@@ -241,17 +244,25 @@ async fn main() -> color_eyre::eyre::Result<()> {
 
         // Artifacts first, then the result: publishing a success whose outputs
         // are not yet fetchable would be worse than reporting the upload failure.
-        let (artifacts, log_key) = match job.upload_artifacts(&client, &http, &outcome, log, nix).await
+        let (artifacts, log_key) = match job
+            .upload_artifacts(&client, &http, &outcome, log, nix)
+            .await
         {
             Ok(uploaded) => uploaded,
             Err(report) => {
                 tracing::error!(job_id = %job.job_id, error = ?report, "artifact upload failed");
-                outcome = Outcome::Failed(infra_failure_message(&job.job_id, "uploading artifacts failed"));
+                outcome = Outcome::Failed(infra_failure_message(
+                    &job.job_id,
+                    "uploading artifacts failed",
+                ));
                 (Vec::new(), None)
             }
         };
 
-        if let Err(e) = job.publish_result(&jetstream, &outcome, &artifacts, log_key.as_ref()).await {
+        if let Err(e) = job
+            .publish_result(&jetstream, &outcome, &artifacts, log_key.as_ref())
+            .await
+        {
             tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
             // Not acked: let it be redelivered rather than lose the job.
             continue;
@@ -288,8 +299,7 @@ fn decode_job(payload: &[u8]) -> eyre::Result<Job> {
     let tenant = request.get_tenant()?.to_string()?;
     // Without one the worker cannot name a key the frontend will sign, so
     // failing here beats failing later with a refused URL request.
-    let tenant =
-        TenantId::from_wire(tenant).ok_or_eyre("build request carries no tenant")?;
+    let tenant = TenantId::from_wire(tenant).ok_or_eyre("build request carries no tenant")?;
 
     Ok(Job {
         job_id: request.get_job_id()?.to_string()?,
@@ -460,7 +470,10 @@ impl Job {
                     job_id = %self.job_id, drv = %self.derivation_path, error = ?e,
                     "builder invocation failed"
                 );
-                Outcome::Failed(infra_failure_message(&self.job_id, "running the builder failed"))
+                Outcome::Failed(infra_failure_message(
+                    &self.job_id,
+                    "running the builder failed",
+                ))
             }
         };
 
@@ -549,7 +562,13 @@ impl Job {
                 out.set_file_size(artifact.file_size);
                 out.set_key(artifact.key.as_str());
                 out.set_compression("zstd");
-                out.set_deriver(artifact.deriver.as_ref().map(StorePath::as_str).unwrap_or(""));
+                out.set_deriver(
+                    artifact
+                        .deriver
+                        .as_ref()
+                        .map(StorePath::as_str)
+                        .unwrap_or(""),
+                );
                 let mut refs = out
                     .reborrow()
                     .init_references(artifact.references.len() as u32);
@@ -583,7 +602,10 @@ mod tests {
         // message the way the old code did — proof this construction never
         // does that.
         let leaked = "AccessDenied: request id AKIAABCDEF1234567890";
-        let message = infra_failure_message("11111111-2222-3333-4444-555555555555", "uploading artifacts failed");
+        let message = infra_failure_message(
+            "11111111-2222-3333-4444-555555555555",
+            "uploading artifacts failed",
+        );
 
         assert!(message.contains("11111111-2222-3333-4444-555555555555"));
         assert!(message.contains("uploading artifacts failed"));

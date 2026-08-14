@@ -145,7 +145,7 @@ mod tests {
             eprintln!("skipping: KUBERNIX_TEST_DATABASE_URL unset");
             return None;
         };
-        match PostgresStore::connect(&url).await {
+        match PostgresStore::connect(&url, crate::postgres_store::ServingRole::Gc).await {
             Ok(store) => Some(store),
             Err(e) => panic!("KUBERNIX_TEST_DATABASE_URL is set but unusable: {e}"),
         }
@@ -174,7 +174,9 @@ mod tests {
         // ...but a zero-second retention prunes everything already retired,
         // leaving only the row this very call just inserted (still current,
         // so never a pruning candidate regardless of retention).
-        let stats = rotate(&store, Duration::from_secs(0)).await.expect("rotates");
+        let stats = rotate(&store, Duration::from_secs(0))
+            .await
+            .expect("rotates");
         assert!(stats.ran);
         let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM capability_secrets")
             .fetch_one(&store.pool)

@@ -464,7 +464,7 @@ mod tests {
             eprintln!("skipping: KUBERNIX_TEST_DATABASE_URL unset");
             return None;
         };
-        match PostgresStore::connect(&url).await {
+        match PostgresStore::connect(&url, crate::postgres_store::ServingRole::Gc).await {
             Ok(store) => Some(store),
             Err(e) => panic!("KUBERNIX_TEST_DATABASE_URL is set but unusable: {e}"),
         }

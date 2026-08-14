@@ -24,6 +24,16 @@ ssh_port := env_var_or_default("KUBERNIX_SSH_PORT", "2222")
 host_key := env_var_or_default("TMPDIR", "/tmp") / "kubernix_host_ed25519"
 
 # Matches what `just run-db` serves. Override to point at another database.
+#
+# A privileged/superuser URL, deliberately -- `postgres`, matching `run-db`'s
+# own bootstrap user. `PostgresStore::connect` uses it twice: once as-is to
+# run migrations (which create the `kubernix_app`/`kubernix_gc` roles and
+# their row-level-security policies -- see
+# `server/migrations/20260814120000_row_level_security.sql`), then again
+# with only the username swapped, to open the actual serving pool under
+# whichever of those two roles the connecting binary is. `run-db`'s trust
+# auth accepts any role name with no password, so nothing else here needs to
+# change to make that swap work.
 database_url := env_var_or_default("DATABASE_URL", "postgres://postgres@127.0.0.1:5433/kubernix")
 
 # Matches what `just s3-mock` serves. The frontend and the cache hold these;

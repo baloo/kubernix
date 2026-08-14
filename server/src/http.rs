@@ -321,9 +321,7 @@ mod tests {
     fn info() -> PathInfo {
         PathInfo {
             path: StorePath::new("00000000000000000000000000000000-thing"),
-            deriver: Some(StorePath::new(
-                "33333333333333333333333333333333-thing.drv",
-            )),
+            deriver: Some(StorePath::new("33333333333333333333333333333333-thing.drv")),
             nar_hash: Hash {
                 hash_type: HashType::Sha256,
                 bytes: vec![0xab; 32],

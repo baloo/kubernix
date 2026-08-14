@@ -83,7 +83,17 @@ in {
     databaseUrl = mkOption {
       type = types.str;
       default = "postgres://postgres@localhost:5432/kubernix";
-      description = "PostgreSQL connection string. Migrations run on startup.";
+      description = ''
+        PostgreSQL connection string. Migrations run on startup, over this
+        connection as given — it therefore needs to authenticate as an
+        owner/superuser role, same as the default here. `kubernix-sshd`
+        itself then reconnects with only its username swapped for
+        `kubernix_app`, the low-privilege, row-level-security-restricted
+        role the migrations create — see
+        `server/migrations/20260814120000_row_level_security.sql` and
+        `PostgresStore::connect`'s doc comment. One URL is still all this
+        needs; the role split happens entirely on the Rust side.
+      '';
     };
 
     natsUrl = mkOption {
@@ -111,7 +121,11 @@ in {
     databaseUrl = mkOption {
       type = types.str;
       default = "postgres://postgres@localhost:5432/kubernix";
-      description = "PostgreSQL connection string. Read-only in practice.";
+      description = ''
+        PostgreSQL connection string. Read-only in practice, and — like
+        kubernix-sshd — serves as `kubernix_app` after migrating; see that
+        option's description.
+      '';
     };
   } // s3Options;
 
@@ -131,7 +145,14 @@ in {
     databaseUrl = mkOption {
       type = types.str;
       default = "postgres://postgres@localhost:5432/kubernix";
-      description = "PostgreSQL connection string.";
+      description = ''
+        PostgreSQL connection string. After migrating, kubernix-gc serves as
+        `kubernix_gc`, not `kubernix_app` — a `BYPASSRLS` role, since a
+        collector has to see every tenant's rows to do reachability and
+        referrer counting at all. See `PostgresStore::connect`'s doc comment
+        and `services.kubernix-sshd.databaseUrl`'s description for the
+        migrate/serve split this relies on.
+      '';
     };
 
     interval = mkOption {
@@ -208,7 +229,11 @@ in {
     databaseUrl = mkOption {
       type = types.str;
       default = "postgres://postgres@localhost:5432/kubernix";
-      description = "PostgreSQL connection string.";
+      description = ''
+        PostgreSQL connection string. Serves as `kubernix_gc` after
+        migrating, same maintenance-tier role as kubernix-gc — see that
+        service's `databaseUrl` description.
+      '';
     };
 
     interval = mkOption {

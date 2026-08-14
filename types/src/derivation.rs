@@ -73,8 +73,9 @@ pub fn parse(bytes: &[u8], store_dir: &str) -> Result<BasicDerivation> {
     // client and the frontend disagree about the store directory — refused
     // rather than silently reinterpreted, the same as at the daemon protocol
     // boundary this feeds.
-    let rooted =
-        |s: String| StorePath::from_full_or_err(store_dir, &s).map_err(|e| ParseError(e.to_string()));
+    let rooted = |s: String| {
+        StorePath::from_full_or_err(store_dir, &s).map_err(|e| ParseError(e.to_string()))
+    };
 
     let output_count = reader.u64()? as usize;
     let mut outputs = Vec::with_capacity(output_count);

@@ -235,7 +235,11 @@ impl UploadSigner {
     /// Uses a queue group so that with several frontends exactly one answers
     /// each request. `store` is consulted for every request's capability
     /// secret — see [`Capability::verify`] — never for anything else here.
-    pub async fn serve(self, client: async_nats::Client, store: Arc<dyn Store>) -> eyre::Result<()> {
+    pub async fn serve(
+        self,
+        client: async_nats::Client,
+        store: Arc<dyn Store>,
+    ) -> eyre::Result<()> {
         let mut requests = client
             .queue_subscribe(UPLOADS_SUBJECT, "kubernix-frontends".to_string())
             .await
@@ -739,9 +743,7 @@ mod tests {
         let other = crate::store::nar_key(
             &alice,
             crate::store::Tier::Built,
-            &kubernix_types::StorePath::new(
-                "22222222222222222222222222222222-unrelated",
-            ),
+            &kubernix_types::StorePath::new("22222222222222222222222222222222-unrelated"),
         )
         .unwrap();
         let payload = request_payload(&[other], UPLOAD, &token);

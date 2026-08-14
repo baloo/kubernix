@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use eyre::{Context as _, OptionExt as _};
-use kubernix_server::postgres_store::PostgresStore;
+use kubernix_server::postgres_store::{PostgresStore, ServingRole};
 use kubernix_server::rotate;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -42,8 +42,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "kubernix_server=debug,kubernix_rotate_capability_secret=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "kubernix_server=debug,kubernix_rotate_capability_secret=debug".into()
+            }),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -51,7 +52,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let database_url = std::env::var("DATABASE_URL")
         .ok()
         .ok_or_eyre("DATABASE_URL must be set - nothing to rotate without it")?;
-    let store = PostgresStore::connect(&database_url)
+    // Same maintenance-tier role as kubernix-gc: `capability_secrets` carries
+    // no row-level security of its own (it is global, not tenant-keyed), but
+    // this is the same class of admin process, not a tenant-scoped one.
+    let store = PostgresStore::connect(&database_url, ServingRole::Gc)
         .await
         .wrap_err("connecting to PostgreSQL")?;
 
@@ -62,7 +66,12 @@ async fn main() -> color_eyre::eyre::Result<()> {
     // without waiting out a production-length interval.
     let once = std::env::args().any(|a| a == "--once");
 
-    tracing::info!(?interval, ?retention, once, "kubernix-rotate-capability-secret starting");
+    tracing::info!(
+        ?interval,
+        ?retention,
+        once,
+        "kubernix-rotate-capability-secret starting"
+    );
 
     if once {
         match rotate::rotate(&store, retention).await {

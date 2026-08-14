@@ -494,9 +494,7 @@ mod tests {
             CaMethod::Text,
             "sha256",
             &hash,
-            &[StorePath::new(
-                "00000000000000000000000000000000-dep",
-            )],
+            &[StorePath::new("00000000000000000000000000000000-dep")],
         );
         assert_ne!(bare, with);
         assert!(bare.is_some() && with.is_some());
@@ -514,9 +512,7 @@ mod tests {
                 CaMethod::Flat,
                 "sha256",
                 &hash,
-                &[StorePath::new(
-                    "00000000000000000000000000000000-dep",
-                )],
+                &[StorePath::new("00000000000000000000000000000000-dep",)],
             ),
             None
         );
@@ -598,9 +594,7 @@ mod tests {
         // References are folded into the path, so adding one moves the path —
         // which means a client cannot smuggle extra references past us.
         let (path, ca, nar) = honest_push();
-        let refs = vec![StorePath::new(
-            "00000000000000000000000000000000-dep",
-        )];
+        let refs = vec![StorePath::new("00000000000000000000000000000000-dep")];
         assert!(matches!(
             DIR.verify(&path, &ca, &refs, &nar),
             Err(Rejection::WrongPath { .. })

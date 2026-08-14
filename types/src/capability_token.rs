@@ -97,7 +97,10 @@ mod tests {
         );
         let printed = format!("{token:?}");
 
-        assert!(printed.contains("acme"), "tenant should be visible: {printed}");
+        assert!(
+            printed.contains("acme"),
+            "tenant should be visible: {printed}"
+        );
         assert!(
             printed.contains("expected_outputs"),
             "output names should be visible: {printed}"
@@ -118,7 +121,10 @@ mod tests {
         let printed = format!("{token:?}");
 
         assert!(printed.contains("undecodable"), "{printed}");
-        assert!(printed.contains('4'), "should mention the byte count: {printed}");
+        assert!(
+            printed.contains('4'),
+            "should mention the byte count: {printed}"
+        );
     }
 
     #[test]
