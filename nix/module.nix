@@ -7,6 +7,7 @@ let
   cfg_cache = config.services.kubernix-cache;
   cfg_worker = config.services.kubernix-worker;
   cfg_gc = config.services.kubernix-gc;
+  cfg_rotate = config.services.kubernix-rotate-capability-secret;
 
   # Credentials for the object store. Only the frontend and the cache hold
   # these; workers receive pre-signed URLs instead, which is the whole point of
@@ -190,6 +191,43 @@ in {
     };
   } // s3Options;
 
+  # Capability-token secret rotation (PLAN.md Phase 14). Its own service, like
+  # kubernix-gc: it mints and prunes rows in a different table with a
+  # different blast radius, and there is no scheduling reason to couple the
+  # two. Not a correctness dependency for anything else here -- a fresh
+  # deployment mints its first secret lazily, on first use, so nothing is
+  # gated on this service ever having run.
+  options.services.kubernix-rotate-capability-secret = {
+    enable = mkEnableOption "Kubernix capability-token secret rotation";
+
+    package = mkOption {
+      type = types.package;
+      description = "The kubernix-server package (provides kubernix-rotate-capability-secret).";
+    };
+
+    databaseUrl = mkOption {
+      type = types.str;
+      default = "postgres://postgres@localhost:5432/kubernix";
+      description = "PostgreSQL connection string.";
+    };
+
+    interval = mkOption {
+      type = types.ints.positive;
+      default = 6 * 3600;
+      description = "Seconds between rotation passes.";
+    };
+
+    retention = mkOption {
+      type = types.ints.positive;
+      default = 24 * 3600;
+      description = ''
+        Seconds a retired secret remains valid for verifying a token, after a
+        rotation supersedes it as current. Long enough that an in-flight job's
+        token never gets invalidated mid-build by a rotation landing under it.
+      '';
+    };
+  };
+
   options.services.kubernix-worker = {
     enable = mkEnableOption "Kubernix Worker";
 
@@ -297,6 +335,27 @@ in {
 
         serviceConfig = {
           ExecStart = "${cfg_gc.package}/bin/kubernix-gc";
+          Restart = "always";
+          DynamicUser = true;
+        };
+      };
+    })
+
+    (mkIf cfg_rotate.enable {
+      systemd.services.kubernix-rotate-capability-secret = {
+        description = "Kubernix capability-token secret rotation";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" "postgresql.service" ];
+
+        environment = {
+          DATABASE_URL = cfg_rotate.databaseUrl;
+          KUBERNIX_ROTATE_INTERVAL = toString cfg_rotate.interval;
+          KUBERNIX_ROTATE_RETENTION = toString cfg_rotate.retention;
+          RUST_LOG = "debug";
+        };
+
+        serviceConfig = {
+          ExecStart = "${cfg_rotate.package}/bin/kubernix-rotate-capability-secret";
           Restart = "always";
           DynamicUser = true;
         };

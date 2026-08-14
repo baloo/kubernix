@@ -9,11 +9,14 @@
 //! *same* type across a process boundary rather than two structurally
 //! identical ones that happen not to unify.
 
+mod capability_token;
+pub mod derivation;
 mod object_key;
 mod store_path;
 mod system;
 mod tenant;
 
+pub use capability_token::CapabilityToken;
 pub use object_key::ObjectKey;
 pub use store_path::StorePath;
 pub use system::System;

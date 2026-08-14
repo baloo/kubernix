@@ -14,6 +14,7 @@ capnp.workspace = true
 capnp-rpc = "0.27.0"
 ed25519-dalek.workspace = true
 futures-util.workspace = true
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 kubernix-signing.workspace = true
 kubernix-types.workspace = true
 rand = "0.10"

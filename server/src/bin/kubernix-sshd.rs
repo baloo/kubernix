@@ -93,8 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rpc_config.uploader = Some(signer.clone());
                         let client = queue.client();
                         let serving = signer.clone();
+                        let serving_store = rpc_config.store.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = (*serving).clone().serve(client).await {
+                            if let Err(e) = (*serving).clone().serve(client, serving_store).await {
                                 tracing::error!(error = %e, "upload url service stopped");
                             }
                         });

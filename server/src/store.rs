@@ -246,6 +246,18 @@ pub trait Store: Send + Sync {
     /// path is inert to clients, which is the safe direction to fall.
     async fn signer(&self, tenant: &TenantId) -> Option<Arc<dyn Signer>>;
 
+    /// The secret currently used to mint capability tokens (`crate::capability`),
+    /// and the id that selects it. Generated lazily on first use if none
+    /// exists — like [`Self::signer`], correctness never depends on a
+    /// separate rotation step having run first; rotation only improves on
+    /// this by keying every new token under a fresh id.
+    async fn current_capability_secret(&self) -> (u64, [u8; 32]);
+
+    /// The capability secret for a specific `kid`, for verifying a token that
+    /// may predate the most recent rotation. `None` once it has aged out of
+    /// the retention window and been deleted.
+    async fn capability_secret(&self, kid: u64) -> Option<[u8; 32]>;
+
     async fn set_options(&self, tenant: &TenantId, options: ClientOptions);
 
     /// Note that a path was read — either its metadata (`queryPathInfo`, a
@@ -314,6 +326,10 @@ pub struct MemoryStore {
     /// makes a `Verified` key collision between two tenants a dedup rather
     /// than two independent objects. See [`Store::object_known`].
     objects: Mutex<HashMap<ObjectKey, RemoteObject>>,
+    /// The capability-token secret, generated once on first use. Global
+    /// rather than per-tenant (unlike `signer`) — a single process has
+    /// nothing to rotate against, so there is only ever `kid = 0`.
+    capability_secret: Mutex<Option<[u8; 32]>>,
 }
 
 /// One tenant's view. Partitioned rather than keyed by `(tenant, path)` so that
@@ -357,6 +373,18 @@ pub fn nar_key(tenant: &TenantId, tier: Tier, store_path: &StorePath) -> Option<
         Tier::Built => format!("{tenant}/nar/{hash}.nar.zst"),
         Tier::Quarantined => format!("{tenant}/untrusted/nar/{hash}.nar.zst"),
     }))
+}
+
+/// Object key for a job's archived build log — mirrors the formula
+/// `worker/src/upload.rs::log_key` computes independently on the worker side
+/// for the same key. Given a copy here too so `uploads.rs` can check a
+/// requested upload key against a job's capability without reaching into the
+/// `worker` crate.
+pub fn log_key(tenant: &TenantId, drv_path: &StorePath) -> Option<ObjectKey> {
+    Some(ObjectKey::new(format!(
+        "{tenant}/log/{}",
+        drv_path.hash_part()?
+    )))
 }
 
 #[derive(Clone, Debug)]
@@ -544,6 +572,19 @@ impl Store for MemoryStore {
                     .clone(),
             )
         })
+    }
+
+    async fn current_capability_secret(&self) -> (u64, [u8; 32]) {
+        let mut guard = self.capability_secret.lock().unwrap();
+        let secret = *guard.get_or_insert_with(rand::random);
+        (0, secret)
+    }
+
+    async fn capability_secret(&self, kid: u64) -> Option<[u8; 32]> {
+        if kid != 0 {
+            return None;
+        }
+        *self.capability_secret.lock().unwrap()
     }
 
     async fn set_options(&self, tenant: &TenantId, options: ClientOptions) {

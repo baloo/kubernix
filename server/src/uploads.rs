@@ -6,14 +6,18 @@
 //! rather than a credential — and build outputs go straight to the object store
 //! instead of through the frontend.
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3::presigning::PresigningConfig;
 use futures_util::StreamExt;
 
-use kubernix_types::ObjectKey;
+use kubernix_types::{CapabilityToken, ObjectKey};
 
+use crate::capability::Capability;
 use crate::kubernix_capnp;
+use crate::store::{Store, Tier};
 use crate::tenant::TenantId;
 
 pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
@@ -233,10 +237,12 @@ impl UploadSigner {
     /// Serve upload-URL requests until the connection drops.
     ///
     /// Uses a queue group so that with several frontends exactly one answers
-    /// each request.
+    /// each request. `store` is consulted for every request's capability
+    /// secret — see [`Capability::verify`] — never for anything else here.
     pub async fn serve(
         self,
         client: async_nats::Client,
+        store: Arc<dyn Store>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut requests = client
             .queue_subscribe(UPLOADS_SUBJECT, "kubernix-frontends".to_string())
@@ -250,7 +256,7 @@ impl UploadSigner {
                 continue;
             };
 
-            let response = self.handle(&message.payload).await;
+            let response = self.handle(&message.payload, &*store).await;
             // Encoded in a scope that ends before the next await: the capnp
             // builder is !Send.
             let payload = match encode_response(&response) {
@@ -268,25 +274,49 @@ impl UploadSigner {
         Ok(())
     }
 
-    async fn handle(&self, payload: &[u8]) -> Result<Vec<String>, String> {
+    async fn handle(&self, payload: &[u8], store: &dyn Store) -> Result<Vec<String>, String> {
         // Decode to owned values first. capnp readers are !Send, and holding one
         // across the presigning awaits would make this future !Send — which it
         // cannot be, since it runs under tokio::spawn.
-        let (job_id, keys, download, tenant) = decode_request(payload)?;
+        let (job_id, keys, download, token) = decode_request(payload)?;
 
-        // A request that names no tenant cannot be scoped, so it cannot be
-        // safely honoured at all.
-        let Some(tenant) = tenant else {
-            tracing::warn!(%job_id, "refusing url request with no tenant");
-            return Err("request names no tenant".to_string());
+        // The tenant this request is scoped to comes entirely from the
+        // verified token — there is no separate wire `tenant` field to trust
+        // or mistrust (PLAN.md Phase 14).
+        let Some(capability) = Capability::verify(&token, store).await else {
+            tracing::warn!(%job_id, "refusing url request with an unverifiable capability token");
+            return Err("invalid or missing capability token".to_string());
         };
+        let tenant = &capability.tenant;
 
         // Validate every key before signing any: a request containing one
         // disallowed key is refused whole rather than partially honoured.
-        for key in &keys {
-            if !key_is_permitted(key, download, &tenant) {
-                tracing::warn!(%job_id, %tenant, %key, download, "refusing url for disallowed key");
-                return Err(format!("key not permitted: {key}"));
+        if download {
+            for key in &keys {
+                if !key_is_permitted(key, download, tenant) {
+                    tracing::warn!(%job_id, %tenant, %key, "refusing download url for disallowed key");
+                    return Err(format!("key not permitted: {key}"));
+                }
+            }
+        } else {
+            // Uploads are scoped narrower still: not just "somewhere under
+            // this tenant's namespace" but "one of this job's own verified
+            // outputs, or its log" — otherwise a worker could still overwrite
+            // some other job's output within its own tenant (Gap 2).
+            let allowed: HashSet<ObjectKey> = capability
+                .expected_outputs
+                .iter()
+                .filter_map(|(_, path)| crate::store::nar_key(tenant, Tier::Built, path))
+                .chain(crate::store::log_key(tenant, &capability.derivation_path))
+                .collect();
+            for key in &keys {
+                if !key_is_permitted(key, download, tenant) || !allowed.contains(key) {
+                    tracing::warn!(
+                        %job_id, %tenant, %key,
+                        "refusing upload url for a key outside this job's verified outputs"
+                    );
+                    return Err(format!("key not permitted: {key}"));
+                }
             }
         }
 
@@ -312,7 +342,7 @@ impl UploadSigner {
     }
 }
 
-type UrlRequest = (String, Vec<ObjectKey>, bool, Option<TenantId>);
+type UrlRequest = (String, Vec<ObjectKey>, bool, CapabilityToken);
 
 fn decode_request(payload: &[u8]) -> Result<UrlRequest, String> {
     let mut cursor = payload;
@@ -328,12 +358,6 @@ fn decode_request(payload: &[u8]) -> Result<UrlRequest, String> {
         .and_then(|t| t.to_string().ok())
         .unwrap_or_default();
 
-    let tenant = request
-        .get_tenant()
-        .ok()
-        .and_then(|t| t.to_string().ok())
-        .and_then(TenantId::from_wire);
-
     let mut keys = Vec::new();
     for key in request.get_keys().map_err(|e| e.to_string())?.iter() {
         keys.push(ObjectKey::new(
@@ -342,7 +366,10 @@ fn decode_request(payload: &[u8]) -> Result<UrlRequest, String> {
                 .map_err(|e| e.to_string())?,
         ));
     }
-    Ok((job_id, keys, request.get_download(), tenant))
+
+    let token = CapabilityToken::new(request.get_token().map_err(|e| e.to_string())?.to_vec());
+
+    Ok((job_id, keys, request.get_download(), token))
 }
 
 fn encode_response(response: &Result<Vec<String>, String>) -> capnp::Result<Vec<u8>> {
@@ -553,35 +580,153 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_request_without_a_tenant_is_refused() {
-        // Decoding yields None for an absent or malformed tenant, and `handle`
-        // refuses rather than falling back to an unscoped grant.
-        let mut message = capnp::message::Builder::new_default();
-        {
-            let mut request = message.init_root::<kubernix_capnp::upload_url_request::Builder>();
-            request.set_job_id("job");
-            request.reborrow().init_keys(1).set(0, "nar/x.nar.zst");
+    /// An `UploadSigner` that never makes a network call: presigning is a pure
+    /// local SigV4 computation, so a client built from fake, offline
+    /// credentials is enough to exercise `handle` end to end, including its
+    /// happy path.
+    fn stub_signer() -> UploadSigner {
+        let config = aws_sdk_s3::config::Builder::new()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
+        UploadSigner {
+            s3: aws_sdk_s3::Client::from_conf(config),
+            bucket: "test-bucket".to_string(),
         }
-        let mut payload = Vec::new();
-        capnp::serialize::write_message(&mut payload, &message).unwrap();
-
-        let (_, _, _, tenant) = decode_request(&payload).expect("decodable");
-        assert!(tenant.is_none());
     }
 
-    #[test]
-    fn a_malformed_wire_tenant_decodes_to_none() {
+    /// A job authorized to produce exactly one output, `p()`, under `tenant`.
+    fn capability_for(tenant: &TenantId) -> Capability {
+        Capability {
+            job_id: uuid::Uuid::new_v4(),
+            tenant: tenant.clone(),
+            derivation_path: kubernix_types::StorePath::new(
+                "/nix/store/00000000000000000000000000000000-x.drv",
+            ),
+            expected_outputs: vec![("out".to_string(), p())],
+        }
+    }
+
+    fn request_payload(keys: &[ObjectKey], download: bool, token: &CapabilityToken) -> Vec<u8> {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut request = message.init_root::<kubernix_capnp::upload_url_request::Builder>();
             request.set_job_id("job");
-            request.set_tenant("../escape");
+            request.set_download(download);
+            request.set_token(token.as_bytes());
+            let mut list = request.reborrow().init_keys(keys.len() as u32);
+            for (i, key) in keys.iter().enumerate() {
+                list.set(i as u32, key.as_str());
+            }
         }
         let mut payload = Vec::new();
         capnp::serialize::write_message(&mut payload, &message).unwrap();
+        payload
+    }
 
-        let (_, _, _, tenant) = decode_request(&payload).expect("decodable");
-        assert!(tenant.is_none(), "an escaping tenant must not be honoured");
+    #[tokio::test]
+    async fn handle_refuses_a_request_with_no_token() {
+        let signer = stub_signer();
+        let store = crate::store::MemoryStore::new();
+        let alice = tenant("alice");
+        let payload = request_payload(
+            &[key(&alice, "nar/abc.nar.zst")],
+            DOWNLOAD,
+            &CapabilityToken::default(),
+        );
+        assert!(signer.handle(&payload, &*store).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_a_tampered_token() {
+        let signer = stub_signer();
+        let store = crate::store::MemoryStore::new();
+        let alice = tenant("alice");
+        let (kid, secret) = store.current_capability_secret().await;
+        let mut bytes = capability_for(&alice).sign(kid, &secret).into_bytes();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        let token = CapabilityToken::new(bytes);
+        let payload = request_payload(&[key(&alice, "nar/abc.nar.zst")], DOWNLOAD, &token);
+        assert!(signer.handle(&payload, &*store).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_scopes_access_to_the_tokens_own_tenant() {
+        // The core Gap-1 regression (PLAN.md Phase 14): there is no wire
+        // `tenant` field to forge any more — a token minted for alice simply
+        // cannot reach bob's keys, full stop.
+        let signer = stub_signer();
+        let store = crate::store::MemoryStore::new();
+        let (alice, bob) = (tenant("alice"), tenant("bob"));
+        let (kid, secret) = store.current_capability_secret().await;
+        let token = capability_for(&alice).sign(kid, &secret);
+
+        let bobs_key = key(&bob, "nar/abc123.nar.zst");
+        let payload = request_payload(&[bobs_key], DOWNLOAD, &token);
+        assert!(signer.handle(&payload, &*store).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_an_upload_outside_the_jobs_verified_outputs() {
+        // The core Gap-2-at-the-URL-layer regression: a token authorizes
+        // uploads for its own job's outputs only, not anything else under the
+        // same tenant.
+        let signer = stub_signer();
+        let store = crate::store::MemoryStore::new();
+        let alice = tenant("alice");
+        let (kid, secret) = store.current_capability_secret().await;
+        let token = capability_for(&alice).sign(kid, &secret); // authorizes only p()
+
+        let other = crate::store::nar_key(
+            &alice,
+            crate::store::Tier::Built,
+            &kubernix_types::StorePath::new(
+                "/nix/store/22222222222222222222222222222222-unrelated",
+            ),
+        )
+        .unwrap();
+        let payload = request_payload(&[other], UPLOAD, &token);
+        assert!(signer.handle(&payload, &*store).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_permits_an_upload_for_a_jobs_verified_output() {
+        let signer = stub_signer();
+        let store = crate::store::MemoryStore::new();
+        let alice = tenant("alice");
+        let (kid, secret) = store.current_capability_secret().await;
+        let token = capability_for(&alice).sign(kid, &secret);
+
+        let output_key = crate::store::nar_key(&alice, crate::store::Tier::Built, &p()).unwrap();
+        let payload = request_payload(&[output_key], UPLOAD, &token);
+        let urls = signer
+            .handle(&payload, &*store)
+            .await
+            .expect("this job's own verified output is permitted");
+        assert_eq!(urls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_permits_a_download_of_a_staged_input_under_the_same_tenant() {
+        // Downloads keep the broader, existing `key_is_permitted` scoping —
+        // only the tenant it is checked against changed (now the token's,
+        // not a wire field).
+        let signer = stub_signer();
+        let store = crate::store::MemoryStore::new();
+        let alice = tenant("alice");
+        let (kid, secret) = store.current_capability_secret().await;
+        let token = capability_for(&alice).sign(kid, &secret);
+
+        let input_key = key(&alice, "nar/abc123.nar.zst"); // not one of the job's own outputs
+        let payload = request_payload(&[input_key], DOWNLOAD, &token);
+        let urls = signer
+            .handle(&payload, &*store)
+            .await
+            .expect("a staged input under the job's own tenant is permitted");
+        assert_eq!(urls.len(), 1);
     }
 }

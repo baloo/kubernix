@@ -149,6 +149,58 @@ pub fn store_path_for(
     }
 }
 
+/// Parse a lowercase hex string into bytes. `None` on malformed input (odd
+/// length, or a character outside `0-9a-f`) — the hash this feeds is
+/// untrusted wire input from a `.drv`.
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// Recompute a fixed-output derivation output's store path from its declared
+/// `algo`/`hash`, entirely ignoring whatever `path` the `.drv` itself claims —
+/// mirroring how a real Nix daemon's `buildDerivation` handles a `CAFixed`
+/// output: `parseDerivationOutput` (`lix/libstore/derivations.cc:223-256`)
+/// discards the wire's `path` field for this case and derives the true one
+/// from the content address alone. PLAN.md Phase 14.
+///
+/// `algo` is the wire's `Output.algo` field: bare `"<hash-algo>"` selects
+/// [`CaMethod::Flat`], `"r:<hash-algo>"` selects [`CaMethod::Recursive`] —
+/// Nix's `ContentAddressMethod::parsePrefix` convention. Returns `None` for
+/// malformed hex, or any shape [`store_path_for`] itself refuses.
+pub fn verify_fixed_output(
+    drv_name: &str,
+    output_name: &str,
+    algo: &str,
+    hash_hex: &str,
+    store_dir: &str,
+) -> Option<StorePath> {
+    let (method, hash_algo) = match algo.strip_prefix("r:") {
+        Some(rest) => (CaMethod::Recursive, rest),
+        None => (CaMethod::Flat, algo),
+    };
+    // `outputPathName`: the "out" output reuses the derivation's own name
+    // bare; every other output is suffixed with its own name.
+    let output_path_name = if output_name == "out" {
+        drv_name.to_string()
+    } else {
+        format!("{drv_name}-{output_name}")
+    };
+    store_path_for(
+        store_dir,
+        &output_path_name,
+        method,
+        hash_algo,
+        &unhex(hash_hex)?,
+        &[],
+    )
+}
+
 /// A content address as it arrives on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentAddress {
@@ -391,6 +443,59 @@ mod tests {
             .as_ref()
             .map(StorePath::as_str),
             Some("/nix/store/ik0brqacj8rn97il4ygixp855xyh64ld-greeting")
+        );
+    }
+
+    #[test]
+    fn verify_fixed_output_matches_nix_store_add_fixed() {
+        // Reuses the fixture from `matches_nix_store_add_fixed`: a fixed-output
+        // derivation named "f.txt" with a plain (non-"r:") sha256 algo and its
+        // "out" output funnels through the same makeFixedOutputPath formula as
+        // `nix-store --add-fixed sha256 f.txt`.
+        assert_eq!(
+            verify_fixed_output("f.txt", "out", "sha256", FLAT_HASH, "/nix/store")
+                .as_ref()
+                .map(StorePath::as_str),
+            Some("/nix/store/6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt")
+        );
+    }
+
+    #[test]
+    fn verify_fixed_output_recursive_prefix_selects_recursive() {
+        // Reuses the fixture from `matches_nix_store_add`: "r:sha256" is the
+        // wire's spelling for CaMethod::Recursive.
+        let nar = nar_of(b"hello content addressing\n");
+        let nar_hash = hex(&Sha256::digest(&nar));
+        assert_eq!(
+            verify_fixed_output("f.txt", "out", "r:sha256", &nar_hash, "/nix/store")
+                .as_ref()
+                .map(StorePath::as_str),
+            Some("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt")
+        );
+    }
+
+    #[test]
+    fn verify_fixed_output_names_non_out_outputs() {
+        // outputPathName: a non-"out" output is suffixed with its own name
+        // rather than reusing the derivation's name bare, so it must land at a
+        // different path from "out".
+        let named = verify_fixed_output("f.txt", "dev", "sha256", FLAT_HASH, "/nix/store")
+            .expect("well-formed");
+        let bare = verify_fixed_output("f.txt", "out", "sha256", FLAT_HASH, "/nix/store")
+            .expect("well-formed");
+        assert_ne!(named, bare);
+        assert_eq!(named.name(), Some("f.txt-dev"));
+    }
+
+    #[test]
+    fn verify_fixed_output_rejects_malformed_hex() {
+        assert_eq!(
+            verify_fixed_output("f.txt", "out", "sha256", "not-hex", "/nix/store"),
+            None
+        );
+        assert_eq!(
+            verify_fixed_output("f.txt", "out", "sha256", "abc", "/nix/store"), // odd length
+            None
         );
     }
 

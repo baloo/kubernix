@@ -54,6 +54,18 @@ let
       args = [ "-c" "echo unverifiable > $out" ];
     }
   '';
+
+  # A second, independent leaf build -- used only to prove a capability token
+  # minted *after* a forced rotation still verifies. Deliberately not `example`
+  # again: that output is reserved for the GC subtest at the end.
+  afterRotation = pkgs.writeText "after-rotation.nix" ''
+    derivation {
+      name = "kubernix-after-rotation";
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      args = [ "-c" "echo built after rotation > $out" ];
+    }
+  '';
 in
 pkgs.testers.nixosTest {
   name = "kubernix-end-to-end";
@@ -147,6 +159,17 @@ pkgs.testers.nixosTest {
         quarantined = 60;
       };
     };
+
+    # Short-circuited the same way kubernix-gc is above: the test forces
+    # rotations directly rather than waiting out a production cadence, but a
+    # short interval still exercises the service as it would actually run.
+    services.kubernix-rotate-capability-secret = {
+      enable = true;
+      package = kubernix-server;
+      databaseUrl = "postgres://postgres@127.0.0.1:5432/kubernix";
+      interval = 2;
+      retention = 60;
+    };
   };
 
   testScript = ''
@@ -164,6 +187,7 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("kubernix-cache.service")
     machine.wait_for_unit("kubernix-worker.service")
     machine.wait_for_unit("kubernix-gc.service")
+    machine.wait_for_unit("kubernix-rotate-capability-secret.service")
     machine.wait_for_open_port(2222)
     machine.wait_for_open_port(3000)
 
@@ -288,6 +312,45 @@ pkgs.testers.nixosTest {
             f"http://127.0.0.1:3000/{other}/{hash_part}.narinfo"
         ).strip()
         assert status == "404", f"cross-tenant read should 404, got {status}"
+
+
+    with subtest("the capability secret is provisioned and rotates"):
+        # Proves the lazy-create-on-first-use path is actually live (not
+        # skipped): by now `build_derivation` has minted and verified at least
+        # one token, so a row must already exist.
+        before = int(machine.succeed(
+            "psql -U postgres -h 127.0.0.1 kubernix -tAc "
+            "\"SELECT count(*) FROM capability_secrets\""
+        ).strip())
+        assert before >= 1, "a capability secret should already exist by now"
+
+        # Force a second pass rather than waiting out the shortened 2s
+        # interval -- deterministic, and proves rotation actually inserts
+        # rather than being a no-op.
+        machine.succeed(
+            "DATABASE_URL=postgres://postgres@127.0.0.1:5432/kubernix "
+            "${kubernix-server}/bin/kubernix-rotate-capability-secret --once"
+        )
+        after = int(machine.succeed(
+            "psql -U postgres -h 127.0.0.1 kubernix -tAc "
+            "\"SELECT count(*) FROM capability_secrets\""
+        ).strip())
+        assert after > before, f"rotation should insert a new secret, {before} -> {after}"
+
+
+    with subtest("a build still succeeds after the secret rotates"):
+        # The token minted for this build is signed with whatever secret is
+        # now current -- proving mint and verify agree on it across the
+        # rotation forced just above, not only within one secret's lifetime.
+        result = machine.succeed(
+            f"NIX_SSHOPTS='{ssh_opts}' nix -L --plugin-files {plugin} build "
+            f"--store 'local?root=${clientStore}' --max-jobs 0 "
+            f"--builders 'kubernix://root@127.0.0.1?port=2222 x86_64-linux' "
+            f"-f ${afterRotation} --no-link --print-out-paths 2>&1"
+        )
+        out2 = [l for l in result.splitlines() if l.startswith("/nix/store/")][-1].strip()
+        content = machine.succeed(f"cat ${clientStore}{out2}")
+        assert "built after rotation" in content, f"unexpected output: {content}"
 
 
     with subtest("garbage collection removes an aged, unreferenced path"):

@@ -12,7 +12,6 @@ pub mod kubernix_capnp {
     include!(concat!(env!("OUT_DIR"), "/kubernix_capnp.rs"));
 }
 
-mod derivation;
 mod nar_export;
 mod serve;
 mod upload;
@@ -23,19 +22,24 @@ pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
 
 use async_nats::jetstream::{self, consumer::PullConsumer};
 use futures_util::stream::StreamExt;
-use kubernix_types::{ObjectKey, StorePath, TenantId};
+use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId, derivation};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 struct Job {
     job_id: String,
     derivation_path: StorePath,
-    /// Whose build this is. Every artifact key is scoped by it, and the
-    /// frontend signs nothing outside that scope.
+    /// Whose build this is, per the frontend's own claim — not what
+    /// authorizes anything; see `token`.
     tenant: TenantId,
     inputs: Vec<InputRef>,
     /// The derivation itself, shipped inline by `buildDerivation`.
     drv: Vec<u8>,
+    /// The signed capability token minted for this job. Carried opaquely —
+    /// this worker never parses it, only presents it back with every
+    /// upload/download URL request, which is what the frontend actually
+    /// checks a key against. PLAN.md Phase 14.
+    token: CapabilityToken,
 }
 
 /// The output paths a derivation declares.
@@ -73,7 +77,8 @@ async fn fetch_inputs(
     }
 
     let keys: Vec<ObjectKey> = job.inputs.iter().map(|i| i.key.clone()).collect();
-    let urls = upload::request_download_urls(client, &job.job_id, &job.tenant, &keys).await?;
+    let urls =
+        upload::request_download_urls(client, &job.job_id, &job.token, &keys).await?;
 
     for (input, url) in job.inputs.iter().zip(urls) {
         tracing::info!(job_id = %job.job_id, path = %input.store_path, "importing input");
@@ -271,6 +276,7 @@ fn decode_job(payload: &[u8]) -> Result<Job, Box<dyn std::error::Error>> {
         tenant,
         inputs,
         drv: request.get_drv()?.to_vec(),
+        token: CapabilityToken::new(request.get_token()?.to_vec()),
     })
 }
 
@@ -313,7 +319,8 @@ async fn upload_artifacts(
         );
     }
 
-    let urls = upload::request_upload_urls(client, &job.job_id, &job.tenant, &keys).await?;
+    let urls =
+        upload::request_upload_urls(client, &job.job_id, &job.token, &keys).await?;
 
     // An empty log is possible — a build that printed nothing — and some S3
     // implementations reject a zero-length PUT outright. Losing the whole job

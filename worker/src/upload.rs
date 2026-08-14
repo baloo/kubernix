@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256, digest::Output};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use kubernix_types::{ObjectKey, StorePath, TenantId};
+use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId};
 
 use crate::kubernix_capnp;
 
@@ -52,10 +52,10 @@ pub fn log_key(tenant: &TenantId, drv_path: &StorePath) -> Option<ObjectKey> {
 pub async fn request_upload_urls(
     client: &async_nats::Client,
     job_id: &str,
-    tenant: &TenantId,
+    token: &CapabilityToken,
     keys: &[ObjectKey],
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    request_urls(client, job_id, tenant, keys, false).await
+    request_urls(client, job_id, token, keys, false).await
 }
 
 /// Ask the frontend to pre-sign the given keys for download.
@@ -66,16 +66,16 @@ pub async fn request_upload_urls(
 pub async fn request_download_urls(
     client: &async_nats::Client,
     job_id: &str,
-    tenant: &TenantId,
+    token: &CapabilityToken,
     keys: &[ObjectKey],
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    request_urls(client, job_id, tenant, keys, true).await
+    request_urls(client, job_id, token, keys, true).await
 }
 
 async fn request_urls(
     client: &async_nats::Client,
     job_id: &str,
-    tenant: &TenantId,
+    token: &CapabilityToken,
     keys: &[ObjectKey],
     download: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -84,7 +84,9 @@ async fn request_urls(
         let mut request = message.init_root::<kubernix_capnp::upload_url_request::Builder>();
         request.set_job_id(job_id);
         request.set_download(download);
-        request.set_tenant(tenant.as_str());
+        // The frontend authorizes this request entirely from `token` — there
+        // is no separate wire `tenant` field, per PLAN.md Phase 14.
+        request.set_token(token.as_bytes());
         let mut list = request.reborrow().init_keys(keys.len() as u32);
         for (i, key) in keys.iter().enumerate() {
             list.set(i as u32, key.as_str());

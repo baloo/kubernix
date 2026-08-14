@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use kubernix_types::{StorePath, System};
+use crate::{StorePath, System};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {

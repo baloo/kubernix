@@ -33,10 +33,14 @@ struct BuildRequest {
   # The serialized derivation, so the worker need not already have it.
   drv            @4 :Data;
   inputs         @5 :List(InputRef);
-  # Whose build this is. Every object key the worker reads or writes for this
-  # job lives under this prefix, and the frontend refuses to sign anything
-  # outside it.
+  # Whose build this is, per the worker's own claim -- informational only
+  # (logging/debugging), never trusted: see `token` below.
   tenant         @6 :Text;
+  # The signed capability token for this job -- a JWT's UTF-8 bytes, HMAC'd by
+  # the frontend (`server/src/capability.rs`). The worker carries this opaquely
+  # and hands it back with every upload/download URL request; it never needs
+  # to parse it. PLAN.md Phase 14.
+  token          @7 :Data;
 }
 
 struct BuildResponse {
@@ -88,10 +92,12 @@ struct UploadUrlRequest {
   # When set, sign GETs instead of PUTs -- the same capability model in the
   # other direction, used to fetch staged inputs.
   download @2 :Bool;
-  # The tenant of the job being run. Every requested key must sit under this
-  # prefix or the whole request is refused, so a worker cannot reach another
-  # tenant's artifacts even though it holds no credentials of its own.
-  tenant @3 :Text;
+  # The signed capability token minted for this job -- see `BuildRequest.token`.
+  # This is the sole source of the tenant a request is authorized for: there
+  # is no separate wire `tenant` field to trust or mistrust, so the frontend
+  # logs the tenant it verifies out of this token rather than a claim carried
+  # alongside it -- PLAN.md Phase 14.
+  token @3 :Data;
 }
 
 struct UploadUrlResponse {

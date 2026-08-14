@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_nats::jetstream::{self, consumer::pull, stream::RetentionPolicy};
 use futures_util::StreamExt;
-use kubernix_types::{ObjectKey, StorePath, System};
+use kubernix_types::{CapabilityToken, ObjectKey, StorePath, System};
 use sha2::{Sha256, digest::Output};
 use uuid::Uuid;
 
@@ -58,11 +58,16 @@ pub struct BuildJob {
     pub drv: Vec<u8>,
     /// Inputs staged to the object store for this build.
     pub inputs: Vec<InputRef>,
-    /// Whose build this is.
-    ///
-    /// Travels with the job because the worker needs it to ask for pre-signed
-    /// URLs: the frontend grants keys under this tenant and refuses the rest.
+    /// Whose build this is, per the dispatcher's own record — not what
+    /// authorizes anything by itself; see `token`.
     pub tenant: TenantId,
+    /// The signed capability token minted for this job
+    /// (`crate::capability::Capability`). The worker carries this opaquely
+    /// and presents it back with every upload/download URL request; it is
+    /// what `uploads.rs` and `record_outputs` actually check, rather than
+    /// trusting `tenant` or a worker-reported `OutputInfo.store_path` at face
+    /// value. PLAN.md Phase 14.
+    pub token: CapabilityToken,
 }
 
 /// Per-output metadata the worker reports, which is what `narinfo` is generated
@@ -178,6 +183,7 @@ impl JobQueue {
             req.set_system(job.system.as_str());
             req.set_drv(&job.drv);
             req.set_tenant(job.tenant.as_str());
+            req.set_token(job.token.as_bytes());
 
             let mut inputs = req.reborrow().init_inputs(job.inputs.len() as u32);
             for (i, input) in job.inputs.iter().enumerate() {

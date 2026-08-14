@@ -36,7 +36,24 @@ pub struct PostgresStore {
     // (advisory lock, drain/mark/sweep) directly against the pool, which is
     // GC-specific enough that it does not belong on the `Store` trait.
     pub(crate) pool: PgPool,
+    /// In-process cache over `capability_secrets`, so minting/verifying a
+    /// token is not a database round trip on every request. Global rather
+    /// than per-tenant, like the table itself.
+    capability_secrets: tokio::sync::Mutex<CapabilitySecretCache>,
 }
+
+/// Positive cache for capability secrets. Safe to hold stale for a while:
+/// `current` merely delays picking up a rotation by up to
+/// [`CAPABILITY_SECRET_CACHE_TTL`], and `by_kid` entries never change once a
+/// row exists (a `kid` is never reused), so a cached-but-since-deleted secret
+/// is only ever a little more lenient than the database, never less.
+#[derive(Default)]
+struct CapabilitySecretCache {
+    current: Option<(std::time::Instant, u64, [u8; 32])>,
+    by_kid: std::collections::HashMap<u64, [u8; 32]>,
+}
+
+const CAPABILITY_SECRET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `/nix/store/<32-char hash>-<name>` → `<32-char hash>`.
 ///
@@ -89,7 +106,10 @@ impl PostgresStore {
             .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
 
         tracing::info!("database ready");
-        Ok(Arc::new(Self { pool }))
+        Ok(Arc::new(Self {
+            pool,
+            capability_secrets: tokio::sync::Mutex::new(CapabilitySecretCache::default()),
+        }))
     }
 
     /// Record a tenant so the foreign keys on `store_paths` and `jobs` resolve.
@@ -500,6 +520,98 @@ impl Store for PostgresStore {
                 None
             }
         }
+    }
+
+    async fn current_capability_secret(&self) -> (u64, [u8; 32]) {
+        {
+            let cache = self.capability_secrets.lock().await;
+            if let Some((fetched_at, kid, secret)) = cache.current
+                && fetched_at.elapsed() < CAPABILITY_SECRET_CACHE_TTL
+            {
+                return (kid, secret);
+            }
+        }
+
+        let found = sqlx::query("SELECT kid, secret FROM capability_secrets ORDER BY kid DESC LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "could not read the current capability secret");
+                None
+            })
+            .and_then(|row| {
+                let kid: i64 = row.get("kid");
+                let secret: Vec<u8> = row.get("secret");
+                secret
+                    .try_into()
+                    .ok()
+                    .map(|secret: [u8; 32]| (kid as u64, secret))
+            });
+
+        let (kid, secret) = match found {
+            Some(found) => found,
+            // Nothing usable yet -- lazily mint the first one, the same way
+            // `signer()` establishes a tenant's key on first use. A concurrent
+            // replica may race this; the extra row is harmless, since the next
+            // read just picks whichever now has the higher `kid`.
+            None => {
+                let secret: [u8; 32] = rand::random();
+                match sqlx::query("INSERT INTO capability_secrets (secret) VALUES ($1) RETURNING kid")
+                    .bind(secret.as_slice())
+                    .fetch_one(&self.pool)
+                    .await
+                {
+                    Ok(row) => (row.get::<i64, _>("kid") as u64, secret),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not persist a capability secret; using a process-local one \
+                             until the database is reachable again"
+                        );
+                        // A `kid` above `i64::MAX` can never collide with a real
+                        // `BIGSERIAL` row, so this is unambiguously
+                        // non-persistent: no other replica (and not even this
+                        // one, after the cache below expires and a fresh
+                        // database read succeeds) will ever resolve it.
+                        let ephemeral_kid = 0x8000_0000_0000_0000u64 | u64::from(rand::random::<u32>());
+                        (ephemeral_kid, secret)
+                    }
+                }
+            }
+        };
+
+        let mut cache = self.capability_secrets.lock().await;
+        cache.current = Some((std::time::Instant::now(), kid, secret));
+        cache.by_kid.insert(kid, secret);
+        (kid, secret)
+    }
+
+    async fn capability_secret(&self, kid: u64) -> Option<[u8; 32]> {
+        {
+            let cache = self.capability_secrets.lock().await;
+            if let Some(secret) = cache.by_kid.get(&kid) {
+                return Some(*secret);
+            }
+        }
+
+        // `kid` values above `i64::MAX` are process-local fallbacks (see
+        // `current_capability_secret`) and never stored, so do not round-trip
+        // through Postgres for one -- it cannot possibly be there.
+        let kid_i64 = i64::try_from(kid).ok()?;
+        let row = sqlx::query("SELECT secret FROM capability_secrets WHERE kid = $1")
+            .bind(kid_i64)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, kid, "could not look up a capability secret");
+                None
+            })?;
+        let secret: Vec<u8> = row.get("secret");
+        let secret: [u8; 32] = secret.try_into().ok()?;
+
+        let mut cache = self.capability_secrets.lock().await;
+        cache.by_kid.insert(kid, secret);
+        Some(secret)
     }
 
     async fn tier(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier> {

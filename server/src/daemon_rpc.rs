@@ -27,7 +27,7 @@ use crate::store_path::{CaMethod, ContentAddress};
 use crate::tenant::{Tenant, TenantId};
 use crate::uploads::UploadSigner;
 use futures_util::StreamExt;
-use kubernix_types::{StorePath, System};
+use kubernix_types::{StorePath, System, derivation};
 use uuid::Uuid;
 
 /// The identifier Lix asks for is `"lix/legacy/" PACKAGE_VERSION`, so it varies
@@ -153,7 +153,35 @@ async fn realise(
 /// Register built outputs so subsequent `queryPathInfo` / `narFromPath` calls
 /// resolve. The worker uploaded the NARs; what it reported is the metadata the
 /// frontend could not compute for itself.
-async fn record_outputs(store: &dyn Store, tenant: &TenantId, infos: &[crate::jobs::OutputInfo]) {
+///
+/// `expected_outputs` is the same set the job's capability token authorized
+/// (PLAN.md Phase 14) — every reported `store_path` must be in it. All or
+/// nothing: a worker reporting even one path outside its job's verified set
+/// is not a partially-trustworthy outcome, so nothing from the batch is
+/// recorded — see `build_derivation`'s caller, which downgrades the build's
+/// reported status accordingly rather than telling the client it succeeded.
+async fn record_outputs(
+    store: &dyn Store,
+    tenant: &TenantId,
+    infos: &[crate::jobs::OutputInfo],
+    expected_outputs: &[(String, StorePath)],
+) -> Result<(), Vec<StorePath>> {
+    let allowed: std::collections::HashSet<&StorePath> =
+        expected_outputs.iter().map(|(_, path)| path).collect();
+
+    let bogus: Vec<StorePath> = infos
+        .iter()
+        .filter(|info| !allowed.contains(&info.store_path))
+        .map(|info| info.store_path.clone())
+        .collect();
+    if !bogus.is_empty() {
+        tracing::error!(
+            %tenant, ?bogus,
+            "worker reported outputs outside its job's verified set; refusing to record any of them"
+        );
+        return Err(bogus);
+    }
+
     for info in infos {
         let mut path_info = PathInfo {
             path: info.store_path.clone(),
@@ -188,6 +216,7 @@ async fn record_outputs(store: &dyn Store, tenant: &TenantId, infos: &[crate::jo
             tracing::error!(path = %info.store_path, error = %e, "could not record built output");
         }
     }
+    Ok(())
 }
 
 /// Sign a path, if the frontend is willing to vouch for it.
@@ -292,6 +321,15 @@ fn store_err(e: StoreError) -> capnp::Error {
         StoreError::Unsupported(op) => rpc_error::unimplemented(op.to_string()),
         other => rpc_error::failed(other.to_string()),
     }
+}
+
+/// A `.drv`'s own name, with the trailing `.drv` stripped — mirrors Nix's
+/// `Derivation::nameFromPath`. Used to recompute a fixed output's path
+/// independent of whatever the `.drv` itself claims
+/// ([`crate::store_path::verify_fixed_output`]).
+fn derivation_name(drv_path: &StorePath) -> &str {
+    let name = drv_path.name().unwrap_or_default();
+    name.strip_suffix(".drv").unwrap_or(name)
 }
 
 /// `StorePath.raw` carries the full printed path (`types-rpc.hh:25-38`).
@@ -1174,6 +1212,46 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             let path = read_store_path(params.get_path()?)?;
             let drv = params.get_drv()?.to_vec();
 
+            // Recompute, rather than trust, every fixed-output path this
+            // derivation declares — mirroring how a real Nix daemon handles
+            // `CAFixed` outputs. Input-addressed outputs (`algo` empty) are not
+            // checked here: the resolved form this server receives cannot
+            // reproduce `hashDerivationModulo`, and real Nix does not attempt
+            // it at this boundary either (PLAN.md Phase 14). Either way, what
+            // this loop settles on for each output is exactly what the job's
+            // capability token will authorize below.
+            let parsed = derivation::parse(&drv)
+                .map_err(|e| rpc_error::failed(format!("kubernix: malformed derivation: {e}")))?;
+            let drv_name = derivation_name(&path);
+            let store_dir = path.store_dir().unwrap_or("/nix/store");
+            let mut expected_outputs = Vec::with_capacity(parsed.outputs.len());
+            for output in &parsed.outputs {
+                let verified_path = if output.algo.is_empty() {
+                    output.path.clone()
+                } else {
+                    crate::store_path::verify_fixed_output(
+                        drv_name,
+                        &output.name,
+                        &output.algo,
+                        &output.hash,
+                        store_dir,
+                    )
+                    .ok_or_else(|| {
+                        tracing::warn!(
+                            %path, output = %output.name,
+                            "refusing a fixed output whose declared path does not match its \
+                             content address"
+                        );
+                        rpc_error::failed(format!(
+                            "kubernix: fixed output '{}' of {path} does not match its declared \
+                             content address",
+                            output.name
+                        ))
+                    })?
+                };
+                expected_outputs.push((output.name.clone(), verified_path));
+            }
+
             let Some(queue) = queue else {
                 tracing::warn!(%path, "build requested but no job queue is configured");
                 return Err(rpc_error::unimplemented(format!(
@@ -1182,6 +1260,20 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             };
 
             let job_id = Uuid::new_v4();
+
+            // Minted here rather than left implicit: this is the one place
+            // that knows both the tenant this connection has authenticated as
+            // and the output paths just independently verified above, so it
+            // is the only place that can state the job's capability honestly.
+            let capability = crate::capability::Capability {
+                job_id,
+                tenant: tenant.clone(),
+                derivation_path: path.clone(),
+                expected_outputs,
+            };
+            let (kid, secret) = store.current_capability_secret().await;
+            let token = capability.sign(kid, &secret);
+
             let job = BuildJob {
                 job_id,
                 derivation_path: path.clone(),
@@ -1189,6 +1281,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 drv,
                 inputs: staged,
                 tenant: tenant.clone(),
+                token,
             };
 
             let outcome = dispatch(&queue, job, &logger)
@@ -1206,9 +1299,34 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     infos,
                     log_key,
                 } => {
-                    tracing::info!(%path, ?outputs, %log_key, "build succeeded");
-                    record_outputs(&*store, &tenant, &infos).await;
-                    result.set_status(legacy_protocol::build_result::Status::Built);
+                    match record_outputs(&*store, &tenant, &infos, &capability.expected_outputs)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(%path, ?outputs, %log_key, "build succeeded");
+                            result.set_status(legacy_protocol::build_result::Status::Built);
+                        }
+                        Err(bogus) => {
+                            // The build ran, but reported outputs this job was
+                            // never dispatched to produce — nothing was
+                            // recorded, so the client must not be told it
+                            // succeeded (PLAN.md Phase 14).
+                            tracing::warn!(%path, ?bogus, %log_key, "build outcome refused: unverified outputs");
+                            result.set_status(legacy_protocol::build_result::Status::PermanentFailure);
+                            result.set_error_msg(
+                                format!(
+                                    "kubernix: worker reported output(s) outside this job's \
+                                     verified set: {}",
+                                    bogus
+                                        .iter()
+                                        .map(StorePath::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                    }
                 }
                 JobOutcome::Failed { message, log_key } => {
                     tracing::warn!(%path, %message, %log_key, "build failed");
@@ -1627,5 +1745,56 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    fn output_info(path: &str, key: &str) -> crate::jobs::OutputInfo {
+        crate::jobs::OutputInfo {
+            store_path: StorePath::new(path),
+            nar_hash: Default::default(),
+            nar_size: 0,
+            file_hash: Default::default(),
+            file_size: 0,
+            key: kubernix_types::ObjectKey::new(key),
+            compression: "zstd".to_string(),
+            references: Vec::new(),
+            deriver: None,
+        }
+    }
+
+    const OTHER: &str = "/nix/store/22222222222222222222222222222222-unrelated";
+
+    #[tokio::test]
+    async fn record_outputs_records_a_fully_verified_batch() {
+        let store = MemoryStore::new();
+        let t = tenant();
+        let expected = vec![("out".to_string(), StorePath::new(OUT))];
+
+        record_outputs(&*store, &t, &[output_info(OUT, "k")], &expected)
+            .await
+            .expect("every reported output is in the verified set");
+
+        assert!(store.is_valid_path(&t, &StorePath::new(OUT)).await);
+    }
+
+    #[tokio::test]
+    async fn record_outputs_is_all_or_nothing_on_a_bogus_report() {
+        // PLAN.md Phase 14: a worker reporting even one output outside its
+        // job's verified set must not get any of that batch recorded —
+        // including the output that *was* legitimate.
+        let store = MemoryStore::new();
+        let t = tenant();
+        let expected = vec![("out".to_string(), StorePath::new(OUT))];
+        let infos = [output_info(OUT, "k1"), output_info(OTHER, "k2")];
+
+        let rejected = record_outputs(&*store, &t, &infos, &expected)
+            .await
+            .expect_err("a bogus output should refuse the whole batch");
+        assert_eq!(rejected, vec![StorePath::new(OTHER)]);
+
+        assert!(
+            !store.is_valid_path(&t, &StorePath::new(OUT)).await,
+            "the legitimate output must not be recorded alongside the bogus one"
+        );
+        assert!(!store.is_valid_path(&t, &StorePath::new(OTHER)).await);
     }
 }

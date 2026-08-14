@@ -29,11 +29,13 @@ pub mod kubernix_capnp {
     include!(concat!(env!("OUT_DIR"), "/kubernix_capnp.rs"));
 }
 
+pub mod capability;
 pub mod daemon_rpc;
 pub mod gc;
 pub mod http;
 pub mod jobs;
 pub mod postgres_store;
+pub mod rotate;
 pub mod rpc_error;
 pub mod ssh;
 pub mod store;
