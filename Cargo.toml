@@ -17,10 +17,13 @@ async-trait = "0.1.92"
 aws-config = "1.10.1"
 aws-sdk-s3 = "1.140"
 capnp = { version = "0.27", features = ["alloc", "std"] }
+color-eyre = "0.6.5"
 digest-io = { version = "0.1.0", features = ["tokio"] }
 ed25519-dalek = { version = "3", features = ["digest", "rand_core"] }
+eyre = "0.6.14"
 futures-util = "0.3.33"
 sha2 = "0.11"
+thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tracing = "0.1.44"

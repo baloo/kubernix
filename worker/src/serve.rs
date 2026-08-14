@@ -24,6 +24,7 @@
 
 use std::process::Stdio;
 
+use eyre::{Context as _, OptionExt as _, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
@@ -83,10 +84,7 @@ pub struct ServeConnection {
 
 impl ServeConnection {
     /// Spawn `nix-store --serve --write` and exchange greetings.
-    pub async fn open(
-        nix_store: &str,
-        store_uri: Option<&str>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn open(nix_store: &str, store_uri: Option<&str>) -> eyre::Result<Self> {
         let mut command = Command::new(nix_store);
         command.arg("--serve").arg("--write");
         // Without this the build log never reaches us. `getBuildSettings` on the
@@ -104,25 +102,34 @@ impl ServeConnection {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
+            .spawn()
+            .wrap_err_with(|| format!("spawning {nix_store} --serve"))?;
 
-        let mut stdin = child.stdin.take().ok_or("no stdin")?;
-        let mut stdout = child.stdout.take().ok_or("no stdout")?;
+        let mut stdin = child.stdin.take().ok_or_eyre("no stdin")?;
+        let mut stdout = child.stdout.take().ok_or_eyre("no stdout")?;
         let stderr = child.stderr.take();
 
         // The client writes both words before reading; the server answers with
         // its own pair. See `lix/legacy/nix-store.cc:933`.
-        write_u64(&mut stdin, MAGIC_1).await?;
-        write_u64(&mut stdin, PROTOCOL_VERSION).await?;
-        stdin.flush().await?;
+        write_u64(&mut stdin, MAGIC_1)
+            .await
+            .wrap_err("writing the serve protocol greeting")?;
+        write_u64(&mut stdin, PROTOCOL_VERSION)
+            .await
+            .wrap_err("writing the serve protocol greeting")?;
+        stdin.flush().await.wrap_err("flushing the greeting")?;
 
-        let magic = read_u64(&mut stdout).await?;
+        let magic = read_u64(&mut stdout)
+            .await
+            .wrap_err("reading the serve protocol greeting")?;
         if magic != MAGIC_2 {
-            return Err(format!("serve protocol mismatch: got {magic:#x}").into());
+            bail!("serve protocol mismatch: got {magic:#x}");
         }
-        let remote_version = read_u64(&mut stdout).await?;
+        let remote_version = read_u64(&mut stdout)
+            .await
+            .wrap_err("reading the serve protocol version")?;
         if remote_version & 0xff00 != PROTOCOL_VERSION & 0xff00 {
-            return Err(format!("unsupported serve protocol version {remote_version:#x}").into());
+            bail!("unsupported serve protocol version {remote_version:#x}");
         }
 
         tracing::debug!(
@@ -141,44 +148,58 @@ impl ServeConnection {
     ///
     /// `drv` is passed through byte for byte: it is already `serializeDerivation`
     /// output, which is exactly what the far side's `readDerivation` expects.
-    pub async fn build_derivation(
-        &mut self,
-        drv_path: &str,
-        drv: &[u8],
-    ) -> Result<BuildOutcome, Box<dyn std::error::Error>> {
-        write_u64(&mut self.stdin, CMD_BUILD_DERIVATION).await?;
-        write_str(&mut self.stdin, drv_path.as_bytes()).await?;
-        self.stdin.write_all(drv).await?;
+    pub async fn build_derivation(&mut self, drv_path: &str, drv: &[u8]) -> eyre::Result<BuildOutcome> {
+        write_u64(&mut self.stdin, CMD_BUILD_DERIVATION)
+            .await
+            .wrap_err("sending the build command")?;
+        write_str(&mut self.stdin, drv_path.as_bytes())
+            .await
+            .wrap_err("sending the derivation path")?;
+        self.stdin
+            .write_all(drv)
+            .await
+            .wrap_err("sending the derivation")?;
 
         // `getBuildSettings` on the far side reads these unconditionally, in
         // this order (`nix-store.cc:952`). Omitting one desynchronises the
         // stream rather than being ignored.
-        write_u64(&mut self.stdin, 0).await?; // maxSilentTime: no limit
-        write_u64(&mut self.stdin, 0).await?; // buildTimeout: no limit
-        write_u64(&mut self.stdin, 0).await?; // maxLogSize: no limit
-        write_u64(&mut self.stdin, 0).await?; // buildRepeat, unsupported upstream
-        write_u64(&mut self.stdin, 0).await?; // enforceDeterminism, ignored
-        write_u64(&mut self.stdin, 0).await?; // keepFailed (minor >= 7)
-        self.stdin.flush().await?;
+        let settings = async {
+            write_u64(&mut self.stdin, 0).await?; // maxSilentTime: no limit
+            write_u64(&mut self.stdin, 0).await?; // buildTimeout: no limit
+            write_u64(&mut self.stdin, 0).await?; // maxLogSize: no limit
+            write_u64(&mut self.stdin, 0).await?; // buildRepeat, unsupported upstream
+            write_u64(&mut self.stdin, 0).await?; // enforceDeterminism, ignored
+            write_u64(&mut self.stdin, 0).await?; // keepFailed (minor >= 7)
+            self.stdin.flush().await
+        };
+        settings.await.wrap_err("sending build settings")?;
 
-        let status = read_u64(&mut self.stdout).await?;
-        let error_msg = read_string(&mut self.stdout).await?;
+        let status = read_u64(&mut self.stdout)
+            .await
+            .wrap_err("reading the build status")?;
+        let error_msg = read_string(&mut self.stdout)
+            .await
+            .wrap_err("reading the build error message")?;
 
         // Protocol 2.7 always carries these; reading them keeps the stream in
         // step even though we only report status and message.
-        let _times_built = read_u64(&mut self.stdout).await?;
-        let _non_deterministic = read_u64(&mut self.stdout).await?;
-        let _start_time = read_u64(&mut self.stdout).await?;
-        let _stop_time = read_u64(&mut self.stdout).await?;
+        let drained = async {
+            read_u64(&mut self.stdout).await?; // times built
+            read_u64(&mut self.stdout).await?; // non-deterministic
+            read_u64(&mut self.stdout).await?; // start time
+            read_u64(&mut self.stdout).await?; // stop time
 
-        // `builtOutputs`, a map of realisations. Empty for input-addressed
-        // derivations, which is everything we build today — but it has to be
-        // drained regardless.
-        let realisations = read_u64(&mut self.stdout).await?;
-        for _ in 0..realisations {
-            read_string(&mut self.stdout).await?; // DrvOutput
-            read_string(&mut self.stdout).await?; // Realisation
-        }
+            // `builtOutputs`, a map of realisations. Empty for input-addressed
+            // derivations, which is everything we build today — but it has to
+            // be drained regardless.
+            let realisations = read_u64(&mut self.stdout).await?;
+            for _ in 0..realisations {
+                read_string(&mut self.stdout).await?; // DrvOutput
+                read_string(&mut self.stdout).await?; // Realisation
+            }
+            std::io::Result::Ok(())
+        };
+        drained.await.wrap_err("draining the build result")?;
 
         Ok(BuildOutcome { status, error_msg })
     }
@@ -187,9 +208,9 @@ impl ServeConnection {
     ///
     /// Dropping stdin is what tells `nix-store --serve` to exit: it reads
     /// commands until EOF.
-    pub async fn close(mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn close(mut self) -> eyre::Result<()> {
         drop(self.stdin);
-        let status = self.child.wait().await?;
+        let status = self.child.wait().await.wrap_err("waiting for nix-store --serve")?;
         if !status.success() {
             tracing::warn!(?status, "nix-store --serve exited non-zero");
         }

@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use eyre::{Context as _, OptionExt as _};
 use kubernix_server::postgres_store::PostgresStore;
 use kubernix_server::rotate;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,7 +38,8 @@ fn env_secs(name: &str, default: Duration) -> Duration {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> color_eyre::eyre::Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -47,8 +49,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let database_url = std::env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL must be set - nothing to rotate without it")?;
-    let store = PostgresStore::connect(&database_url).await?;
+        .ok()
+        .ok_or_eyre("DATABASE_URL must be set - nothing to rotate without it")?;
+    let store = PostgresStore::connect(&database_url)
+        .await
+        .wrap_err("connecting to PostgreSQL")?;
 
     let interval = env_secs("KUBERNIX_ROTATE_INTERVAL", Duration::from_secs(6 * 3600));
     let retention = env_secs("KUBERNIX_ROTATE_RETENTION", Duration::from_secs(24 * 3600));

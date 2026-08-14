@@ -24,7 +24,8 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> color_eyre::eyre::Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -59,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rpc_system = RpcSystem::new(Box::new(network), Some(bootstrap.client));
 
             rpc_system.await?;
-            Ok::<_, Box<dyn std::error::Error>>(())
+            color_eyre::eyre::Result::<()>::Ok(())
         })
         .await?;
 

@@ -261,7 +261,7 @@ impl Handler for SshHandler {
 }
 
 /// Serve the daemon protocol over one bidirectional stream.
-async fn serve_rpc<S>(stream: S, config: RpcConfig) -> Result<(), Box<dyn std::error::Error>>
+async fn serve_rpc<S>(stream: S, config: RpcConfig) -> eyre::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
 {

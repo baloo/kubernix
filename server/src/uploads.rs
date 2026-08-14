@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3::presigning::PresigningConfig;
+use eyre::Context as _;
 use futures_util::StreamExt;
 
+use kubernix_types::errors::public_message;
 use kubernix_types::{CapabilityToken, ObjectKey};
 
 use crate::capability::Capability;
@@ -96,7 +98,7 @@ pub struct UploadSigner {
 }
 
 impl UploadSigner {
-    pub async fn from_env() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn from_env() -> eyre::Result<Self> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "kubernix-cache".to_string());
 
@@ -126,11 +128,7 @@ impl UploadSigner {
     /// Write an object directly. Used for inputs, which arrive at the frontend
     /// over the daemon connection — the frontend already holds the bytes and the
     /// credentials, so there is nothing to delegate.
-    pub async fn put_object(
-        &self,
-        key: &ObjectKey,
-        body: Vec<u8>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn put_object(&self, key: &ObjectKey, body: Vec<u8>) -> eyre::Result<()> {
         let len = body.len();
         self.s3
             .put_object()
@@ -138,22 +136,21 @@ impl UploadSigner {
             .key(key.as_str())
             .body(body.into())
             .send()
-            .await?;
+            .await
+            .wrap_err_with(|| format!("uploading {key}"))?;
         tracing::debug!(%key, bytes = len, "uploaded object");
         Ok(())
     }
 
-    pub async fn presign_put(
-        &self,
-        key: &ObjectKey,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn presign_put(&self, key: &ObjectKey) -> eyre::Result<String> {
         let presigned = self
             .s3
             .put_object()
             .bucket(&self.bucket)
             .key(key.as_str())
-            .presigned(PresigningConfig::expires_in(URL_TTL)?)
-            .await?;
+            .presigned(PresigningConfig::expires_in(URL_TTL).wrap_err("building presign config")?)
+            .await
+            .wrap_err_with(|| format!("presigning an upload for {key}"))?;
         Ok(presigned.uri().to_string())
     }
 
@@ -165,15 +162,15 @@ impl UploadSigner {
     pub async fn get_object_reader(
         &self,
         key: &ObjectKey,
-    ) -> Result<impl tokio::io::AsyncRead + Unpin + Send, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> eyre::Result<impl tokio::io::AsyncRead + Unpin + Send> {
         let object = self
             .s3
             .get_object()
             .bucket(&self.bucket)
             .key(key.as_str())
             .send()
-            .await?;
+            .await
+            .wrap_err_with(|| format!("fetching {key}"))?;
         Ok(object.body.into_async_read())
     }
 
@@ -181,18 +178,21 @@ impl UploadSigner {
     ///
     /// Only for things known to be small — a build log. Artifacts should use
     /// [`Self::get_object_reader`].
-    pub async fn get_object(
-        &self,
-        key: &ObjectKey,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_object(&self, key: &ObjectKey) -> eyre::Result<Vec<u8>> {
         let object = self
             .s3
             .get_object()
             .bucket(&self.bucket)
             .key(key.as_str())
             .send()
-            .await?;
-        let bytes = object.body.collect().await?.into_bytes();
+            .await
+            .wrap_err_with(|| format!("fetching {key}"))?;
+        let bytes = object
+            .body
+            .collect()
+            .await
+            .wrap_err_with(|| format!("reading {key}"))?
+            .into_bytes();
         tracing::debug!(%key, bytes = bytes.len(), "fetched object");
         Ok(bytes.to_vec())
     }
@@ -204,33 +204,29 @@ impl UploadSigner {
     /// already-absent key is not an error), which matters here: a sweep that
     /// crashed after deleting the object but before deleting its `objects`
     /// row will call this again on retry, and that must not fail.
-    pub async fn delete_object(
-        &self,
-        key: &ObjectKey,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn delete_object(&self, key: &ObjectKey) -> eyre::Result<()> {
         self.s3
             .delete_object()
             .bucket(&self.bucket)
             .key(key.as_str())
             .send()
-            .await?;
+            .await
+            .wrap_err_with(|| format!("deleting {key}"))?;
         tracing::debug!(%key, "deleted object");
         Ok(())
     }
 
     /// The same capability model in the read direction: workers fetch staged
     /// inputs with these rather than holding credentials.
-    pub async fn presign_get(
-        &self,
-        key: &ObjectKey,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn presign_get(&self, key: &ObjectKey) -> eyre::Result<String> {
         let presigned = self
             .s3
             .get_object()
             .bucket(&self.bucket)
             .key(key.as_str())
-            .presigned(PresigningConfig::expires_in(URL_TTL)?)
-            .await?;
+            .presigned(PresigningConfig::expires_in(URL_TTL).wrap_err("building presign config")?)
+            .await
+            .wrap_err_with(|| format!("presigning a download for {key}"))?;
         Ok(presigned.uri().to_string())
     }
 
@@ -239,14 +235,11 @@ impl UploadSigner {
     /// Uses a queue group so that with several frontends exactly one answers
     /// each request. `store` is consulted for every request's capability
     /// secret — see [`Capability::verify`] — never for anything else here.
-    pub async fn serve(
-        self,
-        client: async_nats::Client,
-        store: Arc<dyn Store>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn serve(self, client: async_nats::Client, store: Arc<dyn Store>) -> eyre::Result<()> {
         let mut requests = client
             .queue_subscribe(UPLOADS_SUBJECT, "kubernix-frontends".to_string())
-            .await?;
+            .await
+            .wrap_err_with(|| format!("subscribing to {UPLOADS_SUBJECT}"))?;
 
         tracing::info!(subject = UPLOADS_SUBJECT, "serving upload url requests");
 
@@ -327,7 +320,7 @@ impl UploadSigner {
             } else {
                 self.presign_put(key).await
             }
-            .map_err(|e| format!("presigning {key}: {e}"))?;
+            .map_err(to_worker_error)?;
             urls.push(url);
         }
 
@@ -340,6 +333,20 @@ impl UploadSigner {
         );
         Ok(urls)
     }
+}
+
+/// Turn an internal error into what a worker sees over the wire.
+///
+/// The worker is a trusted internal component, not the Nix end user, but the
+/// same discipline applies: an S3 error's text (bucket names, request ids)
+/// stays in the server's own log, and the worker gets a message it can act
+/// on — retry, or give up and report its own generic failure upstream.
+fn to_worker_error(report: eyre::Report) -> String {
+    if let Some(message) = public_message(&report) {
+        return message;
+    }
+    tracing::error!(error = ?report, "internal error handling an upload-url request");
+    "internal error; see server logs".to_string()
 }
 
 type UrlRequest = (String, Vec<ObjectKey>, bool, CapabilityToken);
@@ -411,6 +418,28 @@ mod tests {
     /// `<tenant>/<suffix>`, as the frontend and worker both build them.
     fn key(t: &TenantId, suffix: &str) -> ObjectKey {
         ObjectKey::new(format!("{t}/{suffix}"))
+    }
+
+    mod to_worker_error_tests {
+        use super::*;
+        use kubernix_types::errors::Public;
+
+        #[test]
+        fn an_opaque_internal_error_is_not_leaked() {
+            let io_err = std::io::Error::other("SignatureDoesNotMatch: bucket=kubernix-cache");
+            let report = eyre::Report::new(io_err).wrap_err("presigning an upload");
+            let message = to_worker_error(report);
+            assert!(
+                !message.contains("SignatureDoesNotMatch") && !message.contains("kubernix-cache"),
+                "internal detail leaked into a worker-facing message: {message}"
+            );
+        }
+
+        #[test]
+        fn a_public_marked_cause_passes_through_verbatim() {
+            let report: eyre::Report = Public::new("key not permitted").into();
+            assert_eq!(to_worker_error(report), "key not permitted");
+        }
     }
 
     #[test]

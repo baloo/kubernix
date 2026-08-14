@@ -8,6 +8,7 @@ use std::process::Stdio;
 
 use async_compression::tokio::write::ZstdEncoder;
 use digest_io::{HashReader, HashWriter};
+use eyre::{Context as _, OptionExt as _, bail};
 use sha2::{Digest, Sha256, digest::Output};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -54,7 +55,7 @@ pub async fn request_upload_urls(
     job_id: &str,
     token: &CapabilityToken,
     keys: &[ObjectKey],
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> eyre::Result<Vec<String>> {
     request_urls(client, job_id, token, keys, false).await
 }
 
@@ -68,7 +69,7 @@ pub async fn request_download_urls(
     job_id: &str,
     token: &CapabilityToken,
     keys: &[ObjectKey],
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> eyre::Result<Vec<String>> {
     request_urls(client, job_id, token, keys, true).await
 }
 
@@ -78,7 +79,7 @@ async fn request_urls(
     token: &CapabilityToken,
     keys: &[ObjectKey],
     download: bool,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> eyre::Result<Vec<String>> {
     let mut message = capnp::message::Builder::new_default();
     {
         let mut request = message.init_root::<kubernix_capnp::upload_url_request::Builder>();
@@ -93,19 +94,23 @@ async fn request_urls(
         }
     }
     let mut payload = Vec::new();
-    capnp::serialize::write_message(&mut payload, &message)?;
+    capnp::serialize::write_message(&mut payload, &message).wrap_err("encoding an url request")?;
 
     let reply = client
         .request(crate::UPLOADS_SUBJECT, payload.into())
-        .await?;
+        .await
+        .wrap_err_with(|| format!("requesting urls on {}", crate::UPLOADS_SUBJECT))?;
 
     let mut cursor = reply.payload.as_ref();
-    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
-    let response = reader.get_root::<kubernix_capnp::upload_url_response::Reader>()?;
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+        .wrap_err("decoding the url response")?;
+    let response = reader
+        .get_root::<kubernix_capnp::upload_url_response::Reader>()
+        .wrap_err("reading the upload_url_response root")?;
 
     let error = response.get_error_msg()?.to_string()?;
     if !error.is_empty() {
-        return Err(format!("frontend refused upload: {error}").into());
+        bail!("frontend refused upload: {error}");
     }
 
     let mut urls = Vec::new();
@@ -113,7 +118,7 @@ async fn request_urls(
         urls.push(url?.to_string()?);
     }
     if urls.len() != keys.len() {
-        return Err(format!("expected {} urls, got {}", keys.len(), urls.len()).into());
+        bail!("expected {} urls, got {}", keys.len(), urls.len());
     }
     Ok(urls)
 }
@@ -132,7 +137,7 @@ pub async fn upload_output(
     nix_cli: &str,
     store_uri: Option<&str>,
     store_dir: &str,
-) -> Result<OutputArtifact, Box<dyn std::error::Error>> {
+) -> eyre::Result<OutputArtifact> {
     // `nix store dump-path`, not `nix-store --dump`: the latter takes a
     // *filesystem* path and ignores --store entirely, so it cannot find an
     // output living under a chroot store root.
@@ -145,7 +150,8 @@ pub async fn upload_output(
         .arg(store_path.to_full(store_dir))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .wrap_err_with(|| format!("spawning {nix_cli} store dump-path"))?;
 
     let stdout = child.stdout.take().expect("piped");
     // Compressed as the NAR arrives, into a temporary file rather than memory,
@@ -158,8 +164,8 @@ pub async fn upload_output(
     // transfer-encoding with no `Content-Length`, which S3 rejects outright
     // (`HTTP 400`). Spooling to disk gives a length to declare while keeping
     // *memory* flat, which is what actually mattered.
-    let spool = tempfile::NamedTempFile::new()?;
-    let sink = tokio::fs::File::from_std(spool.reopen()?);
+    let spool = tempfile::NamedTempFile::new().wrap_err("creating a spool file")?;
+    let sink = tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
 
     // `HashReader`/`HashWriter` (digest-io) hash a stream as it passes
     // through; `ZstdEncoder` (async-compression) compresses one as it's
@@ -170,32 +176,38 @@ pub async fn upload_output(
     let file_writer = HashWriter::<Sha256, _>::new(sink);
     let mut encoder = ZstdEncoder::with_quality(file_writer, async_compression::Level::Precise(3));
 
-    let nar_size = tokio::io::copy(&mut nar_reader, &mut encoder).await?;
+    let nar_size = tokio::io::copy(&mut nar_reader, &mut encoder)
+        .await
+        .wrap_err_with(|| format!("dumping {store_path}"))?;
     // Flushes zstd's trailing frame bytes through the `HashWriter` — must
     // happen before the file hash/size below are read.
-    encoder.shutdown().await?;
+    encoder.shutdown().await.wrap_err("flushing the compressor")?;
     let file_writer = encoder.into_inner();
 
     let nar_hash = nar_reader.finalize();
     let (file_hasher, mut sink) = file_writer.into_parts();
-    sink.flush().await?;
+    sink.flush().await.wrap_err("flushing the spool file")?;
     let file_hash = file_hasher.finalize();
-    let file_size = sink.metadata().await?.len();
+    let file_size = sink
+        .metadata()
+        .await
+        .wrap_err("reading the spool file's size")?
+        .len();
     drop(sink);
 
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr).await;
     }
-    let status = child.wait().await?;
+    let status = child.wait().await.wrap_err("waiting for dump-path")?;
     if !status.success() {
-        return Err(format!("dumping {store_path}: {} ({status})", stderr.trim()).into());
+        bail!("dumping {store_path}: {} ({status})", stderr.trim());
     }
 
     // Streamed from disk with the length declared, so the request is one the
     // pre-signed URL will accept.
     let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(
-        tokio::fs::File::from_std(spool.reopen()?),
+        tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?),
     ));
     let response = http
         .put(url)
@@ -203,9 +215,10 @@ pub async fn upload_output(
         .header(reqwest::header::CONTENT_LENGTH, file_size)
         .body(body)
         .send()
-        .await?;
+        .await
+        .wrap_err_with(|| format!("uploading {key}"))?;
     if !response.status().is_success() {
-        return Err(format!("uploading {key}: HTTP {}", response.status()).into());
+        bail!("uploading {key}: HTTP {}", response.status());
     }
 
     let (references, deriver) =
@@ -241,10 +254,14 @@ pub async fn fetch_input(
     nix_store: &str,
     store_uri: Option<&str>,
     store_dir: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let response = http.get(url).send().await?;
+) -> eyre::Result<()> {
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .wrap_err_with(|| format!("fetching {store_path}"))?;
     if !response.status().is_success() {
-        return Err(format!("fetching {store_path}: HTTP {}", response.status()).into());
+        bail!("fetching {store_path}: HTTP {}", response.status());
     }
 
     let mut command = Command::new(nix_store);
@@ -256,7 +273,8 @@ pub async fn fetch_input(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .wrap_err_with(|| format!("spawning {nix_store} --import"))?;
 
     {
         use futures_util::StreamExt as _;
@@ -267,41 +285,56 @@ pub async fn fetch_input(
         // The object is a bare NAR; `--import` wants an export stream. The
         // wrapping is built here rather than stored, so the object store holds
         // one representation of a path rather than two — see `nar_export`.
-        stdin.write_all(&crate::nar_export::header()).await?;
+        stdin
+            .write_all(&crate::nar_export::header())
+            .await
+            .wrap_err("writing the export header")?;
 
         // Decompressed as it arrives rather than in one piece: peak memory is a
         // chunk, not the whole NAR. `zstd`'s streaming writer is enough for
         // this, so it needs no additional dependency.
-        let mut decoder = zstd::stream::write::Decoder::new(Vec::new())?;
+        let mut decoder =
+            zstd::stream::write::Decoder::new(Vec::new()).wrap_err("starting decompression")?;
         let mut body = response.bytes_stream();
         while let Some(chunk) = body.next().await {
-            decoder.write_all(&chunk?)?;
+            decoder
+                .write_all(&chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
+                .wrap_err_with(|| format!("decompressing {store_path}"))?;
             let decoded = std::mem::take(decoder.get_mut());
             if !decoded.is_empty() {
-                stdin.write_all(&decoded).await?;
+                stdin
+                    .write_all(&decoded)
+                    .await
+                    .wrap_err("writing to nix-store --import")?;
             }
         }
-        decoder.flush()?;
+        decoder.flush().wrap_err_with(|| format!("decompressing {store_path}"))?;
         let decoded = std::mem::take(decoder.get_mut());
         if !decoded.is_empty() {
-            stdin.write_all(&decoded).await?;
+            stdin
+                .write_all(&decoded)
+                .await
+                .wrap_err("writing to nix-store --import")?;
         }
 
         stdin
             .write_all(&crate::nar_export::trailer(
                 store_path, references, deriver, store_dir,
             ))
-            .await?;
-        stdin.shutdown().await?;
+            .await
+            .wrap_err("writing the export trailer")?;
+        stdin.shutdown().await.wrap_err("closing nix-store --import's stdin")?;
     }
 
-    let output = child.wait_with_output().await?;
+    let output = child
+        .wait_with_output()
+        .await
+        .wrap_err("waiting for nix-store --import")?;
     if !output.status.success() {
-        return Err(format!(
+        bail!(
             "importing {store_path}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
+        );
     }
     Ok(())
 }
@@ -317,15 +350,16 @@ pub async fn upload_log(
     url: &str,
     key: &ObjectKey,
     log: Vec<u8>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> eyre::Result<()> {
     let response = http
         .put(url)
         .header("content-type", "text/plain; charset=utf-8")
         .body(log)
         .send()
-        .await?;
+        .await
+        .wrap_err_with(|| format!("uploading {key}"))?;
     if !response.status().is_success() {
-        return Err(format!("uploading {key}: HTTP {}", response.status()).into());
+        bail!("uploading {key}: HTTP {}", response.status());
     }
     Ok(())
 }
@@ -335,7 +369,7 @@ async fn query_path_metadata(
     store_path: &StorePath,
     store_uri: Option<&str>,
     store_dir: &str,
-) -> Result<(Vec<StorePath>, StorePath), Box<dyn std::error::Error>> {
+) -> eyre::Result<(Vec<StorePath>, StorePath)> {
     let with_store = |cmd: &str| {
         let mut c = Command::new(nix_store);
         if let Some(uri) = store_uri {
@@ -349,7 +383,8 @@ async fn query_path_metadata(
         .arg("--references")
         .arg(store_path.to_full(store_dir))
         .output()
-        .await?;
+        .await
+        .wrap_err_with(|| format!("querying references of {store_path}"))?;
     // `nix-store --query` prints full paths, rooted at whatever store
     // directory the local `nix-store` is actually configured for. A mismatch
     // against `store_dir` means this worker's `KUBERNIX_STORE_DIR` disagrees
@@ -359,23 +394,25 @@ async fn query_path_metadata(
         .lines()
         .map(|s| {
             StorePath::from_full(store_dir, s)
-                .ok_or_else(|| format!("{s} is not rooted at KUBERNIX_STORE_DIR ({store_dir})"))
+                .ok_or_eyre("not rooted at KUBERNIX_STORE_DIR")
+                .wrap_err_with(|| format!("{s} (store dir {store_dir})"))
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<eyre::Result<_>>()?;
 
     let deriver = with_store("--query")
         .arg("--deriver")
         .arg(store_path.to_full(store_dir))
         .output()
-        .await?;
+        .await
+        .wrap_err_with(|| format!("querying the deriver of {store_path}"))?;
     let deriver = String::from_utf8_lossy(&deriver.stdout).trim().to_string();
     // `--query --deriver` prints "unknown-deriver" when there is none.
     let deriver = if deriver == "unknown-deriver" {
         StorePath::default()
     } else {
-        StorePath::from_full(store_dir, &deriver).ok_or_else(|| {
-            format!("{deriver} is not rooted at KUBERNIX_STORE_DIR ({store_dir})")
-        })?
+        StorePath::from_full(store_dir, &deriver)
+            .ok_or_eyre("not rooted at KUBERNIX_STORE_DIR")
+            .wrap_err_with(|| format!("{deriver} (store dir {store_dir})"))?
     };
 
     Ok((references, deriver))

@@ -343,6 +343,35 @@ async fn is_valid_path_anywhere(
 }
 
 fn store_err(e: StoreError) -> capnp::Error {
+    store_err_ref(&e)
+}
+
+/// The one place an internal error becomes something a Nix client sees.
+///
+/// `context` is a short label for what was being attempted (e.g. `"fetching
+/// object"`) — used only in the generic fallback message, so it should read
+/// fine standing alone, without the error text that follows it elsewhere.
+///
+/// Known-safe domain errors are shown via their own `Display`; a call site
+/// that already knows its message is safe can mark it with
+/// [`kubernix_types::errors::Public`] as the report's root cause. Anything
+/// else is logged in full and replaced with a generic message — an S3
+/// request id or a Postgres error string is not this client's business.
+fn to_client_error(context: &str, report: eyre::Report) -> capnp::Error {
+    if let Some(e) = report.downcast_ref::<StoreError>() {
+        return store_err_ref(e);
+    }
+    if let Some(e) = report.downcast_ref::<kubernix_signing::SignError>() {
+        return rpc_error::failed(e.to_string());
+    }
+    if let Some(message) = kubernix_types::errors::public_message(&report) {
+        return rpc_error::failed(message);
+    }
+    tracing::error!(error = ?report, %context, "internal error serving daemon protocol request");
+    rpc_error::failed(format!("kubernix: {context} failed; see server logs"))
+}
+
+fn store_err_ref(e: &StoreError) -> capnp::Error {
     match e {
         StoreError::Unsupported(op) => rpc_error::unimplemented(op.to_string()),
         other => rpc_error::failed(other.to_string()),
@@ -698,13 +727,21 @@ async fn dispatch(
     queue: &JobQueue,
     job: BuildJob,
     logger: &log_stream::Client,
-) -> Result<JobOutcome, Box<dyn std::error::Error + Send + Sync>> {
+) -> eyre::Result<JobOutcome> {
+    use eyre::WrapErr as _;
+
     let job_id = job.job_id;
 
-    let mut logs = queue.subscribe_logs(&job_id).await?;
-    let consumer = queue.result_consumer(&job_id).await?;
+    let mut logs = queue
+        .subscribe_logs(&job_id)
+        .await
+        .wrap_err("subscribing to the job's logs")?;
+    let consumer = queue
+        .result_consumer(&job_id)
+        .await
+        .wrap_err("creating a result consumer")?;
 
-    queue.submit(&job).await?;
+    queue.submit(&job).await.wrap_err("submitting the job")?;
 
     // The client sees a build activity for the job, and each log line arrives as
     // a result on it — the same shape a local build produces, so it renders
@@ -1166,7 +1203,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             let mut reader = uploader
                 .get_object_reader(&remote.key)
                 .await
-                .map_err(|e| rpc_error::failed(format!("fetching {}: {e}", remote.key)))?;
+                .map_err(|e| to_client_error("fetching a store path", e))?;
 
             // Fetched, decompressed and forwarded a chunk at a time. Nothing
             // here scales with the size of the NAR — the old version held the
@@ -1178,20 +1215,22 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             // awaiting a `Send` future from a `!Send` task is fine (NOTES.md
             // item 7), so this needs no extra threading.
             const CHUNK: usize = 64 * 1024;
-            let mut decoder = zstd::stream::write::Decoder::new(Vec::new())
-                .map_err(|e| rpc_error::failed(format!("decompressing {}: {e}", remote.key)))?;
+            let mut decoder = zstd::stream::write::Decoder::new(Vec::new()).map_err(|e| {
+                to_client_error("decompressing a store path", eyre::Report::new(e))
+            })?;
             let mut buf = vec![0u8; CHUNK];
             let mut sent: u64 = 0;
 
             loop {
                 let read = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
                     .await
-                    .map_err(|e| rpc_error::failed(format!("reading {}: {e}", remote.key)))?;
+                    .map_err(|e| to_client_error("reading a store path", eyre::Report::new(e)))?;
                 if read == 0 {
                     break;
                 }
-                std::io::Write::write_all(&mut decoder, &buf[..read])
-                    .map_err(|e| rpc_error::failed(format!("decompressing {}: {e}", remote.key)))?;
+                std::io::Write::write_all(&mut decoder, &buf[..read]).map_err(|e| {
+                    to_client_error("decompressing a store path", eyre::Report::new(e))
+                })?;
                 let decoded = std::mem::take(decoder.get_mut());
                 if !decoded.is_empty() {
                     sent += decoded.len() as u64;
@@ -1201,8 +1240,9 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 }
             }
 
-            std::io::Write::flush(&mut decoder)
-                .map_err(|e| rpc_error::failed(format!("decompressing {}: {e}", remote.key)))?;
+            std::io::Write::flush(&mut decoder).map_err(|e| {
+                to_client_error("decompressing a store path", eyre::Report::new(e))
+            })?;
             let decoded = std::mem::take(decoder.get_mut());
             if !decoded.is_empty() {
                 sent += decoded.len() as u64;
@@ -1375,7 +1415,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
 
             let outcome = dispatch(&queue, job, &logger)
                 .await
-                .map_err(|e| rpc_error::failed(e.to_string()))?;
+                .map_err(|e| to_client_error("dispatching the build", e))?;
 
             store
                 .record_job_outcome(&tenant, job_id, &path, system.as_str(), &outcome)
@@ -1588,8 +1628,9 @@ impl legacy_protocol::stream::Server for NarSink {
                 )));
             };
 
-            let compressed = zstd::stream::encode_all(nar.as_slice(), 3)
-                .map_err(|e| rpc_error::failed(format!("compressing {}: {e}", self.info.path)))?;
+            let compressed = zstd::stream::encode_all(nar.as_slice(), 3).map_err(|e| {
+                to_client_error("compressing a pushed path", eyre::Report::new(e))
+            })?;
             let file_size = compressed.len() as u64;
             let file_hash = <sha2::Sha256 as sha2::Digest>::digest(&compressed);
 
@@ -1623,7 +1664,7 @@ impl legacy_protocol::stream::Server for NarSink {
                 uploader
                     .put_object(&key, compressed)
                     .await
-                    .map_err(|e| rpc_error::failed(format!("uploading {}: {e}", self.info.path)))?;
+                    .map_err(|e| to_client_error("uploading a pushed path", e))?;
             }
 
             // Signed here, on the way in, so the signature lands in the same row
@@ -1707,6 +1748,52 @@ mod tests {
             key: kubernix_types::ObjectKey::new(key),
             file_size: 0,
             file_hash: Default::default(),
+        }
+    }
+
+    /// Proof of the safety split `to_client_error` exists for: an internal
+    /// error's text must never reach the client, a domain error's must pass
+    /// through untouched, and an explicit [`kubernix_types::errors::Public`]
+    /// marking must survive exactly as written.
+    mod to_client_error_tests {
+        use super::*;
+        use kubernix_types::errors::Public;
+
+        fn message_of(error: &capnp::Error) -> String {
+            rpc_error::decode(&error.extra)
+                .expect("should decode as a v1 structured error")
+                .1
+        }
+
+        #[test]
+        fn an_opaque_internal_error_is_not_leaked() {
+            let io_err = std::io::Error::other(
+                "AccessDenied: request id AKIAABCDEF1234567890 is not authorized",
+            );
+            let report = eyre::Report::new(io_err).wrap_err("fetching an object");
+            let error = to_client_error("fetching a store path", report);
+
+            let message = message_of(&error);
+            assert!(
+                !message.contains("AccessDenied") && !message.contains("AKIAABCDEF1234567890"),
+                "internal detail leaked into a client-facing message: {message}"
+            );
+            assert!(message.contains("fetching a store path"));
+        }
+
+        #[test]
+        fn a_public_marked_cause_passes_through_verbatim() {
+            let report: eyre::Report =
+                Public::new("could not fetch this path; see server logs").into();
+            let error = to_client_error("fetching a store path", report);
+            assert_eq!(message_of(&error), "could not fetch this path; see server logs");
+        }
+
+        #[test]
+        fn a_store_error_passes_through_as_its_own_display() {
+            let report = eyre::Report::new(StoreError::NotFound(OUT.to_string()));
+            let error = to_client_error("looking up a path", report);
+            assert_eq!(message_of(&error), StoreError::NotFound(OUT.to_string()).to_string());
         }
     }
 

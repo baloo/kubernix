@@ -15,6 +15,7 @@
 use std::time::Duration;
 
 use async_nats::jetstream::{self, consumer::pull, stream::RetentionPolicy};
+use eyre::{Context as _, OptionExt as _};
 use futures_util::StreamExt;
 use kubernix_types::{CapabilityToken, ObjectKey, StorePath, System};
 use sha2::{Sha256, digest::Output};
@@ -112,9 +113,11 @@ impl JobQueue {
         self.client.clone()
     }
 
-    pub async fn connect(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn connect(url: &str) -> eyre::Result<Self> {
         tracing::info!(%url, "connecting to NATS");
-        let client = async_nats::connect(url).await?;
+        let client = async_nats::connect(url)
+            .await
+            .wrap_err_with(|| format!("connecting to NATS at {url}"))?;
         let jetstream = jetstream::new(client.clone());
 
         // Created here rather than assumed: a frontend that starts before any
@@ -126,7 +129,8 @@ impl JobQueue {
                 retention: RetentionPolicy::WorkQueue,
                 ..Default::default()
             })
-            .await?;
+            .await
+            .wrap_err_with(|| format!("creating the {JOBS_STREAM} stream"))?;
 
         jetstream
             .get_or_create_stream(jetstream::stream::Config {
@@ -135,7 +139,8 @@ impl JobQueue {
                 max_age: Duration::from_secs(24 * 3600),
                 ..Default::default()
             })
-            .await?;
+            .await
+            .wrap_err_with(|| format!("creating the {RESULTS_STREAM} stream"))?;
 
         Ok(Self {
             client,
@@ -158,23 +163,24 @@ impl JobQueue {
     pub async fn result_consumer(
         &self,
         job_id: &Uuid,
-    ) -> Result<jetstream::consumer::Consumer<pull::Config>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let stream = self.jetstream.get_stream(RESULTS_STREAM).await?;
+    ) -> eyre::Result<jetstream::consumer::Consumer<pull::Config>> {
+        let stream = self
+            .jetstream
+            .get_stream(RESULTS_STREAM)
+            .await
+            .wrap_err_with(|| format!("getting the {RESULTS_STREAM} stream"))?;
         let consumer = stream
             .create_consumer(pull::Config {
                 // Ephemeral: this consumer exists for one build.
                 filter_subject: results_subject(job_id),
                 ..Default::default()
             })
-            .await?;
+            .await
+            .wrap_err_with(|| format!("creating a result consumer for job {job_id}"))?;
         Ok(consumer)
     }
 
-    pub async fn submit(
-        &self,
-        job: &BuildJob,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn submit(&self, job: &BuildJob) -> eyre::Result<()> {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut req = message.init_root::<kubernix_capnp::build_request::Builder>();
@@ -198,7 +204,8 @@ impl JobQueue {
             }
         }
         let mut payload = Vec::new();
-        capnp::serialize::write_message(&mut payload, &message)?;
+        capnp::serialize::write_message(&mut payload, &message)
+            .wrap_err("encoding the build request")?;
 
         let subject = jobs_subject(&job.system);
         tracing::info!(
@@ -214,8 +221,10 @@ impl JobQueue {
         // waiting for a build nobody queued.
         self.jetstream
             .publish(subject, payload.into())
-            .await?
-            .await?;
+            .await
+            .wrap_err_with(|| format!("publishing job {}", job.job_id))?
+            .await
+            .wrap_err_with(|| format!("awaiting the publish ack for job {}", job.job_id))?;
         Ok(())
     }
 
@@ -223,31 +232,40 @@ impl JobQueue {
     pub async fn await_outcome(
         &self,
         consumer: jetstream::consumer::Consumer<pull::Config>,
-    ) -> Result<JobOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let mut messages = consumer.messages().await?;
+    ) -> eyre::Result<JobOutcome> {
+        let mut messages = consumer
+            .messages()
+            .await
+            .wrap_err("subscribing to the result consumer")?;
 
         let message = tokio::time::timeout(self.result_timeout, messages.next())
             .await
-            .map_err(|_| {
+            .wrap_err_with(|| {
                 format!(
                     "timed out after {:?} waiting for a worker",
                     self.result_timeout
                 )
             })?
-            .ok_or("result stream ended before an outcome arrived")??;
+            .ok_or_eyre("result stream ended before an outcome arrived")?
+            .wrap_err("reading a result message")?;
 
         let outcome = decode_outcome(&message.payload)?;
-        message.ack().await?;
+        message
+            .ack()
+            .await
+            .map_err(|e| eyre::eyre!("{e}"))
+            .wrap_err("acking the result message")?;
         Ok(outcome)
     }
 }
 
-pub fn decode_outcome(
-    payload: &[u8],
-) -> Result<JobOutcome, Box<dyn std::error::Error + Send + Sync>> {
+pub fn decode_outcome(payload: &[u8]) -> eyre::Result<JobOutcome> {
     let mut cursor = payload;
-    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
-    let result = reader.get_root::<kubernix_capnp::job_result::Reader>()?;
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+        .wrap_err("decoding a job result message")?;
+    let result = reader
+        .get_root::<kubernix_capnp::job_result::Reader>()
+        .wrap_err("reading the job_result root")?;
 
     let log_key = result.get_log_key()?.to_string()?;
 

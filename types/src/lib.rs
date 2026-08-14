@@ -11,6 +11,7 @@
 
 mod capability_token;
 pub mod derivation;
+pub mod errors;
 mod object_key;
 mod store_path;
 mod system;

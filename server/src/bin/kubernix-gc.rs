@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use eyre::{Context as _, OptionExt as _};
 use kubernix_server::gc::{self, JobRetention, TierCutoffs};
 use kubernix_server::postgres_store::PostgresStore;
 use kubernix_server::uploads::UploadSigner;
@@ -38,7 +39,8 @@ fn env_secs(name: &str, default: Duration) -> Duration {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> color_eyre::eyre::Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -52,12 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to collect, so refusing to start is the honest answer rather than
     // idling forever.
     let database_url = std::env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL must be set - nothing to collect without it")?;
-    let store = PostgresStore::connect(&database_url).await?;
+        .ok()
+        .ok_or_eyre("DATABASE_URL must be set - nothing to collect without it")?;
+    let store = PostgresStore::connect(&database_url)
+        .await
+        .wrap_err("connecting to PostgreSQL")?;
 
     let uploader = UploadSigner::from_env()
         .await
-        .map_err(|e| format!("no S3 configuration: {e}"))?;
+        .wrap_err("no S3 configuration")?;
 
     let cutoffs = TierCutoffs {
         verified: env_secs(

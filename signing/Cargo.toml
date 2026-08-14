@@ -9,6 +9,7 @@ ed25519-dalek.workspace = true
 crypto-common = { version = "0.2.2", features = ["getrandom"] }
 async-trait.workspace = true
 kubernix-types.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

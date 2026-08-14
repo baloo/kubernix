@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use eyre::Context as _;
 use kubernix_server::daemon_rpc::Config as RpcConfig;
 use kubernix_server::postgres_store::PostgresStore;
 use kubernix_server::ssh::{AuthPolicy, SshServer};
@@ -31,7 +32,8 @@ use russh::keys::{Algorithm, PrivateKey};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> color_eyre::eyre::Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -126,21 +128,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_or_create_host_key() -> Result<PrivateKey, Box<dyn std::error::Error>> {
+fn load_or_create_host_key() -> eyre::Result<PrivateKey> {
     let path = std::env::var("KUBERNIX_SSH_HOST_KEY")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("kubernix_host_ed25519"));
 
     if path.exists() {
-        let key = PrivateKey::read_openssh_file(&path)?;
+        let key = PrivateKey::read_openssh_file(&path)
+            .wrap_err_with(|| format!("reading the host key at {}", path.display()))?;
         tracing::info!(path = %path.display(), "loaded host key");
         return Ok(key);
     }
 
     // A stable host key matters: clients pin it in known_hosts, and a key that
     // changes every restart trips host-key verification.
-    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
-    key.write_openssh_file(&path, russh::keys::ssh_key::LineEnding::LF)?;
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+        .wrap_err("generating a host key")?;
+    key.write_openssh_file(&path, russh::keys::ssh_key::LineEnding::LF)
+        .wrap_err_with(|| format!("writing the host key to {}", path.display()))?;
     tracing::warn!(path = %path.display(), "generated new host key");
     Ok(key)
 }

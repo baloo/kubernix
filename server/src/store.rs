@@ -97,27 +97,18 @@ impl Tier {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("path not in store: {0}")]
     NotFound(String),
     /// Valid, but its bytes live in the object store rather than here.
+    #[error("path is in the object store: {0}")]
     Elsewhere(String),
+    #[error("operation not supported: {0}")]
     Unsupported(&'static str),
+    #[error("{0}")]
     Other(String),
 }
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StoreError::NotFound(p) => write!(f, "path not in store: {p}"),
-            StoreError::Elsewhere(p) => write!(f, "path is in the object store: {p}"),
-            StoreError::Unsupported(op) => write!(f, "operation not supported: {op}"),
-            StoreError::Other(m) => write!(f, "{m}"),
-        }
-    }
-}
-
-impl std::error::Error for StoreError {}
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 

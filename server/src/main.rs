@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use eyre::Context as _;
 use kubernix_server::http::{self, HttpState};
 use kubernix_server::postgres_store::PostgresStore;
 use kubernix_server::store::{MemoryStore, Store};
@@ -27,7 +28,8 @@ use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> color_eyre::eyre::Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -40,7 +42,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is a row. Starting anyway would answer 404 to everything, which looks like
     // a cache miss rather than a misconfiguration — so say so loudly instead.
     let store: Arc<dyn Store> = match std::env::var("DATABASE_URL") {
-        Ok(url) => PostgresStore::connect(&url).await?,
+        Ok(url) => PostgresStore::connect(&url)
+            .await
+            .wrap_err("connecting to PostgreSQL")?,
         Err(_) => {
             tracing::warn!(
                 "DATABASE_URL unset - serving from an empty in-memory store, \

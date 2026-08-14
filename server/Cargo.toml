@@ -12,7 +12,9 @@ axum = { version = "0.8.9", features = ["macros"] }
 base64 = "0.23.1"
 capnp.workspace = true
 capnp-rpc = "0.27.0"
+color-eyre.workspace = true
 ed25519-dalek.workspace = true
+eyre.workspace = true
 futures-util.workspace = true
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 kubernix-signing.workspace = true
@@ -23,6 +25,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2.workspace = true
 sqlx = { version = "0.9.0", features = ["migrate", "postgres", "runtime-tokio", "tls-rustls", "uuid"] }
+thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util = { version = "0.7.19", features = ["compat"] }

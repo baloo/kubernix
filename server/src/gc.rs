@@ -97,33 +97,15 @@ pub struct GcStats {
     pub jobs_reaped: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum GcError {
-    Database(sqlx::Error),
+    #[error("database: {0}")]
+    Database(#[from] sqlx::Error),
     /// An object failed to delete from the object store. Not fatal to the
     /// pass — the row stays `purging` and the next pass retries it — but
     /// worth the caller knowing about.
-    Upload {
-        key: ObjectKey,
-        error: String,
-    },
-}
-
-impl std::fmt::Display for GcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GcError::Database(e) => write!(f, "database: {e}"),
-            GcError::Upload { key, error } => write!(f, "deleting {key}: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for GcError {}
-
-impl From<sqlx::Error> for GcError {
-    fn from(e: sqlx::Error) -> Self {
-        GcError::Database(e)
-    }
+    #[error("deleting {key}: {error}")]
+    Upload { key: ObjectKey, error: String },
 }
 
 type Result<T> = std::result::Result<T, GcError>;

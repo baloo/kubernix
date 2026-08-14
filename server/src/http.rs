@@ -270,7 +270,7 @@ async fn nar(
     match uploader.presign_get(&key).await {
         Ok(url) => Redirect::temporary(&url).into_response(),
         Err(e) => {
-            tracing::error!(%key, error = %e, "could not presign a nar url");
+            tracing::error!(%key, error = ?e, "could not presign a nar url");
             (StatusCode::INTERNAL_SERVER_ERROR, "cannot serve\n").into_response()
         }
     }
@@ -307,7 +307,7 @@ async fn log(
             .into_response(),
         // Absent is the common case — most derivations were never built here.
         Err(e) => {
-            tracing::debug!(%drv_hash, error = %e, "no log");
+            tracing::debug!(%drv_hash, error = ?e, "no log");
             (StatusCode::NOT_FOUND, "not found\n").into_response()
         }
     }

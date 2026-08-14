@@ -21,6 +21,7 @@ mod upload;
 pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
 
 use async_nats::jetstream::{self, consumer::PullConsumer};
+use eyre::{Context as _, OptionExt as _};
 use futures_util::stream::StreamExt;
 use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId, derivation};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -47,8 +48,8 @@ struct Job {
 /// Taken from the derivation rather than from a builder's stdout: with
 /// `nix-store --serve` stdout carries the protocol, and the derivation is the
 /// authoritative statement of where its outputs go regardless.
-fn declared_outputs(job: &Job, store_dir: &str) -> Result<Vec<StorePath>, Box<dyn std::error::Error>> {
-    let drv = derivation::parse(&job.drv, store_dir)?;
+fn declared_outputs(job: &Job, store_dir: &str) -> eyre::Result<Vec<StorePath>> {
+    let drv = derivation::parse(&job.drv, store_dir).wrap_err("parsing the derivation")?;
     Ok(drv.outputs.into_iter().map(|o| o.path).collect())
 }
 
@@ -72,14 +73,15 @@ async fn fetch_inputs(
     nix_store: &str,
     store_uri: Option<&str>,
     store_dir: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> eyre::Result<()> {
     if job.inputs.is_empty() {
         return Ok(());
     }
 
     let keys: Vec<ObjectKey> = job.inputs.iter().map(|i| i.key.clone()).collect();
-    let urls =
-        upload::request_download_urls(client, &job.job_id, &job.token, &keys).await?;
+    let urls = upload::request_download_urls(client, &job.job_id, &job.token, &keys)
+        .await
+        .wrap_err("requesting download urls")?;
 
     for (input, url) in job.inputs.iter().zip(urls) {
         tracing::info!(job_id = %job.job_id, path = %input.store_path, "importing input");
@@ -93,7 +95,8 @@ async fn fetch_inputs(
             store_uri,
             store_dir,
         )
-        .await?;
+        .await
+        .wrap_err_with(|| format!("importing {}", input.store_path))?;
     }
 
     tracing::info!(job_id = %job.job_id, count = job.inputs.len(), "inputs imported");
@@ -101,7 +104,8 @@ async fn fetch_inputs(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> color_eyre::eyre::Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -197,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!(job_id = %job.job_id, drv = %job.derivation_path, inputs = job.inputs.len(), "building");
 
-        if let Err(e) = fetch_inputs(
+        if let Err(report) = fetch_inputs(
             &client,
             &http,
             &job,
@@ -207,8 +211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
         {
-            tracing::error!(job_id = %job.job_id, error = %e, "could not fetch inputs");
-            let outcome = Outcome::Failed(format!("fetching inputs: {e}"));
+            tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
+            let outcome = Outcome::Failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
             let _ = publish_result(&jetstream, &job, &outcome, &[], &ObjectKey::default()).await;
             let _ = message.ack().await;
             continue;
@@ -217,9 +221,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Where the outputs will land, read from the derivation itself.
         let outputs = match declared_outputs(&job, &store_dir) {
             Ok(outputs) => outputs,
-            Err(e) => {
-                tracing::error!(job_id = %job.job_id, error = %e, "undecodable derivation");
-                let outcome = Outcome::Failed(format!("reading derivation: {e}"));
+            Err(report) => {
+                tracing::error!(job_id = %job.job_id, error = ?report, "undecodable derivation");
+                let outcome =
+                    Outcome::Failed(infra_failure_message(&job.job_id, "reading the derivation failed"));
                 let _ =
                     publish_result(&jetstream, &job, &outcome, &[], &ObjectKey::default()).await;
                 let _ = message.ack().await;
@@ -253,9 +258,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         {
             Ok(uploaded) => uploaded,
-            Err(e) => {
-                tracing::error!(job_id = %job.job_id, error = %e, "artifact upload failed");
-                outcome = Outcome::Failed(format!("uploading artifacts: {e}"));
+            Err(report) => {
+                tracing::error!(job_id = %job.job_id, error = ?report, "artifact upload failed");
+                outcome = Outcome::Failed(infra_failure_message(&job.job_id, "uploading artifacts failed"));
                 (Vec::new(), ObjectKey::default())
             }
         };
@@ -272,10 +277,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn decode_job(payload: &[u8]) -> Result<Job, Box<dyn std::error::Error>> {
+fn decode_job(payload: &[u8]) -> eyre::Result<Job> {
     let mut cursor = payload;
-    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
-    let request = reader.get_root::<kubernix_capnp::build_request::Reader>()?;
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+        .wrap_err("decoding a build request")?;
+    let request = reader
+        .get_root::<kubernix_capnp::build_request::Reader>()
+        .wrap_err("reading the build_request root")?;
     let mut inputs = Vec::new();
     for input in request.get_inputs()?.iter() {
         let mut references = Vec::new();
@@ -292,7 +300,8 @@ fn decode_job(payload: &[u8]) -> Result<Job, Box<dyn std::error::Error>> {
     let tenant = request.get_tenant()?.to_string()?;
     // Without one the worker cannot name a key the frontend will sign, so
     // failing here beats failing later with a refused URL request.
-    let tenant = TenantId::from_wire(tenant).ok_or("build request carries no tenant")?;
+    let tenant =
+        TenantId::from_wire(tenant).ok_or_eyre("build request carries no tenant")?;
 
     Ok(Job {
         job_id: request.get_job_id()?.to_string()?,
@@ -304,9 +313,28 @@ fn decode_job(payload: &[u8]) -> Result<Job, Box<dyn std::error::Error>> {
     })
 }
 
+/// A job's terminal state.
+///
+/// `Failed`'s `String` is sent over the wire on `kubernix.results.<job_id>`
+/// and forwarded **verbatim** to the Nix client — `server/src/jobs.rs`'s
+/// `decode_outcome` and `daemon_rpc.rs`'s `set_error_msg` do no filtering of
+/// their own. Construct it as if writing directly to `nix build`'s stderr:
+/// `outcome.describe()` (a real build failure) is exactly that already; for
+/// anything else — a failure to even reach the point of building — log the
+/// real error with `tracing::error!(error = ?report, ...)` first and use
+/// [`infra_failure_message`] for the text that actually goes out.
 enum Outcome {
     Completed(Vec<StorePath>),
     Failed(String),
+}
+
+/// The wire text for an infra failure — one that happened before or around
+/// the build itself, not a build failure in its own right (S3, NATS, a
+/// malformed derivation). Never includes the underlying error: that belongs
+/// in the worker's own log via `tracing::error!(error = ?report, ...)`,
+/// keyed by the same `job_id` so the two are easy to correlate by hand.
+fn infra_failure_message(job_id: &str, context: &str) -> String {
+    format!("{context} (job {job_id}); see worker logs")
 }
 
 /// Upload the job's artifacts and return what the frontend needs to serve them.
@@ -326,26 +354,29 @@ async fn upload_artifacts(
     nix_cli: &str,
     store_uri: Option<&str>,
     store_dir: &str,
-) -> Result<(Vec<upload::OutputArtifact>, ObjectKey), Box<dyn std::error::Error>> {
+) -> eyre::Result<(Vec<upload::OutputArtifact>, ObjectKey)> {
     let outputs: Vec<StorePath> = match outcome {
         Outcome::Completed(paths) => paths.clone(),
         Outcome::Failed(_) => Vec::new(),
     };
 
     let log_key = upload::log_key(&job.tenant, &job.derivation_path)
-        .ok_or_else(|| format!("cannot derive log key from {}", job.derivation_path))?;
+        .ok_or_eyre("cannot derive a log key")
+        .wrap_err_with(|| job.derivation_path.to_string())?;
 
     // One round trip for every key this job needs.
     let mut keys = vec![log_key.clone()];
     for path in &outputs {
         keys.push(
             upload::nar_key(&job.tenant, path)
-                .ok_or_else(|| format!("cannot derive nar key from {path}"))?,
+                .ok_or_eyre("cannot derive a nar key")
+                .wrap_err_with(|| path.to_string())?,
         );
     }
 
-    let urls =
-        upload::request_upload_urls(client, &job.job_id, &job.token, &keys).await?;
+    let urls = upload::request_upload_urls(client, &job.job_id, &job.token, &keys)
+        .await
+        .wrap_err("requesting upload urls")?;
 
     // An empty log is possible — a build that printed nothing — and some S3
     // implementations reject a zero-length PUT outright. Losing the whole job
@@ -354,7 +385,9 @@ async fn upload_artifacts(
         tracing::debug!(job_id = %job.job_id, "build produced no log; not uploading one");
         ObjectKey::default()
     } else {
-        upload::upload_log(http, &urls[0], &log_key, log).await?;
+        upload::upload_log(http, &urls[0], &log_key, log)
+            .await
+            .wrap_err("uploading the build log")?;
         log_key
     };
 
@@ -373,7 +406,8 @@ async fn upload_artifacts(
                 store_uri,
                 store_dir,
             )
-            .await?,
+            .await
+            .wrap_err_with(|| format!("uploading {path}"))?,
         );
     }
 
@@ -400,7 +434,8 @@ async fn run_build(
     let mut conn = match serve::ServeConnection::open(builder, store_uri).await {
         Ok(conn) => conn,
         Err(e) => {
-            let message = format!("starting {builder} --serve: {e}");
+            tracing::error!(job_id = %job.job_id, %builder, error = ?e, "could not start the builder");
+            let message = infra_failure_message(&job.job_id, "starting the builder failed");
             let _ = client.publish(log_subject, message.clone().into()).await;
             return (Outcome::Failed(message.clone()), message.into_bytes());
         }
@@ -435,7 +470,13 @@ async fn run_build(
             }
             Outcome::Failed(message)
         }
-        Err(e) => Outcome::Failed(format!("building {}: {e}", job.derivation_path)),
+        Err(e) => {
+            tracing::error!(
+                job_id = %job.job_id, drv = %job.derivation_path, error = ?e,
+                "builder invocation failed"
+            );
+            Outcome::Failed(infra_failure_message(&job.job_id, "running the builder failed"))
+        }
     };
 
     (outcome, archive)
@@ -485,7 +526,7 @@ async fn publish_result(
     outcome: &Outcome,
     artifacts: &[upload::OutputArtifact],
     log_key: &ObjectKey,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> eyre::Result<()> {
     let mut message = capnp::message::Builder::new_default();
     {
         let mut result = message.init_root::<kubernix_capnp::job_result::Builder>();
@@ -527,11 +568,31 @@ async fn publish_result(
     }
 
     let mut payload = Vec::new();
-    capnp::serialize::write_message(&mut payload, &message)?;
+    capnp::serialize::write_message(&mut payload, &message).wrap_err("encoding the job result")?;
 
     jetstream
         .publish(format!("kubernix.results.{}", job.job_id), payload.into())
-        .await?
-        .await?;
+        .await
+        .wrap_err_with(|| format!("publishing the result for job {}", job.job_id))?
+        .await
+        .wrap_err_with(|| format!("awaiting the publish ack for job {}", job.job_id))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infra_failure_message_carries_no_error_detail() {
+        // A fake error's text, as if it had been formatted straight into the
+        // message the way the old code did — proof this construction never
+        // does that.
+        let leaked = "AccessDenied: request id AKIAABCDEF1234567890";
+        let message = infra_failure_message("11111111-2222-3333-4444-555555555555", "uploading artifacts failed");
+
+        assert!(message.contains("11111111-2222-3333-4444-555555555555"));
+        assert!(message.contains("uploading artifacts failed"));
+        assert!(!message.contains(leaked));
+    }
 }

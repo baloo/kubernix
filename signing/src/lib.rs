@@ -67,21 +67,12 @@ pub fn fingerprint(f: &Fingerprint<'_>) -> String {
     )
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SignError {
     /// The key material could not be used — malformed, or the backend refused.
+    #[error("signing key unusable: {0}")]
     Unusable(String),
 }
-
-impl std::fmt::Display for SignError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SignError::Unusable(why) => write!(f, "signing key unusable: {why}"),
-        }
-    }
-}
-
-impl std::error::Error for SignError {}
 
 /// Something that can sign on a tenant's behalf.
 ///

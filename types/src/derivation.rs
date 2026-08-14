@@ -55,16 +55,9 @@ struct Reader<'a> {
     pos: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("malformed derivation: {0}")]
 pub struct ParseError(String);
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "malformed derivation: {}", self.0)
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 type Result<T> = std::result::Result<T, ParseError>;
 
