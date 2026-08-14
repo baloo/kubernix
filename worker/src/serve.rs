@@ -136,6 +136,17 @@ pub struct ServeConnection {
 
 impl ServeConnection {
     /// Spawn `nix-store --serve --write` and exchange greetings.
+    ///
+    /// TODO: nothing here bounds how long a hung or malicious builder can
+    /// block this connection's I/O — the only backstop is the worker's NATS
+    /// `ack_wait` (3600s), which affects redelivery, not killing the stuck
+    /// process. A `tokio::time::timeout` around this and `build_derivation`
+    /// would be a bandage; the real fix is to stop shelling out to
+    /// `nix-store --serve` at all and speak the Nix/Lix daemon protocol
+    /// directly over its Unix socket instead — the same kind of worker
+    /// protocol `kubernix-server` already speaks over SSH
+    /// (`server/src/daemon_rpc.rs`) — which makes a hung build a connection
+    /// the worker controls rather than a subprocess it has to babysit.
     pub async fn open(nix_store: &str, store_uri: Option<&str>) -> eyre::Result<Self> {
         let mut command = Command::new(nix_store);
         command.arg("--serve").arg("--write");
@@ -204,6 +215,10 @@ impl ServeConnection {
     ///
     /// `drv` is passed through byte for byte: it is already `serializeDerivation`
     /// output, which is exactly what the far side's `readDerivation` expects.
+    ///
+    /// TODO: same unbounded-hang risk as [`Self::open`] — no timeout on this
+    /// exchange, same real fix (talk to the daemon socket directly rather
+    /// than through this subprocess).
     pub async fn build_derivation(&mut self, drv_path: &str, drv: &[u8]) -> eyre::Result<BuildOutcome> {
         self.stdin
             .write_wire_u64(CMD_BUILD_DERIVATION)

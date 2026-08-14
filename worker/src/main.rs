@@ -197,7 +197,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
             Ok(job) => job,
             Err(e) => {
                 tracing::error!(error = %e, "undecodable job, dropping");
-                let _ = message.ack().await;
+                if let Err(e) = message.ack().await {
+                    tracing::error!(error = %e, "failed to ack an undecodable job");
+                }
                 continue;
             }
         };
@@ -207,8 +209,12 @@ async fn main() -> color_eyre::eyre::Result<()> {
         if let Err(report) = job.fetch_inputs(&client, &http, nix).await {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
             let outcome = Outcome::Failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
-            let _ = job.publish_result(&jetstream, &outcome, &[], &ObjectKey::default()).await;
-            let _ = message.ack().await;
+            if let Err(e) = job.publish_result(&jetstream, &outcome, &[], &ObjectKey::default()).await {
+                tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
+            }
+            if let Err(e) = message.ack().await {
+                tracing::error!(job_id = %job.job_id, error = %e, "failed to ack job");
+            }
             continue;
         }
 
@@ -219,9 +225,14 @@ async fn main() -> color_eyre::eyre::Result<()> {
                 tracing::error!(job_id = %job.job_id, error = ?report, "undecodable derivation");
                 let outcome =
                     Outcome::Failed(infra_failure_message(&job.job_id, "reading the derivation failed"));
-                let _ =
-                    job.publish_result(&jetstream, &outcome, &[], &ObjectKey::default()).await;
-                let _ = message.ack().await;
+                if let Err(e) =
+                    job.publish_result(&jetstream, &outcome, &[], &ObjectKey::default()).await
+                {
+                    tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
+                }
+                if let Err(e) = message.ack().await {
+                    tracing::error!(job_id = %job.job_id, error = %e, "failed to ack job");
+                }
                 continue;
             }
         };
@@ -243,12 +254,14 @@ async fn main() -> color_eyre::eyre::Result<()> {
         };
 
         if let Err(e) = job.publish_result(&jetstream, &outcome, &artifacts, &log_key).await {
-            tracing::error!(error = %e, "failed to publish result");
+            tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
             // Not acked: let it be redelivered rather than lose the job.
             continue;
         }
 
-        let _ = message.ack().await;
+        if let Err(e) = message.ack().await {
+            tracing::error!(job_id = %job.job_id, error = %e, "failed to ack job");
+        }
     }
 
     Ok(())

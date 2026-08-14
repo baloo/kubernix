@@ -626,7 +626,9 @@ impl Store for PostgresStore {
             tracing::error!(error = %e, %path, "tier lookup failed");
             None
         })
-        .map(|s| Tier::from_str(&s))
+        // Infallible: unrecognised text is treated as `Quarantined`, per
+        // `Tier`'s `FromStr` impl, never as a parse error.
+        .map(|s| s.parse().unwrap())
     }
 
     async fn set_options(&self, tenant: &TenantId, options: ClientOptions) {

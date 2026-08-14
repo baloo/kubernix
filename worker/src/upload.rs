@@ -142,6 +142,11 @@ impl<'a> NixStore<'a> {
     /// Hashes both the uncompressed and compressed byte streams in the *same*
     /// pass: buffering the whole NAR to hash it afterwards would defeat the
     /// point for a large closure.
+    ///
+    /// TODO: the `nix store dump-path` child below has no timeout — see
+    /// `serve::ServeConnection::open`'s doc comment for the same hang risk
+    /// and the same real fix (a direct connection to the daemon socket
+    /// instead of shelling out).
     pub async fn upload_output(
         &self,
         http: &reqwest::Client,
@@ -258,6 +263,10 @@ impl<'a> NixStore<'a> {
     /// Streamed end to end: fetched, decompressed and piped into the child a
     /// chunk at a time, so peak memory does not scale with the size of the
     /// input.
+    ///
+    /// TODO: same unbounded-hang risk on the `--import` child as
+    /// `upload_output`'s `dump-path` child — see `serve::ServeConnection::
+    /// open`'s doc comment.
     pub async fn fetch_input(
         &self,
         http: &reqwest::Client,
@@ -386,6 +395,10 @@ pub async fn upload_log(
 }
 
 impl<'a> NixStore<'a> {
+    // TODO: the `nix-store --query` children spawned below (via `.output()`,
+    // which waits for exit with no timeout) share the same unbounded-hang
+    // risk as `upload_output`'s and `fetch_input`'s — see
+    // `serve::ServeConnection::open`'s doc comment.
     async fn query_path_metadata(
         &self,
         store_path: &StorePath,

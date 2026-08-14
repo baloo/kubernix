@@ -86,14 +86,26 @@ impl Tier {
             Tier::Quarantined => "quarantined",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Tier {
+    /// Infallible on purpose, matching the old hand-rolled `from_str`: an
+    /// unknown value must not become vouchable by accident, so it falls back
+    /// to the least-trusted tier rather than erroring.
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match s {
             "verified" => Tier::Verified,
             "built" => Tier::Built,
-            // An unknown value must not become vouchable by accident.
             _ => Tier::Quarantined,
-        }
+        })
     }
 }
 
@@ -593,6 +605,21 @@ mod tests {
 
     fn tenant(name: &str) -> TenantId {
         Tenant::from_ssh(name, None, false).id
+    }
+
+    #[test]
+    fn tier_round_trips_through_display_and_from_str() {
+        for tier in [Tier::Verified, Tier::Built, Tier::Quarantined] {
+            let parsed: Tier = tier.to_string().parse().unwrap();
+            assert_eq!(parsed, tier);
+        }
+    }
+
+    #[test]
+    fn tier_from_str_treats_unrecognised_text_as_quarantined() {
+        // An unknown value must not become vouchable by accident.
+        let parsed: Tier = "not-a-real-tier".parse().unwrap();
+        assert_eq!(parsed, Tier::Quarantined);
     }
 
     fn info(path: &str) -> PathInfo {
