@@ -66,6 +66,11 @@ pub struct Config {
     /// Set per connection in [`crate::ssh`] from the identity the client
     /// presented, so a `Config` clone is one client's view of the frontend.
     pub tenant: Tenant,
+    /// The store directory a real Nix client prepends to every path it sends
+    /// or expects on the wire. [`StorePath`] itself never carries this — see
+    /// its doc comment — so every boundary that reads or writes the daemon
+    /// protocol needs it in scope.
+    pub store_dir: String,
 }
 
 impl Default for Config {
@@ -81,6 +86,7 @@ impl Default for Config {
             // Overwritten per connection. A default that is nobody in particular
             // keeps a misconfigured caller out of a real tenant's data.
             tenant: Tenant::from_ssh("anonymous", None, false),
+            store_dir: "/nix/store".to_string(),
         }
     }
 }
@@ -93,13 +99,17 @@ pub fn default_system() -> System {
 /// variant (i.e. names a derivation to realise rather than a path to check).
 fn read_derived_path(
     reader: legacy_protocol::derived_path::Reader<'_>,
+    store_dir: &str,
 ) -> capnp::Result<(StorePath, bool)> {
     use crate::daemon_capnp::legacy_protocol::derived_path;
     Ok(match reader.get_raw().which()? {
-        derived_path::raw::Which::Opaque(opaque) => (read_store_path(opaque?.get_path()?)?, false),
-        derived_path::raw::Which::Built(built) => {
-            (read_store_path(built?.get_drv_path()?.get_path()?)?, true)
+        derived_path::raw::Which::Opaque(opaque) => {
+            (read_store_path(opaque?.get_path()?, store_dir)?, false)
         }
+        derived_path::raw::Which::Built(built) => (
+            read_store_path(built?.get_drv_path()?.get_path()?, store_dir)?,
+            true,
+        ),
     })
 }
 
@@ -126,6 +136,7 @@ async fn realise(
     tenant: &TenantId,
     path: &StorePath,
     built: bool,
+    store_dir: &str,
 ) -> Result<(), capnp::Error> {
     if built {
         tracing::warn!(%path, "refusing buildPaths for a derivation");
@@ -141,7 +152,7 @@ async fn realise(
         ));
     }
 
-    if is_valid_path_anywhere(store, tenant, path).await {
+    if is_valid_path_anywhere(store, tenant, path, store_dir).await {
         Ok(())
     } else {
         Err(rpc_error::failed(format!(
@@ -165,6 +176,7 @@ async fn record_outputs(
     tenant: &TenantId,
     infos: &[crate::jobs::OutputInfo],
     expected_outputs: &[(String, StorePath)],
+    store_dir: &str,
 ) -> Result<(), Vec<StorePath>> {
     let allowed: std::collections::HashSet<&StorePath> =
         expected_outputs.iter().map(|(_, path)| path).collect();
@@ -198,7 +210,7 @@ async fn record_outputs(
         };
         // A worker we dispatched produced this, so it is `Built` and we are
         // willing to say so.
-        sign_if_vouchable(store, tenant, &mut path_info, Tier::Built).await;
+        sign_if_vouchable(store, tenant, &mut path_info, Tier::Built, store_dir).await;
 
         if let Err(e) = store
             .record_path(
@@ -233,7 +245,13 @@ async fn record_outputs(
 /// Failing to sign is not failing to store. An unsigned path is merely unusable
 /// by strict clients; refusing the write would lose data the client already
 /// sent.
-async fn sign_if_vouchable(store: &dyn Store, tenant: &TenantId, info: &mut PathInfo, tier: Tier) {
+async fn sign_if_vouchable(
+    store: &dyn Store,
+    tenant: &TenantId,
+    info: &mut PathInfo,
+    tier: Tier,
+    store_dir: &str,
+) {
     if !tier.is_vouchable() {
         tracing::debug!(path = %info.path, tier = tier.as_str(), "not signing");
         return;
@@ -243,11 +261,13 @@ async fn sign_if_vouchable(store: &dyn Store, tenant: &TenantId, info: &mut Path
         return;
     };
 
+    let full_path = info.path.to_full(store_dir);
     let fingerprint = kubernix_signing::Fingerprint {
-        path: info.path.as_str(),
+        path: &full_path,
         nar_hash: &info.nar_hash.bytes,
         nar_size: info.nar_size,
         references: &info.references,
+        store_dir,
     };
     match signer.sign_path(&fingerprint).await {
         Ok(signature) => {
@@ -275,6 +295,7 @@ async fn resolve_verified(
     store: &dyn Store,
     tenant: &TenantId,
     hash_part: &str,
+    store_dir: &str,
 ) -> Option<StorePath> {
     if let Some(path) = store.query_path_from_hash_part(tenant, hash_part).await {
         return Some(path);
@@ -286,7 +307,7 @@ async fn resolve_verified(
     // should be its own — not a mix that quietly says another tenant also
     // vouched for it.
     info.sigs.clear();
-    sign_if_vouchable(store, tenant, &mut info, Tier::Verified).await;
+    sign_if_vouchable(store, tenant, &mut info, Tier::Verified, store_dir).await;
     if let Err(e) = store
         .record_path(tenant, info, object, Tier::Verified)
         .await
@@ -306,14 +327,19 @@ async fn resolve_verified(
 /// opaque `buildPaths` dependency) both need this, not just the RPC entry
 /// point — an opaque dependency that only another tenant has pushed is
 /// exactly the case sharing exists for.
-async fn is_valid_path_anywhere(store: &dyn Store, tenant: &TenantId, path: &StorePath) -> bool {
+async fn is_valid_path_anywhere(
+    store: &dyn Store,
+    tenant: &TenantId,
+    path: &StorePath,
+    store_dir: &str,
+) -> bool {
     if store.is_valid_path(tenant, path).await {
         return true;
     }
     let Some(hash_part) = path.hash_part() else {
         return false;
     };
-    resolve_verified(store, tenant, hash_part).await.as_ref() == Some(path)
+    resolve_verified(store, tenant, hash_part, store_dir).await.as_ref() == Some(path)
 }
 
 fn store_err(e: StoreError) -> capnp::Error {
@@ -333,27 +359,41 @@ fn derivation_name(drv_path: &StorePath) -> &str {
 }
 
 /// `StorePath.raw` carries the full printed path (`types-rpc.hh:25-38`).
-fn read_store_path(reader: crate::types_capnp::store_path::Reader<'_>) -> capnp::Result<StorePath> {
-    Ok(StorePath::new(
-        String::from_utf8_lossy(reader.get_raw()?).into_owned(),
-    ))
+///
+/// Refused, rather than silently reinterpreted, if it is not actually rooted
+/// at `store_dir`: this connection's client and the frontend must agree on
+/// the store directory, or every path-derived computation downstream
+/// (content verification, signing) would be operating on the wrong bytes.
+fn read_store_path(
+    reader: crate::types_capnp::store_path::Reader<'_>,
+    store_dir: &str,
+) -> capnp::Result<StorePath> {
+    let raw = String::from_utf8_lossy(reader.get_raw()?).into_owned();
+    StorePath::from_full(store_dir, &raw).ok_or_else(|| {
+        rpc_error::failed(format!(
+            "kubernix: {raw} is not rooted at this server's store directory \
+             ({store_dir}); the client and the frontend must use the same store dir"
+        ))
+    })
 }
 
 fn read_store_paths(
     list: capnp::struct_list::Reader<'_, crate::types_capnp::store_path::Owned>,
+    store_dir: &str,
 ) -> capnp::Result<Vec<StorePath>> {
-    list.iter().map(read_store_path).collect()
+    list.iter().map(|r| read_store_path(r, store_dir)).collect()
 }
 
 fn write_store_paths(
     mut builder: capnp::struct_list::Builder<'_, crate::types_capnp::store_path::Owned>,
     paths: &[StorePath],
+    store_dir: &str,
 ) {
     for (i, path) in paths.iter().enumerate() {
         builder
             .reborrow()
             .get(i as u32)
-            .set_raw(path.as_str().as_bytes());
+            .set_raw(path.to_full(store_dir).as_bytes());
     }
 }
 
@@ -376,15 +416,18 @@ fn hash_type_to(ht: HashType) -> legacy_protocol::HashType {
 }
 
 /// Read a `ValidPathInfo` off the wire.
-fn read_path_info(reader: legacy_protocol::valid_path_info::Reader<'_>) -> capnp::Result<PathInfo> {
+fn read_path_info(
+    reader: legacy_protocol::valid_path_info::Reader<'_>,
+    store_dir: &str,
+) -> capnp::Result<PathInfo> {
     use crate::types_capnp::option;
 
-    let path = read_store_path(reader.get_path()?)?;
+    let path = read_store_path(reader.get_path()?, store_dir)?;
     let unkeyed = reader.get_unkeyed_valid_path_info()?;
 
     let deriver = match unkeyed.get_deriver()?.which()? {
         option::Which::None(()) => None,
-        option::Which::Some(sp) => Some(read_store_path(sp?)?),
+        option::Which::Some(sp) => Some(read_store_path(sp?, store_dir)?),
     };
 
     let nar_hash_reader = unkeyed.get_nar_hash()?;
@@ -404,7 +447,7 @@ fn read_path_info(reader: legacy_protocol::valid_path_info::Reader<'_>) -> capnp
         deriver,
         nar_hash,
         nar_size: unkeyed.get_nar_size(),
-        references: read_store_paths(unkeyed.get_references()?)?,
+        references: read_store_paths(unkeyed.get_references()?, store_dir)?,
         registration_time: unkeyed.get_registration_time(),
         ultimate: unkeyed.get_ultimate(),
         sigs,
@@ -447,11 +490,15 @@ fn read_content_address(
 }
 
 /// Write a `ValidPathInfo` to the wire.
-fn write_path_info(mut builder: legacy_protocol::valid_path_info::Builder<'_>, info: &PathInfo) {
+fn write_path_info(
+    mut builder: legacy_protocol::valid_path_info::Builder<'_>,
+    info: &PathInfo,
+    store_dir: &str,
+) {
     builder
         .reborrow()
         .init_path()
-        .set_raw(info.path.as_str().as_bytes());
+        .set_raw(info.path.to_full(store_dir).as_bytes());
 
     let mut unkeyed = builder.init_unkeyed_valid_path_info();
     match &info.deriver {
@@ -459,7 +506,7 @@ fn write_path_info(mut builder: legacy_protocol::valid_path_info::Builder<'_>, i
             .reborrow()
             .init_deriver()
             .init_some()
-            .set_raw(deriver.as_str().as_bytes()),
+            .set_raw(deriver.to_full(store_dir).as_bytes()),
         None => unkeyed.reborrow().init_deriver().set_none(()),
     }
 
@@ -478,6 +525,7 @@ fn write_path_info(mut builder: legacy_protocol::valid_path_info::Builder<'_>, i
             .reborrow()
             .init_references(info.references.len() as u32),
         &info.references,
+        store_dir,
     );
 
     let mut sigs = unkeyed.reborrow().init_sigs(info.sigs.len() as u32);
@@ -538,6 +586,7 @@ impl bootstrap::Server for BootstrapImpl {
                 system: config.system,
                 uploader: config.uploader,
                 tenant: config.tenant,
+                store_dir: config.store_dir,
             });
 
             // LegacyBoot extends Protocol, so it is a valid Protocol capability.
@@ -557,6 +606,7 @@ pub struct LegacyBootImpl {
     system: System,
     uploader: Option<Arc<UploadSigner>>,
     tenant: Tenant,
+    store_dir: String,
 }
 
 /// `LegacyBoot extends Protocol`, so the generated `legacy_boot::Server` trait
@@ -576,6 +626,7 @@ impl legacy_boot::Server for LegacyBootImpl {
         let system = self.system.clone();
         let uploader = self.uploader.clone();
         let tenant = self.tenant.clone();
+        let store_dir = self.store_dir.clone();
         async move {
             // The client hands us a logger capability. Everything a remote build
             // prints goes back through this, which is why build logs need no side
@@ -596,6 +647,7 @@ impl legacy_boot::Server for LegacyBootImpl {
                 uploader,
                 tenant,
                 staged: RefCell::new(Vec::new()),
+                store_dir,
             });
 
             let mut results = results.get();
@@ -628,6 +680,8 @@ pub struct LegacyProtocolImpl {
     /// builds that follow. Tracking it per connection avoids shipping every
     /// path the frontend has ever seen.
     staged: RefCell<Vec<crate::jobs::InputRef>>,
+    /// The store directory this connection's client prepends to every path.
+    store_dir: String,
 }
 
 /// Submit a job, relay its log into the client's `LogStream`, and return the
@@ -791,11 +845,12 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
-            let path = read_store_path(params.get()?.get_path()?)?;
+            let path = read_store_path(params.get()?.get_path()?, &store_dir)?;
             results
                 .get()
-                .set_result(is_valid_path_anywhere(&*store, &tenant, &path).await);
+                .set_result(is_valid_path_anywhere(&*store, &tenant, &path, &store_dir).await);
             Ok(())
         }
     }
@@ -807,8 +862,9 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
-            let paths = read_store_paths(params.get()?.get_paths()?)?;
+            let paths = read_store_paths(params.get()?.get_paths()?, &store_dir)?;
             let mut valid = store.query_valid_paths(&tenant, &paths).await;
             for path in &paths {
                 if valid.contains(path) {
@@ -817,11 +873,19 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 let Some(hash_part) = path.hash_part() else {
                     continue;
                 };
-                if resolve_verified(&*store, &tenant, hash_part).await.as_ref() == Some(path) {
+                if resolve_verified(&*store, &tenant, hash_part, &store_dir)
+                    .await
+                    .as_ref()
+                    == Some(path)
+                {
                     valid.push(path.clone());
                 }
             }
-            write_store_paths(results.get().init_result(valid.len() as u32), &valid);
+            write_store_paths(
+                results.get().init_result(valid.len() as u32),
+                &valid,
+                &store_dir,
+            );
             Ok(())
         }
     }
@@ -833,9 +897,14 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
             let paths = store.query_all_valid_paths(&tenant).await;
-            write_store_paths(results.get().init_result(paths.len() as u32), &paths);
+            write_store_paths(
+                results.get().init_result(paths.len() as u32),
+                &paths,
+                &store_dir,
+            );
             Ok(())
         }
     }
@@ -847,13 +916,14 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
-            let path = read_store_path(params.get()?.get_path()?)?;
+            let path = read_store_path(params.get()?.get_path()?, &store_dir)?;
             let mut result = results.get().init_result();
             let mut info = store.query_path_info(&tenant, &path).await;
             if info.is_none()
                 && let Some(hash_part) = path.hash_part()
-                && resolve_verified(&*store, &tenant, hash_part)
+                && resolve_verified(&*store, &tenant, hash_part, &store_dir)
                     .await
                     .is_some()
             {
@@ -866,7 +936,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     // in its own right so a path is not collected in the
                     // window between the two.
                     store.record_access(&tenant, &path).await;
-                    write_path_info(result.init_some(), &info)
+                    write_path_info(result.init_some(), &info, &store_dir)
                 }
                 None => result.set_none(()),
             }
@@ -881,11 +951,14 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
             let hash_part = String::from_utf8_lossy(params.get()?.get_hash_part()?).into_owned();
             let mut result = results.get().init_result();
-            match resolve_verified(&*store, &tenant, &hash_part).await {
-                Some(path) => result.init_some().set_raw(path.as_str().as_bytes()),
+            match resolve_verified(&*store, &tenant, &hash_part, &store_dir).await {
+                Some(path) => result
+                    .init_some()
+                    .set_raw(path.to_full(&store_dir).as_bytes()),
                 None => result.set_none(()),
             }
             Ok(())
@@ -899,12 +972,14 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
-            let path = read_store_path(params.get()?.get_path()?)?;
+            let path = read_store_path(params.get()?.get_path()?, &store_dir)?;
             let referrers = store.query_referrers(&tenant, &path).await;
             write_store_paths(
                 results.get().init_result(referrers.len() as u32),
                 &referrers,
+                &store_dir,
             );
             Ok(())
         }
@@ -917,10 +992,15 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
-            let paths = read_store_paths(params.get()?.get_paths()?)?;
+            let paths = read_store_paths(params.get()?.get_paths()?, &store_dir)?;
             let subs = store.query_substitutable_paths(&tenant, &paths).await;
-            write_store_paths(results.get().init_result(subs.len() as u32), &subs);
+            write_store_paths(
+                results.get().init_result(subs.len() as u32),
+                &subs,
+                &store_dir,
+            );
             Ok(())
         }
     }
@@ -944,6 +1024,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
             // DerivedPath is a union of opaque/built; both name a store path.
             let mut targets = Vec::new();
@@ -951,11 +1032,12 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 use crate::daemon_capnp::legacy_protocol::derived_path;
                 match target.get_raw().which()? {
                     derived_path::raw::Which::Opaque(opaque) => {
-                        targets.push(read_store_path(opaque?.get_path()?)?)
+                        targets.push(read_store_path(opaque?.get_path()?, &store_dir)?)
                     }
-                    derived_path::raw::Which::Built(built) => {
-                        targets.push(read_store_path(built?.get_drv_path()?.get_path()?)?)
-                    }
+                    derived_path::raw::Which::Built(built) => targets.push(read_store_path(
+                        built?.get_drv_path()?.get_path()?,
+                        &store_dir,
+                    )?),
                 }
             }
 
@@ -966,16 +1048,19 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     .reborrow()
                     .init_will_build(missing.will_build.len() as u32),
                 &missing.will_build,
+                &store_dir,
             );
             write_store_paths(
                 result
                     .reborrow()
                     .init_will_substitute(missing.will_substitute.len() as u32),
                 &missing.will_substitute,
+                &store_dir,
             );
             write_store_paths(
                 result.reborrow().init_unknown(missing.unknown.len() as u32),
                 &missing.unknown,
+                &store_dir,
             );
             result.set_download_size(missing.download_size);
             result.set_nar_size(missing.nar_size);
@@ -990,9 +1075,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
             let params = params.get()?;
-            let path = read_store_path(params.get_path()?)?;
+            let path = read_store_path(params.get_path()?, &store_dir)?;
             let sigs = params
                 .get_signatures()?
                 .iter()
@@ -1037,7 +1123,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         let staged = self.clone();
         async move {
             let wire_info = params.get()?.get_info()?;
-            let info = read_path_info(wire_info)?;
+            let info = read_path_info(wire_info, &staged.store_dir)?;
             let ca = read_content_address(wire_info.get_unkeyed_valid_path_info()?)?;
             tracing::debug!(path = %info.path, content_addressed = ca.is_some(), "receiving nar");
             let sink: legacy_protocol::stream::Client =
@@ -1056,9 +1142,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
         let uploader = self.uploader.clone();
+        let store_dir = self.store_dir.clone();
         async move {
             let params = params.get()?;
-            let path = read_store_path(params.get_path()?)?;
+            let path = read_store_path(params.get_path()?, &store_dir)?;
             let into = params.get_into()?;
 
             // Every path's bytes are in the object store, whichever route it
@@ -1141,10 +1228,11 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
             for target in params.get()?.get_paths()?.iter() {
-                let (path, built) = read_derived_path(target)?;
-                realise(&*store, &tenant, &path, built).await?;
+                let (path, built) = read_derived_path(target, &store_dir)?;
+                realise(&*store, &tenant, &path, built, &store_dir).await?;
             }
             Ok(())
         }
@@ -1157,12 +1245,13 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
+        let store_dir = self.store_dir.clone();
         async move {
             let targets = params.get()?.get_paths()?;
             let mut resolved = Vec::new();
             for target in targets.iter() {
-                let (path, built) = read_derived_path(target)?;
-                realise(&*store, &tenant, &path, built).await?;
+                let (path, built) = read_derived_path(target, &store_dir)?;
+                realise(&*store, &tenant, &path, built, &store_dir).await?;
                 resolved.push(path);
             }
 
@@ -1175,7 +1264,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     .init_raw()
                     .init_opaque()
                     .init_path()
-                    .set_raw(path.as_str().as_bytes());
+                    .set_raw(path.to_full(&store_dir).as_bytes());
                 let mut result = keyed.init_result();
                 // Only opaque paths reach here, and `realise` has already
                 // confirmed each one is valid — so nothing was built.
@@ -1207,9 +1296,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         let store = self.store.clone();
         let tenant = self.tenant.id.clone();
         let staged = self.staged.borrow().clone();
+        let store_dir = self.store_dir.clone();
         async move {
             let params = params.get()?;
-            let path = read_store_path(params.get_path()?)?;
+            let path = read_store_path(params.get_path()?, &store_dir)?;
             let drv = params.get_drv()?.to_vec();
 
             // Recompute, rather than trust, every fixed-output path this
@@ -1220,10 +1310,9 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             // it at this boundary either (PLAN.md Phase 14). Either way, what
             // this loop settles on for each output is exactly what the job's
             // capability token will authorize below.
-            let parsed = derivation::parse(&drv)
+            let parsed = derivation::parse(&drv, &store_dir)
                 .map_err(|e| rpc_error::failed(format!("kubernix: malformed derivation: {e}")))?;
             let drv_name = derivation_name(&path);
-            let store_dir = path.store_dir().unwrap_or("/nix/store");
             let mut expected_outputs = Vec::with_capacity(parsed.outputs.len());
             for output in &parsed.outputs {
                 let verified_path = if output.algo.is_empty() {
@@ -1234,7 +1323,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                         &output.name,
                         &output.algo,
                         &output.hash,
-                        store_dir,
+                        &store_dir,
                     )
                     .ok_or_else(|| {
                         tracing::warn!(
@@ -1299,8 +1388,14 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     infos,
                     log_key,
                 } => {
-                    match record_outputs(&*store, &tenant, &infos, &capability.expected_outputs)
-                        .await
+                    match record_outputs(
+                        &*store,
+                        &tenant,
+                        &infos,
+                        &capability.expected_outputs,
+                        &store_dir,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             tracing::info!(%path, ?outputs, %log_key, "build succeeded");
@@ -1408,6 +1503,7 @@ impl legacy_protocol::stream::Server for NarSink {
                     Some(ca) => {
                         match crate::store_path::verify(
                             &self.info.path,
+                            &self.connection.store_dir,
                             ca,
                             &self.info.references,
                             &nar,
@@ -1534,7 +1630,14 @@ impl legacy_protocol::stream::Server for NarSink {
             // as the path. A verified push is one we derived ourselves, so it is
             // ours to vouch for; a quarantined one is left unsigned.
             let mut info = self.info.clone();
-            sign_if_vouchable(&*self.store, &self.connection.tenant.id, &mut info, tier).await;
+            sign_if_vouchable(
+                &*self.store,
+                &self.connection.tenant.id,
+                &mut info,
+                tier,
+                &self.connection.store_dir,
+            )
+            .await;
 
             let references = info.references.clone();
             let deriver = info.deriver.clone().unwrap_or_default();
@@ -1575,8 +1678,9 @@ mod tests {
     use super::*;
     use crate::store::{Hash, HashType, MemoryStore, PathInfo};
 
-    const DRV: &str = "/nix/store/00000000000000000000000000000000-thing.drv";
-    const OUT: &str = "/nix/store/11111111111111111111111111111111-thing";
+    const STORE_DIR: &str = "/nix/store";
+    const DRV: &str = "00000000000000000000000000000000-thing.drv";
+    const OUT: &str = "11111111111111111111111111111111-thing";
 
     fn info(path: &str) -> PathInfo {
         PathInfo {
@@ -1615,7 +1719,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            realise(&*store, &t, &StorePath::new(OUT), false)
+            realise(&*store, &t, &StorePath::new(OUT), false, STORE_DIR)
                 .await
                 .is_ok()
         );
@@ -1624,7 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn an_opaque_path_that_is_missing_is_an_error() {
         let store = MemoryStore::new();
-        let error = realise(&*store, &tenant(), &StorePath::new(OUT), false)
+        let error = realise(&*store, &tenant(), &StorePath::new(OUT), false, STORE_DIR)
             .await
             .expect_err("should refuse");
         assert!(error.extra.contains("path not in store"));
@@ -1636,7 +1740,7 @@ mod tests {
         // reached the worker and died there with a parse error. The frontend has
         // no derivation to send, so it must say so here.
         let store = MemoryStore::new();
-        let error = realise(&*store, &tenant(), &StorePath::new(DRV), true)
+        let error = realise(&*store, &tenant(), &StorePath::new(DRV), true, STORE_DIR)
             .await
             .expect_err("should refuse");
 
@@ -1663,7 +1767,7 @@ mod tests {
         let (alice, bob) = (tenant(), bob());
 
         let mut pushed = info(OUT);
-        sign_if_vouchable(&*store, &alice, &mut pushed, Tier::Verified).await;
+        sign_if_vouchable(&*store, &alice, &mut pushed, Tier::Verified, STORE_DIR).await;
         store
             .record_path(&alice, pushed, object("k"), Tier::Verified)
             .await
@@ -1673,7 +1777,7 @@ mod tests {
         assert!(!store.is_valid_path(&bob, &StorePath::new(OUT)).await);
 
         let hash_part = StorePath::new(OUT).hash_part().unwrap().to_string();
-        let resolved = resolve_verified(&*store, &bob, &hash_part).await;
+        let resolved = resolve_verified(&*store, &bob, &hash_part, STORE_DIR).await;
         assert_eq!(resolved, Some(StorePath::new(OUT)));
 
         // Bob now has his own row, not a view onto Alice's.
@@ -1698,7 +1802,10 @@ mod tests {
     async fn resolve_verified_finds_nothing_for_a_path_nobody_has() {
         let store = MemoryStore::new();
         let hash_part = StorePath::new(OUT).hash_part().unwrap().to_string();
-        assert_eq!(resolve_verified(&*store, &bob(), &hash_part).await, None);
+        assert_eq!(
+            resolve_verified(&*store, &bob(), &hash_part, STORE_DIR).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -1710,7 +1817,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(is_valid_path_anywhere(&*store, &bob, &StorePath::new(OUT)).await);
+        assert!(is_valid_path_anywhere(&*store, &bob, &StorePath::new(OUT), STORE_DIR).await);
     }
 
     #[tokio::test]
@@ -1724,7 +1831,7 @@ mod tests {
 
         // Only `Verified` is provably identical across tenants; `Built` stays
         // strictly per-tenant, unaffected by this fallback.
-        assert!(!is_valid_path_anywhere(&*store, &bob, &StorePath::new(OUT)).await);
+        assert!(!is_valid_path_anywhere(&*store, &bob, &StorePath::new(OUT), STORE_DIR).await);
     }
 
     #[tokio::test]
@@ -1741,7 +1848,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            realise(&*store, &bob, &StorePath::new(OUT), false)
+            realise(&*store, &bob, &StorePath::new(OUT), false, STORE_DIR)
                 .await
                 .is_ok()
         );
@@ -1761,7 +1868,7 @@ mod tests {
         }
     }
 
-    const OTHER: &str = "/nix/store/22222222222222222222222222222222-unrelated";
+    const OTHER: &str = "22222222222222222222222222222222-unrelated";
 
     #[tokio::test]
     async fn record_outputs_records_a_fully_verified_batch() {
@@ -1769,7 +1876,7 @@ mod tests {
         let t = tenant();
         let expected = vec![("out".to_string(), StorePath::new(OUT))];
 
-        record_outputs(&*store, &t, &[output_info(OUT, "k")], &expected)
+        record_outputs(&*store, &t, &[output_info(OUT, "k")], &expected, STORE_DIR)
             .await
             .expect("every reported output is in the verified set");
 
@@ -1786,7 +1893,7 @@ mod tests {
         let expected = vec![("out".to_string(), StorePath::new(OUT))];
         let infos = [output_info(OUT, "k1"), output_info(OTHER, "k2")];
 
-        let rejected = record_outputs(&*store, &t, &infos, &expected)
+        let rejected = record_outputs(&*store, &t, &infos, &expected, STORE_DIR)
             .await
             .expect_err("a bogus output should refuse the whole batch");
         assert_eq!(rejected, vec![StorePath::new(OTHER)]);

@@ -58,12 +58,13 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// `Store::makeStorePath`: `<type>:<hash>:<storeDir>:<name>`, sha256'd,
-/// compressed to 20 bytes, base32'd.
+/// compressed to 20 bytes, base32'd. `store_dir` only feeds the hash — Nix's
+/// formula folds it in — the returned string is the bare `<hash>-<name>`.
 pub fn make_store_path(store_dir: &str, ty: &str, hash_hex: &str, name: &str) -> String {
     let s = format!("{ty}:{hash_hex}:{store_dir}:{name}");
     let digest = Sha256::digest(s.as_bytes());
     let compressed = compress_hash(&digest, 20);
-    format!("{store_dir}/{}-{name}", base32_encode(&compressed))
+    format!("{}-{name}", base32_encode(&compressed))
 }
 
 /// Stuff references into the type string, as `makeType` does.
@@ -74,13 +75,7 @@ fn make_type(store_dir: &str, base: &str, references: &[StorePath], self_ref: bo
     let mut ty = base.to_string();
     for reference in references {
         ty.push(':');
-        // References are already printed paths on our wire, but tolerate a bare
-        // name so callers cannot accidentally produce `…:/nix/store//nix/store/…`.
-        if reference.as_str().starts_with(store_dir) {
-            ty.push_str(reference.as_str());
-        } else {
-            ty.push_str(&format!("{store_dir}/{reference}"));
-        }
+        ty.push_str(&reference.to_full(store_dir));
     }
     if self_ref {
         ty.push_str(":self");
@@ -247,15 +242,13 @@ impl std::fmt::Display for Rejection {
 /// under someone else's name.
 pub fn verify(
     path: &StorePath,
+    store_dir: &str,
     ca: &ContentAddress,
     references: &[StorePath],
     nar: &[u8],
 ) -> std::result::Result<(), Rejection> {
     let name = path
         .name()
-        .ok_or(Rejection::Unverifiable("not a store path"))?;
-    let store_dir = path
-        .store_dir()
         .ok_or(Rejection::Unverifiable("not a store path"))?;
 
     if ca.algo != "sha256" {
@@ -403,7 +396,7 @@ mod tests {
             )
             .as_ref()
             .map(StorePath::as_str),
-            Some("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt")
+            Some("cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt")
         );
     }
 
@@ -422,7 +415,7 @@ mod tests {
             )
             .as_ref()
             .map(StorePath::as_str),
-            Some("/nix/store/6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt")
+            Some("6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt")
         );
     }
 
@@ -442,7 +435,7 @@ mod tests {
             )
             .as_ref()
             .map(StorePath::as_str),
-            Some("/nix/store/ik0brqacj8rn97il4ygixp855xyh64ld-greeting")
+            Some("ik0brqacj8rn97il4ygixp855xyh64ld-greeting")
         );
     }
 
@@ -456,7 +449,7 @@ mod tests {
             verify_fixed_output("f.txt", "out", "sha256", FLAT_HASH, "/nix/store")
                 .as_ref()
                 .map(StorePath::as_str),
-            Some("/nix/store/6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt")
+            Some("6mhsdfmq1xchgx34768mghvp3jlw3fg4-f.txt")
         );
     }
 
@@ -470,7 +463,7 @@ mod tests {
             verify_fixed_output("f.txt", "out", "r:sha256", &nar_hash, "/nix/store")
                 .as_ref()
                 .map(StorePath::as_str),
-            Some("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt")
+            Some("cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt")
         );
     }
 
@@ -513,7 +506,7 @@ mod tests {
             "sha256",
             &hash,
             &[StorePath::new(
-                "/nix/store/00000000000000000000000000000000-dep",
+                "00000000000000000000000000000000-dep",
             )],
         );
         assert_ne!(bare, with);
@@ -534,7 +527,7 @@ mod tests {
                 "sha256",
                 &hash,
                 &[StorePath::new(
-                    "/nix/store/00000000000000000000000000000000-dep",
+                    "00000000000000000000000000000000-dep",
                 )],
             ),
             None
@@ -569,7 +562,7 @@ mod tests {
             hash: Sha256::digest(&nar).to_vec(),
         };
         (
-            StorePath::new("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt"),
+            StorePath::new("cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt"),
             ca,
             nar,
         )
@@ -578,7 +571,7 @@ mod tests {
     #[test]
     fn accepts_content_that_matches_its_address() {
         let (path, ca, nar) = honest_push();
-        assert_eq!(verify(&path, &ca, &[], &nar), Ok(()));
+        assert_eq!(verify(&path, "/nix/store", &ca, &[], &nar), Ok(()));
     }
 
     #[test]
@@ -587,7 +580,7 @@ mod tests {
         let (path, ca, mut nar) = honest_push();
         nar.extend_from_slice(b"tampered");
         assert!(matches!(
-            verify(&path, &ca, &[], &nar),
+            verify(&path, "/nix/store", &ca, &[], &nar),
             Err(Rejection::HashMismatch { .. })
         ));
     }
@@ -598,15 +591,15 @@ mod tests {
         // presented at a path it does not belong at. Only recomputing the path
         // catches this — the hash check alone passes.
         let (_, ca, nar) = honest_push();
-        let claimed = StorePath::new("/nix/store/00000000000000000000000000000000-bash");
-        match verify(&claimed, &ca, &[], &nar) {
+        let claimed = StorePath::new("00000000000000000000000000000000-bash");
+        match verify(&claimed, "/nix/store", &ca, &[], &nar) {
             Err(Rejection::WrongPath { computed, .. }) => {
                 assert_ne!(computed, claimed.to_string());
                 // The name is itself part of what is hashed, so the content does
                 // not even land at the same hash under a different name — a
                 // client cannot rename its way into an existing path.
                 assert!(computed.ends_with("-bash"));
-                assert!(!computed.starts_with("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r"));
+                assert!(!computed.starts_with("cqarpckbfd0dmdylgwx5rc2wqaz2882r"));
             }
             other => panic!("should have refused the path, got {other:?}"),
         }
@@ -618,10 +611,10 @@ mod tests {
         // which means a client cannot smuggle extra references past us.
         let (path, ca, nar) = honest_push();
         let refs = vec![StorePath::new(
-            "/nix/store/00000000000000000000000000000000-dep",
+            "00000000000000000000000000000000-dep",
         )];
         assert!(matches!(
-            verify(&path, &ca, &refs, &nar),
+            verify(&path, "/nix/store", &ca, &refs, &nar),
             Err(Rejection::WrongPath { .. })
         ));
     }
@@ -638,7 +631,8 @@ mod tests {
         };
         assert_eq!(
             verify(
-                &StorePath::new("/nix/store/ik0brqacj8rn97il4ygixp855xyh64ld-greeting"),
+                &StorePath::new("ik0brqacj8rn97il4ygixp855xyh64ld-greeting"),
+                "/nix/store",
                 &ca,
                 &[],
                 &nar_of(contents),
@@ -655,23 +649,22 @@ mod tests {
         // waved through as verified.
         ca.algo = "sha512".to_string();
         assert!(matches!(
-            verify(&path, &ca, &[], &nar),
+            verify(&path, "/nix/store", &ca, &[], &nar),
             Err(Rejection::Unverifiable(_))
         ));
 
         // Nor may a non-store path.
         let (_, ca, nar) = honest_push();
         assert!(matches!(
-            verify(&StorePath::new("/etc/passwd"), &ca, &[], &nar),
+            verify(&StorePath::new("not-a-store-path"), "/nix/store", &ca, &[], &nar),
             Err(Rejection::Unverifiable(_))
         ));
     }
 
     #[test]
     fn splits_paths() {
-        let p = StorePath::new("/nix/store/cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt");
+        let p = StorePath::new("cqarpckbfd0dmdylgwx5rc2wqaz2882r-f.txt");
         assert_eq!(p.name(), Some("f.txt"));
-        assert_eq!(p.store_dir(), Some("/nix/store"));
-        assert_eq!(StorePath::new("/etc/passwd").name(), None);
+        assert_eq!(StorePath::new("not-a-store-path").name(), None);
     }
 }

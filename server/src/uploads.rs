@@ -402,7 +402,7 @@ mod tests {
         crate::tenant::Tenant::from_ssh(name, None, false).id
     }
 
-    const P: &str = "/nix/store/00000000000000000000000000000000-thing";
+    const P: &str = "00000000000000000000000000000000-thing";
 
     fn p() -> kubernix_types::StorePath {
         kubernix_types::StorePath::new(P)
@@ -604,7 +604,7 @@ mod tests {
             job_id: uuid::Uuid::new_v4(),
             tenant: tenant.clone(),
             derivation_path: kubernix_types::StorePath::new(
-                "/nix/store/00000000000000000000000000000000-x.drv",
+                "00000000000000000000000000000000-x.drv",
             ),
             expected_outputs: vec![("out".to_string(), p())],
         }
@@ -685,7 +685,7 @@ mod tests {
             &alice,
             crate::store::Tier::Built,
             &kubernix_types::StorePath::new(
-                "/nix/store/22222222222222222222222222222222-unrelated",
+                "22222222222222222222222222222222-unrelated",
             ),
         )
         .unwrap();

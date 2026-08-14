@@ -15,6 +15,7 @@
 //!   `KUBERNIX_SSH_HOST_KEY`        host key path (generated if absent)
 //!   `KUBERNIX_SSH_AUTHORIZED_KEYS` authorized_keys path; if unset, any key is accepted
 //!   `DATABASE_URL`                 PostgreSQL; if unset, an in-memory store is used
+//!   `KUBERNIX_STORE_DIR`           store dir a client's paths are prefixed with (default `/nix/store`)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut rpc_config = RpcConfig::default();
+    if let Ok(store_dir) = std::env::var("KUBERNIX_STORE_DIR") {
+        rpc_config.store_dir = store_dir;
+    }
 
     // Without a database the frontend still works, but every path it knows is
     // forgotten on restart — which strands objects a worker already uploaded.

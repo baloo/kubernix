@@ -31,8 +31,10 @@ pub struct Hash {
 }
 
 /// Everything `queryPathInfo` answers with, and everything a `narinfo` is made
-/// of. Store paths are the full printed form (`/nix/store/<hash>-<name>`) —
-/// that is what `StorePath.raw` carries on the wire (`types-rpc.hh:25-38`).
+/// of. Store paths here are bare (`<hash>-<name>`, no store directory) — see
+/// [`kubernix_types::StorePath`]; the daemon protocol boundary
+/// (`StorePath.raw`, `types-rpc.hh:25-38`) is where the full printed form is
+/// reconstructed and parsed.
 #[derive(Clone, Debug)]
 pub struct PathInfo {
     pub path: StorePath,
@@ -627,7 +629,7 @@ mod tests {
         }
     }
 
-    const P: &str = "/nix/store/00000000000000000000000000000000-thing";
+    const P: &str = "00000000000000000000000000000000-thing";
 
     fn p() -> StorePath {
         StorePath::new(P)
@@ -675,7 +677,7 @@ mod tests {
     async fn tracks_referrers() {
         let store = MemoryStore::new();
         let t = tenant("alice");
-        let dep = "/nix/store/11111111111111111111111111111111-dep";
+        let dep = "11111111111111111111111111111111-dep";
         store
             .record_path(&t, info(dep), object("d"), Tier::Verified)
             .await

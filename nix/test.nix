@@ -218,6 +218,10 @@ pkgs.testers.nixosTest {
         assert "BUILDING-REMOTELY" in result, f"build log did not stream back:\n{result}"
 
         out = [l for l in result.splitlines() if l.startswith("/nix/store/")][-1].strip()
+        # `store_paths.path` holds the bare `<hash>-<name>` form now — see
+        # kubernix_types::StorePath's doc comment — while every `nix`/`curl`
+        # command below still wants the full printed path.
+        out_bare = out.split("/")[-1]
         print(f"built {out}")
         content = machine.succeed(f"cat ${clientStore}{out}")
         assert "built by kubernix" in content, f"unexpected output: {content}"
@@ -279,6 +283,7 @@ pkgs.testers.nixosTest {
         pushed = machine.succeed(
             "nix build -f ${unverifiable} --no-link --print-out-paths"
         ).strip()
+        pushed_bare = pushed.split("/")[-1]
         machine.succeed(
             f"NIX_SSHOPTS='{ssh_opts}' nix --plugin-files {plugin} copy "
             f"--to 'kubernix://root@127.0.0.1?port=2222' {pushed} --no-check-sigs"
@@ -287,7 +292,7 @@ pkgs.testers.nixosTest {
         tier, sigs = machine.succeed(
             "psql -U postgres -h 127.0.0.1 kubernix -tAc "
             f"\"SELECT tier, coalesce(array_length(sigs,1),0) FROM store_paths "
-            f"WHERE path = '{pushed}'\""
+            f"WHERE path = '{pushed_bare}'\""
         ).strip().split("|")
         assert tier == "quarantined", f"unverifiable push should be quarantined, got {tier}"
         assert int(sigs) == 0, "a quarantined path must never be signed"
@@ -363,7 +368,7 @@ pkgs.testers.nixosTest {
         machine.succeed(
             "psql -U postgres -h 127.0.0.1 kubernix -c "
             f"\"UPDATE store_paths SET last_access = NOW() - INTERVAL '1 hour' "
-            f"WHERE path = '{out}'\""
+            f"WHERE path = '{out_bare}'\""
         )
 
         # kubernix-gc's drain -> mark -> sweep -> reap all happen within one
@@ -376,7 +381,7 @@ pkgs.testers.nixosTest {
             state = machine.succeed(
                 "psql -U postgres -h 127.0.0.1 kubernix -tAc "
                 f"\"SELECT coalesce(state, 'gone') FROM store_paths "
-                f"WHERE path = '{out}'\""
+                f"WHERE path = '{out_bare}'\""
             ).strip()
             if state in ("", "gone"):
                 break

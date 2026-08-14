@@ -131,6 +131,7 @@ pub async fn upload_output(
     nix_store: &str,
     nix_cli: &str,
     store_uri: Option<&str>,
+    store_dir: &str,
 ) -> Result<OutputArtifact, Box<dyn std::error::Error>> {
     // `nix store dump-path`, not `nix-store --dump`: the latter takes a
     // *filesystem* path and ignores --store entirely, so it cannot find an
@@ -141,7 +142,7 @@ pub async fn upload_output(
         command.arg("--store").arg(uri);
     }
     let mut child = command
-        .arg(store_path.as_str())
+        .arg(store_path.to_full(store_dir))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -207,7 +208,8 @@ pub async fn upload_output(
         return Err(format!("uploading {key}: HTTP {}", response.status()).into());
     }
 
-    let (references, deriver) = query_path_metadata(nix_store, store_path, store_uri).await?;
+    let (references, deriver) =
+        query_path_metadata(nix_store, store_path, store_uri, store_dir).await?;
 
     Ok(OutputArtifact {
         store_path: store_path.clone(),
@@ -238,6 +240,7 @@ pub async fn fetch_input(
     deriver: &StorePath,
     nix_store: &str,
     store_uri: Option<&str>,
+    store_dir: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = http.get(url).send().await?;
     if !response.status().is_success() {
@@ -285,7 +288,9 @@ pub async fn fetch_input(
         }
 
         stdin
-            .write_all(&crate::nar_export::trailer(store_path, references, deriver))
+            .write_all(&crate::nar_export::trailer(
+                store_path, references, deriver, store_dir,
+            ))
             .await?;
         stdin.shutdown().await?;
     }
@@ -329,6 +334,7 @@ async fn query_path_metadata(
     nix_store: &str,
     store_path: &StorePath,
     store_uri: Option<&str>,
+    store_dir: &str,
 ) -> Result<(Vec<StorePath>, StorePath), Box<dyn std::error::Error>> {
     let with_store = |cmd: &str| {
         let mut c = Command::new(nix_store);
@@ -341,17 +347,25 @@ async fn query_path_metadata(
 
     let references = with_store("--query")
         .arg("--references")
-        .arg(store_path.as_str())
+        .arg(store_path.to_full(store_dir))
         .output()
         .await?;
+    // `nix-store --query` prints full paths, rooted at whatever store
+    // directory the local `nix-store` is actually configured for. A mismatch
+    // against `store_dir` means this worker's `KUBERNIX_STORE_DIR` disagrees
+    // with its real store — a misconfiguration worth failing loudly on
+    // rather than silently corrupting every path derived from it.
     let references = String::from_utf8_lossy(&references.stdout)
         .lines()
-        .map(StorePath::new)
-        .collect();
+        .map(|s| {
+            StorePath::from_full(store_dir, s)
+                .ok_or_else(|| format!("{s} is not rooted at KUBERNIX_STORE_DIR ({store_dir})"))
+        })
+        .collect::<Result<_, _>>()?;
 
     let deriver = with_store("--query")
         .arg("--deriver")
-        .arg(store_path.as_str())
+        .arg(store_path.to_full(store_dir))
         .output()
         .await?;
     let deriver = String::from_utf8_lossy(&deriver.stdout).trim().to_string();
@@ -359,7 +373,9 @@ async fn query_path_metadata(
     let deriver = if deriver == "unknown-deriver" {
         StorePath::default()
     } else {
-        StorePath::new(deriver)
+        StorePath::from_full(store_dir, &deriver).ok_or_else(|| {
+            format!("{deriver} is not rooted at KUBERNIX_STORE_DIR ({store_dir})")
+        })?
     };
 
     Ok((references, deriver))
@@ -370,7 +386,7 @@ mod tests {
     use super::{log_key, nar_key};
     use kubernix_types::{ObjectKey, StorePath, TenantId};
 
-    const P: &str = "/nix/store/21d91afy6vgw4l00yzy92kp92b1w3cdm-kxs-testfile.txt";
+    const P: &str = "21d91afy6vgw4l00yzy92kp92b1w3cdm-kxs-testfile.txt";
 
     fn p() -> StorePath {
         StorePath::new(P)

@@ -55,7 +55,7 @@ struct CapabilitySecretCache {
 
 const CAPABILITY_SECRET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// `/nix/store/<32-char hash>-<name>` → `<32-char hash>`.
+/// `<32-char hash>-<name>` → `<32-char hash>`.
 ///
 /// Stored alongside the path so `queryPathFromHashPart` is an index lookup.
 fn hash_part_of(path: &str) -> &str {
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn extracts_the_hash_part() {
         assert_eq!(
-            hash_part_of("/nix/store/00000000000000000000000000000000-thing"),
+            hash_part_of("00000000000000000000000000000000-thing"),
             "00000000000000000000000000000000"
         );
         // Not a store path: the column is still NOT NULL, so this must produce
@@ -791,8 +791,8 @@ mod tests {
         }
     }
 
-    const P: &str = "/nix/store/00000000000000000000000000000000-thing";
-    const DEP: &str = "/nix/store/11111111111111111111111111111111-dep";
+    const P: &str = "00000000000000000000000000000000-thing";
+    const DEP: &str = "11111111111111111111111111111111-dep";
 
     fn p() -> StorePath {
         StorePath::new(P)
@@ -1067,7 +1067,7 @@ mod tests {
         // the lookup by hash part alone (no tenant argument) must find it.
         let Some(store) = db().await else { return };
         let alice = tenant("find-verified-alice");
-        let path = "/nix/store/22222222222222222222222222222222-thing";
+        let path = "22222222222222222222222222222222-thing";
         store
             .record_path(
                 &alice,
@@ -1093,7 +1093,7 @@ mod tests {
         // lookup, even though they exist.
         let Some(store) = db().await else { return };
         let alice = tenant("find-verified-built");
-        let path = "/nix/store/33333333333333333333333333333333-thing";
+        let path = "33333333333333333333333333333333-thing";
         store
             .record_path(&alice, info(path), object("alice/nar/x"), Tier::Built)
             .await
@@ -1114,7 +1114,7 @@ mod tests {
         // second tenant as something worth materializing a fresh copy of.
         let Some(store) = db().await else { return };
         let alice = tenant("find-verified-marked");
-        let path = "/nix/store/44444444444444444444444444444444-thing";
+        let path = "44444444444444444444444444444444-thing";
         store
             .record_path(
                 &alice,
@@ -1189,7 +1189,7 @@ mod tests {
         let t = tenant("job-completed");
         let job_id = uuid::Uuid::new_v4();
         let drv = StorePath::new(format!(
-            "/nix/store/00000000000000000000000000000000-{job_id}.drv"
+            "00000000000000000000000000000000-{job_id}.drv"
         ));
 
         store
@@ -1227,7 +1227,7 @@ mod tests {
         let t = tenant("job-failed");
         let job_id = uuid::Uuid::new_v4();
         let drv = StorePath::new(format!(
-            "/nix/store/00000000000000000000000000000000-{job_id}.drv"
+            "00000000000000000000000000000000-{job_id}.drv"
         ));
 
         store

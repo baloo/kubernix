@@ -141,10 +141,10 @@ mod tests {
         Capability {
             job_id: Uuid::new_v4(),
             tenant: TenantId::from_wire("user-alice-0000000000000000").expect("well formed"),
-            derivation_path: StorePath::new("/nix/store/00000000000000000000000000000000-x.drv"),
+            derivation_path: StorePath::new("00000000000000000000000000000000-x.drv"),
             expected_outputs: vec![(
                 "out".to_string(),
-                StorePath::new("/nix/store/11111111111111111111111111111111-x"),
+                StorePath::new("11111111111111111111111111111111-x"),
             )],
         }
     }

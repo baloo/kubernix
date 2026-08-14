@@ -591,7 +591,7 @@ mod tests {
     /// production code does, rather than inserting the row directly.
     async fn record_job(store: &PostgresStore, t: &TenantId, job_id: Uuid, log_key: &str) {
         let drv = kubernix_types::StorePath::new(format!(
-            "/nix/store/00000000000000000000000000000000-{job_id}.drv"
+            "00000000000000000000000000000000-{job_id}.drv"
         ));
         store
             .record_job_outcome(
@@ -612,7 +612,7 @@ mod tests {
     async fn a_stale_unreferenced_path_is_marked() {
         let Some(store) = db().await else { return };
         let t = tenant("stale");
-        let path = "/nix/store/00000000000000000000000000000001-a";
+        let path = "00000000000000000000000000000001-a";
         store
             .record_path(&t, info(path), object("gc/a"), Tier::Verified)
             .await
@@ -660,8 +660,8 @@ mod tests {
         // must not be collected just because nothing reads it directly.
         let Some(store) = db().await else { return };
         let t = tenant("shared-dep");
-        let dep = "/nix/store/00000000000000000000000000000002-dep";
-        let referrer = "/nix/store/00000000000000000000000000000003-referrer";
+        let dep = "00000000000000000000000000000002-dep";
+        let referrer = "00000000000000000000000000000003-referrer";
 
         store
             .record_path(&t, info(dep), object("gc/dep"), Tier::Verified)
@@ -688,7 +688,7 @@ mod tests {
     async fn a_read_while_marked_resurrects_the_row() {
         let Some(store) = db().await else { return };
         let t = tenant("resurrect");
-        let path = "/nix/store/00000000000000000000000000000004-r";
+        let path = "00000000000000000000000000000004-r";
         store
             .record_path(&t, info(path), object("gc/r"), Tier::Verified)
             .await
@@ -729,7 +729,7 @@ mod tests {
         let Some(store) = db().await else { return };
         let Some(uploader) = s3().await else { return };
         let t = tenant("sweep");
-        let path = "/nix/store/00000000000000000000000000000005-s";
+        let path = "00000000000000000000000000000005-s";
         // A key private to this test, under the tenant's own prefix, so a
         // failure here cannot step on another test's object.
         let key = ObjectKey::new(format!("{t}/nar/gc-sweep-test.nar.zst"));
@@ -780,7 +780,7 @@ mod tests {
         let Some(store) = db().await else { return };
         let Some(uploader) = s3().await else { return };
         let t = tenant("sweep-live");
-        let path = "/nix/store/00000000000000000000000000000006-l";
+        let path = "00000000000000000000000000000006-l";
         let key = ObjectKey::new(format!("{t}/nar/gc-sweep-live-test.nar.zst"));
 
         uploader
@@ -815,7 +815,7 @@ mod tests {
         let Some(store) = db().await else { return };
         let Some(uploader) = s3().await else { return };
         let t = tenant("full-pass");
-        let path = "/nix/store/00000000000000000000000000000007-p";
+        let path = "00000000000000000000000000000007-p";
         let key = ObjectKey::new(format!("{t}/nar/gc-full-pass-test.nar.zst"));
 
         uploader

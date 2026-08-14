@@ -49,17 +49,25 @@ fn write_str(out: &mut Vec<u8>, value: &[u8]) {
 ///
 /// Returned separately from the NAR so a caller can stream the NAR through
 /// without ever holding it: write the header, forward the NAR, then write this.
-pub fn trailer(store_path: &StorePath, references: &[StorePath], deriver: &StorePath) -> Vec<u8> {
+///
+/// `store_dir` reconstructs the full printed paths this format carries — see
+/// [`StorePath`]'s doc comment.
+pub fn trailer(
+    store_path: &StorePath,
+    references: &[StorePath],
+    deriver: &StorePath,
+    store_dir: &str,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(512);
     write_u64(&mut out, EXPORT_MAGIC);
-    write_str(&mut out, store_path.as_str().as_bytes());
+    write_str(&mut out, store_path.to_full(store_dir).as_bytes());
 
     write_u64(&mut out, references.len() as u64);
     for reference in references {
-        write_str(&mut out, reference.as_str().as_bytes());
+        write_str(&mut out, reference.to_full(store_dir).as_bytes());
     }
 
-    write_str(&mut out, deriver.as_str().as_bytes());
+    write_str(&mut out, deriver.to_full(store_dir).as_bytes());
     write_u64(&mut out, 0);
 
     // End of stream.
@@ -78,7 +86,10 @@ pub fn header() -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const P: &str = "/nix/store/00000000000000000000000000000000-thing";
+    const STORE_DIR: &str = "/nix/store";
+    const P: &str = "00000000000000000000000000000000-thing";
+    /// The full printed form `trailer` actually writes onto the wire.
+    const FULL_P: &str = "/nix/store/00000000000000000000000000000000-thing";
 
     fn p() -> StorePath {
         StorePath::new(P)
@@ -93,10 +104,10 @@ mod tests {
         let header = header();
         assert_eq!(read_u64(&header, 0), 1, "stream starts with a path marker");
 
-        let trailer = trailer(&p(), &[], &StorePath::default());
+        let trailer = trailer(&p(), &[], &StorePath::default(), STORE_DIR);
         assert_eq!(read_u64(&trailer, 0), EXPORT_MAGIC);
-        assert_eq!(read_u64(&trailer, 8) as usize, P.len());
-        assert_eq!(&trailer[16..16 + P.len()], P.as_bytes());
+        assert_eq!(read_u64(&trailer, 8) as usize, FULL_P.len());
+        assert_eq!(&trailer[16..16 + FULL_P.len()], FULL_P.as_bytes());
         assert_eq!(
             read_u64(&trailer, trailer.len() - 8),
             0,
@@ -108,12 +119,12 @@ mod tests {
     fn pads_strings_to_eight_bytes() {
         // A reader that mis-handles padding desynchronises for the rest of the
         // stream, so assert the field *after* the path lands where it should.
-        let padding = (8 - (P.len() % 8)) % 8;
+        let padding = (8 - (FULL_P.len() % 8)) % 8;
         assert_ne!(padding, 0, "this path should exercise padding");
 
-        let trailer = trailer(&p(), &[], &StorePath::default());
+        let trailer = trailer(&p(), &[], &StorePath::default(), STORE_DIR);
         // magic(8) + length(8) = 16, then the path itself.
-        let after_path = 16 + P.len() + padding;
+        let after_path = 16 + FULL_P.len() + padding;
         assert_eq!(
             read_u64(&trailer, after_path),
             0,
@@ -125,12 +136,18 @@ mod tests {
     fn carries_references_and_deriver() {
         // Without these a worker can fetch a path's bytes but not register it,
         // which is the whole reason they travel with the object key.
-        let dep = StorePath::new("/nix/store/11111111111111111111111111111111-dep");
-        let drv = StorePath::new("/nix/store/22222222222222222222222222222222-thing.drv");
-        let trailer = trailer(&p(), std::slice::from_ref(&dep), &drv);
+        let dep = StorePath::new("11111111111111111111111111111111-dep");
+        let drv = StorePath::new("22222222222222222222222222222222-thing.drv");
+        let trailer = trailer(&p(), std::slice::from_ref(&dep), &drv, STORE_DIR);
 
         let haystack = String::from_utf8_lossy(&trailer);
-        assert!(haystack.contains(dep.as_str()), "references must survive");
-        assert!(haystack.contains(drv.as_str()), "deriver must survive");
+        assert!(
+            haystack.contains(&dep.to_full(STORE_DIR)),
+            "references must survive"
+        );
+        assert!(
+            haystack.contains(&drv.to_full(STORE_DIR)),
+            "deriver must survive"
+        );
     }
 }

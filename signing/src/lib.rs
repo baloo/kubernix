@@ -41,6 +41,10 @@ pub struct Fingerprint<'a> {
     pub nar_hash: &'a [u8],
     pub nar_size: u64,
     pub references: &'a [StorePath],
+    /// Prepended to each reference: [`StorePath`] itself never carries the
+    /// store directory (see its doc comment), but a client recomputes this
+    /// fingerprint from full paths, so references have to be printed full too.
+    pub store_dir: &'a str,
 }
 
 /// What a signature is computed over.
@@ -51,7 +55,7 @@ pub fn fingerprint(f: &Fingerprint<'_>) -> String {
     let references = f
         .references
         .iter()
-        .map(StorePath::as_str)
+        .map(|r| r.to_full(f.store_dir))
         .collect::<Vec<_>>()
         .join(",");
     format!(
@@ -219,10 +223,11 @@ pub fn key_name_for(tenant: &TenantId) -> String {
 mod tests {
     use super::*;
 
+    const STORE_DIR: &str = "/nix/store";
     const PATH: &str = "/nix/store/00000000000000000000000000000000-thing";
     const REFS: [&str; 2] = [
-        "/nix/store/11111111111111111111111111111111-a",
-        "/nix/store/22222222222222222222222222222222-b",
+        "11111111111111111111111111111111-a",
+        "22222222222222222222222222222222-b",
     ];
 
     fn refs() -> Vec<StorePath> {
@@ -235,6 +240,7 @@ mod tests {
             nar_hash: &[0xab; 32],
             nar_size: 1234,
             references: refs,
+            store_dir: STORE_DIR,
         }
     }
 
@@ -253,8 +259,14 @@ mod tests {
         );
         assert!(fingerprint.contains(";1234;"), "nar size: {fingerprint}");
         assert!(
-            fingerprint.ends_with(&format!("{};{}", REFS[0], REFS[1]).replace(';', ",")),
-            "references are comma separated: {fingerprint}"
+            fingerprint.ends_with(
+                &format!(
+                    "{STORE_DIR}/{};{STORE_DIR}/{}",
+                    REFS[0], REFS[1]
+                )
+                .replace(';', ",")
+            ),
+            "references are comma separated, printed full: {fingerprint}"
         );
     }
 

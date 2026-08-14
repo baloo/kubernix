@@ -47,8 +47,8 @@ struct Job {
 /// Taken from the derivation rather than from a builder's stdout: with
 /// `nix-store --serve` stdout carries the protocol, and the derivation is the
 /// authoritative statement of where its outputs go regardless.
-fn declared_outputs(job: &Job) -> Result<Vec<StorePath>, Box<dyn std::error::Error>> {
-    let drv = derivation::parse(&job.drv)?;
+fn declared_outputs(job: &Job, store_dir: &str) -> Result<Vec<StorePath>, Box<dyn std::error::Error>> {
+    let drv = derivation::parse(&job.drv, store_dir)?;
     Ok(drv.outputs.into_iter().map(|o| o.path).collect())
 }
 
@@ -71,6 +71,7 @@ async fn fetch_inputs(
     job: &Job,
     nix_store: &str,
     store_uri: Option<&str>,
+    store_dir: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if job.inputs.is_empty() {
         return Ok(());
@@ -90,6 +91,7 @@ async fn fetch_inputs(
             &input.deriver,
             nix_store,
             store_uri,
+            store_dir,
         )
         .await?;
     }
@@ -116,6 +118,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // testing honest, since it cannot silently rely on the host's /nix/store.
     let nix_cli = std::env::var("KUBERNIX_NIX_CLI").unwrap_or_else(|_| "nix".to_string());
     let store_uri = std::env::var("KUBERNIX_NIX_STORE").ok();
+    // The store directory a real Nix client/CLI prepends to every path — see
+    // `kubernix_types::StorePath`'s doc comment for why the type itself never
+    // carries this.
+    let store_dir =
+        std::env::var("KUBERNIX_STORE_DIR").unwrap_or_else(|_| "/nix/store".to_string());
 
     tracing::info!(%nats_url, %system, "starting worker");
     let client = async_nats::connect(&nats_url).await?;
@@ -190,7 +197,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!(job_id = %job.job_id, drv = %job.derivation_path, inputs = job.inputs.len(), "building");
 
-        if let Err(e) = fetch_inputs(&client, &http, &job, &builder, store_uri.as_deref()).await {
+        if let Err(e) = fetch_inputs(
+            &client,
+            &http,
+            &job,
+            &builder,
+            store_uri.as_deref(),
+            &store_dir,
+        )
+        .await
+        {
             tracing::error!(job_id = %job.job_id, error = %e, "could not fetch inputs");
             let outcome = Outcome::Failed(format!("fetching inputs: {e}"));
             let _ = publish_result(&jetstream, &job, &outcome, &[], &ObjectKey::default()).await;
@@ -199,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Where the outputs will land, read from the derivation itself.
-        let outputs = match declared_outputs(&job) {
+        let outputs = match declared_outputs(&job, &store_dir) {
             Ok(outputs) => outputs,
             Err(e) => {
                 tracing::error!(job_id = %job.job_id, error = %e, "undecodable derivation");
@@ -211,8 +227,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let (mut outcome, log) =
-            run_build(&client, &job, outputs, &builder, store_uri.as_deref()).await;
+        let (mut outcome, log) = run_build(
+            &client,
+            &job,
+            outputs,
+            &builder,
+            store_uri.as_deref(),
+            &store_dir,
+        )
+        .await;
 
         // Artifacts first, then the result: publishing a success whose outputs
         // are not yet fetchable would be worse than reporting the upload failure.
@@ -225,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &builder,
             &nix_cli,
             store_uri.as_deref(),
+            &store_dir,
         )
         .await
         {
@@ -301,6 +325,7 @@ async fn upload_artifacts(
     nix_store: &str,
     nix_cli: &str,
     store_uri: Option<&str>,
+    store_dir: &str,
 ) -> Result<(Vec<upload::OutputArtifact>, ObjectKey), Box<dyn std::error::Error>> {
     let outputs: Vec<StorePath> = match outcome {
         Outcome::Completed(paths) => paths.clone(),
@@ -338,8 +363,17 @@ async fn upload_artifacts(
         let key = keys[i + 1].clone();
         tracing::info!(job_id = %job.job_id, %path, %key, "uploading output");
         artifacts.push(
-            upload::upload_output(http, &urls[i + 1], key, path, nix_store, nix_cli, store_uri)
-                .await?,
+            upload::upload_output(
+                http,
+                &urls[i + 1],
+                key,
+                path,
+                nix_store,
+                nix_cli,
+                store_uri,
+                store_dir,
+            )
+            .await?,
         );
     }
 
@@ -359,6 +393,7 @@ async fn run_build(
     outputs: Vec<StorePath>,
     builder: &str,
     store_uri: Option<&str>,
+    store_dir: &str,
 ) -> (Outcome, Vec<u8>) {
     let log_subject = format!("kubernix.logs.{}", job.job_id);
 
@@ -377,7 +412,7 @@ async fn run_build(
     let pump = tokio::spawn(pump_log(client.clone(), log_subject.clone(), stderr));
 
     let result = conn
-        .build_derivation(job.derivation_path.as_str(), &job.drv)
+        .build_derivation(&job.derivation_path.to_full(store_dir), &job.drv)
         .await;
 
     // Closing drops stdin, which is what tells `nix-store --serve` to exit, which

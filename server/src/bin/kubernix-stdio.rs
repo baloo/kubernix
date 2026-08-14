@@ -50,8 +50,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Default::default(),
             );
 
-            let bootstrap: bootstrap::Client =
-                capnp_rpc::new_client(BootstrapImpl::new(Config::default()));
+            let mut config = Config::default();
+            if let Ok(store_dir) = std::env::var("KUBERNIX_STORE_DIR") {
+                config.store_dir = store_dir;
+            }
+            let bootstrap: bootstrap::Client = capnp_rpc::new_client(BootstrapImpl::new(config));
 
             let rpc_system = RpcSystem::new(Box::new(network), Some(bootstrap.client));
 

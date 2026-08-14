@@ -1,4 +1,5 @@
-//! A Nix store path: `/nix/store/<32-char hash>-<name>`.
+//! A Nix store path: the bare `<32-char hash>-<name>` printed by a store
+//! object, without the store directory.
 //!
 //! Deliberately just a labelled `String`, not a `std::path::PathBuf`: the
 //! content-addressing hash is computed over the *exact bytes* of the printed
@@ -6,14 +7,42 @@
 //! act like a path (e.g. `Command::arg`) already accepts `&str` via
 //! `AsRef<OsStr>`. `Path`'s normalization semantics would be a hazard here,
 //! not a convenience.
+//!
+//! The store directory (`/nix/store` by default, but configurable) is
+//! deliberately not part of this type — it is a deployment-wide setting
+//! threaded separately wherever it's needed. [`StorePath::from_full`] and
+//! [`StorePath::to_full`] are the only places that combine the two, and exist
+//! solely for the boundaries that must speak the full printed form to
+//! something outside kubernix's control (the Lix daemon protocol, a `.drv`'s
+//! wire bytes, narinfo, signature fingerprints, and real `nix`/`nix-store`
+//! invocations).
 
-/// A Nix store path.
+/// A Nix store path, without its store directory.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorePath(String);
 
 impl StorePath {
     pub fn new(path: impl Into<String>) -> Self {
         StorePath(path.into())
+    }
+
+    /// Parse a full printed path (`<store_dir>/<hash>-<name>`), stripping the
+    /// store directory.
+    ///
+    /// `None` if `full` is not actually rooted at `store_dir` — deliberately
+    /// not tolerant of a mismatch: silently keeping the wrong prefix as part
+    /// of the "bare" name would corrupt every downstream use of it (content
+    /// verification, signing, hash-part lookups) rather than fail loudly. A
+    /// caller whose peer's store directory does not match ours needs to know
+    /// that, not have it hidden.
+    pub fn from_full(store_dir: &str, full: &str) -> Option<Self> {
+        let bare = full.strip_prefix(store_dir)?.strip_prefix('/')?;
+        Some(StorePath(bare.to_string()))
+    }
+
+    /// Reconstruct the full printed path: `<store_dir>/<hash>-<name>`.
+    pub fn to_full(&self, store_dir: &str) -> String {
+        format!("{store_dir}/{}", self.0)
     }
 
     pub fn as_str(&self) -> &str {
@@ -24,19 +53,14 @@ impl StorePath {
         self.0
     }
 
-    /// The `<name>` part of `/nix/store/<hash>-<name>`.
+    /// The `<name>` part of `<hash>-<name>`.
     pub fn name(&self) -> Option<&str> {
         let base = self.0.rsplit('/').next()?;
         let (hash, name) = base.split_once('-')?;
         (hash.len() == 32 && !name.is_empty()).then_some(name)
     }
 
-    /// The store directory a path sits in: `/nix/store/abc-x` → `/nix/store`.
-    pub fn store_dir(&self) -> Option<&str> {
-        self.0.rfind('/').map(|at| &self.0[..at])
-    }
-
-    /// The 32-character hash part: `/nix/store/<hash>-<name>` → `<hash>`.
+    /// The 32-character hash part: `<hash>-<name>` → `<hash>`.
     pub fn hash_part(&self) -> Option<&str> {
         let base = self.0.rsplit('/').next()?;
         let hash = base.split('-').next()?;
@@ -66,20 +90,52 @@ impl AsRef<str> for StorePath {
 mod tests {
     use super::*;
 
-    const P: &str = "/nix/store/21d91afy6vgw4l00yzy92kp92b1w3cdm-kxs-testfile.txt";
+    const P: &str = "21d91afy6vgw4l00yzy92kp92b1w3cdm-kxs-testfile.txt";
 
     #[test]
     fn splits_paths() {
         let p = StorePath::new(P);
         assert_eq!(p.name(), Some("kxs-testfile.txt"));
-        assert_eq!(p.store_dir(), Some("/nix/store"));
         assert_eq!(p.hash_part(), Some("21d91afy6vgw4l00yzy92kp92b1w3cdm"));
     }
 
     #[test]
     fn rejects_paths_without_a_hash_part() {
-        assert_eq!(StorePath::new("/etc/passwd").hash_part(), None);
+        assert_eq!(StorePath::new("not-a-hash").hash_part(), None);
         assert_eq!(StorePath::new("notapath").hash_part(), None);
-        assert_eq!(StorePath::new("/etc/passwd").name(), None);
+        assert_eq!(StorePath::new("not-a-hash").name(), None);
+    }
+
+    #[test]
+    fn from_full_strips_the_store_dir() {
+        assert_eq!(
+            StorePath::from_full("/nix/store", &format!("/nix/store/{P}")),
+            Some(StorePath::new(P))
+        );
+    }
+
+    #[test]
+    fn from_full_refuses_a_path_rooted_elsewhere() {
+        // A mismatched store directory must fail loudly, not silently adopt
+        // the wrong prefix as part of the "bare" name.
+        assert_eq!(StorePath::from_full("/nix/store", P), None);
+        assert_eq!(
+            StorePath::from_full("/nix/store", &format!("/mnt/other-store/{P}")),
+            None
+        );
+        // A prefix match that isn't actually a directory boundary must not
+        // slip through either.
+        assert_eq!(
+            StorePath::from_full("/nix/store", &format!("/nix/store-other/{P}")),
+            None
+        );
+    }
+
+    #[test]
+    fn to_full_reconstructs_the_printed_path() {
+        assert_eq!(
+            StorePath::new(P).to_full("/nix/store"),
+            format!("/nix/store/{P}")
+        );
     }
 }

@@ -33,7 +33,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 
-use kubernix_types::ObjectKey;
+use kubernix_types::{ObjectKey, StorePath};
 
 use crate::store::{PathInfo, Store};
 use crate::tenant::TenantId;
@@ -194,7 +194,7 @@ fn render_narinfo(
     store_dir: &str,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!("StorePath: {}\n", info.path));
+    out.push_str(&format!("StorePath: {}\n", info.path.to_full(store_dir)));
     // Relative to the cache root, which is the tenant prefix — so a client that
     // fetched `/<tenant>/<hash>.narinfo` resolves this against the same prefix.
     out.push_str(&format!(
@@ -214,24 +214,13 @@ fn render_narinfo(
     out.push_str(&format!("NarSize: {}\n", info.nar_size));
 
     // References are printed *without* the store directory: a narinfo lists bare
-    // names, and a client prepends its own store dir.
-    let references: Vec<&str> = info
-        .references
-        .iter()
-        .map(|r| {
-            r.as_str()
-                .strip_prefix(&format!("{store_dir}/"))
-                .unwrap_or(r.as_str())
-        })
-        .collect();
+    // names, and a client prepends its own store dir. `StorePath` already
+    // carries no prefix, so there is nothing to strip.
+    let references: Vec<&str> = info.references.iter().map(StorePath::as_str).collect();
     out.push_str(&format!("References: {}\n", references.join(" ")));
 
     if let Some(deriver) = &info.deriver {
-        let deriver = deriver
-            .as_str()
-            .strip_prefix(&format!("{store_dir}/"))
-            .unwrap_or(deriver.as_str());
-        out.push_str(&format!("Deriver: {deriver}\n"));
+        out.push_str(&format!("Deriver: {}\n", deriver.as_str()));
     }
     for sig in &info.sigs {
         out.push_str(&format!("Sig: {sig}\n"));
@@ -328,13 +317,12 @@ async fn log(
 mod tests {
     use super::*;
     use crate::store::{Hash, HashType};
-    use kubernix_types::StorePath;
 
     fn info() -> PathInfo {
         PathInfo {
-            path: StorePath::new("/nix/store/00000000000000000000000000000000-thing"),
+            path: StorePath::new("00000000000000000000000000000000-thing"),
             deriver: Some(StorePath::new(
-                "/nix/store/33333333333333333333333333333333-thing.drv",
+                "33333333333333333333333333333333-thing.drv",
             )),
             nar_hash: Hash {
                 hash_type: HashType::Sha256,
@@ -342,8 +330,8 @@ mod tests {
             },
             nar_size: 4096,
             references: vec![
-                StorePath::new("/nix/store/11111111111111111111111111111111-a"),
-                StorePath::new("/nix/store/22222222222222222222222222222222-b"),
+                StorePath::new("11111111111111111111111111111111-a"),
+                StorePath::new("22222222222222222222222222222222-b"),
             ],
             registration_time: 0,
             ultimate: true,

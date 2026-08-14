@@ -102,21 +102,38 @@ impl<'a> Reader<'a> {
 }
 
 /// Decode the `drv :Data` field of a build request.
-pub fn parse(bytes: &[u8]) -> Result<BasicDerivation> {
+///
+/// `store_dir` strips the store directory off the full printed paths this
+/// wire form carries — the client's `serializeDerivation` always writes them
+/// full.
+pub fn parse(bytes: &[u8], store_dir: &str) -> Result<BasicDerivation> {
     let mut reader = Reader::new(bytes);
+
+    // A path in this wire form that is not rooted at `store_dir` means the
+    // client and the frontend disagree about the store directory — refused
+    // rather than silently reinterpreted, the same as at the daemon protocol
+    // boundary this feeds.
+    let rooted = |s: String| {
+        StorePath::from_full(store_dir, &s)
+            .ok_or_else(|| ParseError(format!("{s} is not rooted at {store_dir}")))
+    };
 
     let output_count = reader.u64()? as usize;
     let mut outputs = Vec::with_capacity(output_count);
     for _ in 0..output_count {
         outputs.push(Output {
             name: reader.string()?,
-            path: StorePath::new(reader.string()?),
+            path: rooted(reader.string()?)?,
             algo: reader.string()?,
             hash: reader.string()?,
         });
     }
 
-    let input_srcs = reader.strings()?.into_iter().map(StorePath::new).collect();
+    let input_srcs = reader
+        .strings()?
+        .into_iter()
+        .map(rooted)
+        .collect::<Result<_>>()?;
     let platform = System::new(reader.string()?);
     let builder = reader.string()?;
     let args = reader.strings()?;
@@ -176,19 +193,35 @@ mod tests {
 
     #[test]
     fn parses_the_wire_form() {
-        let drv = parse(&sample_wire()).unwrap();
+        let drv = parse(&sample_wire(), "/nix/store").unwrap();
         assert_eq!(drv.outputs.len(), 1);
         assert_eq!(drv.outputs[0].name, "out");
+        assert_eq!(
+            drv.outputs[0].path,
+            StorePath::new("00000000000000000000000000000000-thing")
+        );
         assert_eq!(drv.platform.as_str(), "x86_64-linux");
         assert_eq!(drv.builder, "/bin/sh");
         assert_eq!(drv.args, vec!["-c", "echo hi"]);
         assert_eq!(drv.input_srcs.len(), 1);
+        assert_eq!(
+            drv.input_srcs[0],
+            StorePath::new("11111111111111111111111111111111-dep")
+        );
         assert_eq!(drv.env.get("name").map(String::as_str), Some("thing"));
     }
 
     #[test]
     fn rejects_truncated_input() {
-        assert!(parse(&[0u8; 4]).is_err());
-        assert!(parse(&sample_wire()[..20]).is_err());
+        assert!(parse(&[0u8; 4], "/nix/store").is_err());
+        assert!(parse(&sample_wire()[..20], "/nix/store").is_err());
+    }
+
+    #[test]
+    fn rejects_a_path_rooted_at_a_different_store_dir() {
+        // The wire's paths are rooted at "/nix/store"; a server configured
+        // for a different store directory must refuse rather than silently
+        // treat the mismatched prefix as part of the bare name.
+        assert!(parse(&sample_wire(), "/mnt/other-store").is_err());
     }
 }
