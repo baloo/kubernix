@@ -22,7 +22,7 @@ use kubernix_types::StorePath;
 impl From<&StoreError> for capnp::Error {
     fn from(e: &StoreError) -> Self {
         match e {
-            StoreError::Unsupported(op) => rpc_error::unimplemented(op.to_string()),
+            StoreError::Unsupported(op) => rpc_error::unimplemented(op),
             other => rpc_error::failed(other.to_string()),
         }
     }

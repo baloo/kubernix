@@ -17,6 +17,7 @@ use std::time::Duration;
 use sqlx::Connection;
 use sqlx::postgres::PgConnection;
 
+use crate::advisory_lock::AdvisoryLock;
 use crate::postgres_store::PostgresStore;
 
 /// Fixed key for `pg_try_advisory_lock`, distinct from `crate::gc`'s — see
@@ -45,27 +46,16 @@ pub async fn rotate(
     store: &PostgresStore,
     retention: Duration,
 ) -> Result<RotateStats, sqlx::Error> {
-    let mut conn = store.pool.acquire().await?;
-
-    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(ROTATE_LOCK_KEY)
-        .fetch_one(&mut *conn)
-        .await?;
-    if !locked {
+    let Some(mut lock) = AdvisoryLock::try_acquire(&store.pool, ROTATE_LOCK_KEY).await? else {
         tracing::debug!("rotation pass skipped: another replica holds the lock");
         return Ok(RotateStats::default());
-    }
+    };
 
-    let result = rotate_locked(&mut conn, retention).await;
+    let result = rotate_locked(lock.conn(), retention).await;
 
-    // Unlock regardless of how the pass went, so a mid-pass error does not
-    // strand the lock until this connection happens to close — same
-    // reasoning as `crate::gc::run_gc_pass`.
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(ROTATE_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-    {
+    // See `crate::advisory_lock` for how the lock is guaranteed not to leak
+    // into the pool still held, on any exit path.
+    if let Err(e) = lock.release().await {
         tracing::error!(error = %e, "failed to release the rotation advisory lock");
     }
 

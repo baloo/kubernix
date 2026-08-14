@@ -81,14 +81,14 @@ fn tenant_router() -> Router<HttpState> {
 /// Rejecting a malformed id here rather than passing it through means a
 /// traversal attempt cannot reach the object store, where the id becomes a key
 /// prefix.
-fn tenant_of(raw: &str) -> Result<TenantId, Response> {
+fn tenant_of(raw: &str) -> Result<TenantId, Box<Response>> {
     TenantId::from_wire(raw)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown tenant\n").into_response())
+        .ok_or_else(|| Box::new((StatusCode::NOT_FOUND, "unknown tenant\n").into_response()))
 }
 
 async fn nix_cache_info(State(state): State<HttpState>, Path(tenant): Path<String>) -> Response {
     if let Err(response) = tenant_of(&tenant) {
-        return response;
+        return *response;
     }
     (
         StatusCode::OK,
@@ -108,7 +108,7 @@ async fn nix_cache_info(State(state): State<HttpState>, Path(tenant): Path<Strin
 async fn public_key(State(state): State<HttpState>, Path(tenant): Path<String>) -> Response {
     let tenant = match tenant_of(&tenant) {
         Ok(tenant) => tenant,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     match state.store.signer(&tenant).await {
@@ -128,7 +128,7 @@ async fn narinfo(
 ) -> Response {
     let tenant = match tenant_of(&tenant) {
         Ok(tenant) => tenant,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(hash) = file.strip_suffix(".narinfo") else {
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
@@ -253,7 +253,7 @@ async fn nar(
 ) -> Response {
     let tenant = match tenant_of(&tenant) {
         Ok(tenant) => tenant,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(uploader) = &state.uploader else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no object store\n").into_response();
@@ -286,7 +286,7 @@ async fn log(
 ) -> Response {
     let tenant = match tenant_of(&tenant) {
         Ok(tenant) => tenant,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(uploader) = &state.uploader else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no object store\n").into_response();

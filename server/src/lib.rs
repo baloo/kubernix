@@ -29,6 +29,7 @@ pub mod kubernix_capnp {
     include!(concat!(env!("OUT_DIR"), "/kubernix_capnp.rs"));
 }
 
+pub mod advisory_lock;
 pub mod capability;
 mod capnp_ext;
 pub mod daemon_rpc;

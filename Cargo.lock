@@ -2514,6 +2514,7 @@ dependencies = [
 name = "kubernix-types"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "eyre",
  "thiserror 2.0.20",
 ]

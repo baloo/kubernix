@@ -30,6 +30,7 @@ use sqlx::postgres::{PgConnection, PgPool};
 use kubernix_types::ObjectKey;
 use uuid::Uuid;
 
+use crate::advisory_lock::AdvisoryLock;
 use crate::postgres_store::PostgresStore;
 use crate::uploads::UploadSigner;
 
@@ -112,11 +113,9 @@ type Result<T> = std::result::Result<T, GcError>;
 
 /// Run one full drain → mark → sweep+reap pass, under the advisory lock.
 ///
-/// Acquires a single connection and holds the lock on it for the whole pass,
-/// unlocking before returning — a session-level advisory lock outlives the
-/// query that took it, so returning the connection to the pool without
-/// explicitly unlocking would leave it held against whatever borrows that
-/// physical connection next.
+/// Acquires a single connection and holds the lock on it for the whole pass
+/// (see [`crate::advisory_lock`] for how the lock is guaranteed not to leak
+/// into the pool still held, on any exit path).
 ///
 /// Returns `Ok(GcStats { ran: false, .. })`, not an error, when another
 /// collector already holds the lock — that is the expected steady state with
@@ -138,26 +137,14 @@ async fn run_gc_pass_on(
     job_retention: &JobRetention,
     batch_size: i64,
 ) -> Result<GcStats> {
-    let mut conn = pool.acquire().await?;
-
-    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(GC_LOCK_KEY)
-        .fetch_one(&mut *conn)
-        .await?;
-    if !locked {
+    let Some(mut lock) = AdvisoryLock::try_acquire(pool, GC_LOCK_KEY).await? else {
         tracing::debug!("gc pass skipped: another collector holds the lock");
         return Ok(GcStats::default());
-    }
+    };
 
-    let result = run_locked(&mut conn, uploader, cutoffs, job_retention, batch_size).await;
+    let result = run_locked(lock.conn(), uploader, cutoffs, job_retention, batch_size).await;
 
-    // Unlock regardless of how the pass above went, so a mid-pass error does
-    // not strand the lock until this connection happens to close.
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(GC_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-    {
+    if let Err(e) = lock.release().await {
         tracing::error!(error = %e, "failed to release the gc advisory lock");
     }
 

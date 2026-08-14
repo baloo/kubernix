@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn omits_the_ambiguous_letters() {
-        for c in [b'e', b'o', b'u', b't'] {
+        for c in *b"eout" {
             assert!(
                 !BASE32_CHARS.contains(&c),
                 "{} should be omitted",

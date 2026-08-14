@@ -355,7 +355,7 @@ impl LegacyProtocolImpl {
                     crate::store::RemoteObject {
                         key: info.key.clone(),
                         file_size: info.file_size,
-                        file_hash: info.file_hash.clone(),
+                        file_hash: info.file_hash,
                     },
                     Tier::Built,
                 )
@@ -666,16 +666,14 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
         }
     }
 
-    fn query_valid_derivers(
+    async fn query_valid_derivers(
         self: Rc<Self>,
         _params: legacy_protocol::QueryValidDeriversParams,
         mut results: legacy_protocol::QueryValidDeriversResults,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            // Derivers are tracked per path in PathInfo, not indexed in reverse.
-            results.get().init_result(0);
-            Ok(())
-        }
+    ) -> Result<(), capnp::Error> {
+        // Derivers are tracked per path in PathInfo, not indexed in reverse.
+        results.get().init_result(0);
+        Ok(())
     }
 
     fn query_missing(
@@ -751,20 +749,20 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     /// Temp roots are a GC concept. The frontend does not GC on the client's
     /// behalf, so these are accepted and ignored rather than refused — refusing
     /// would abort otherwise valid client operations.
-    fn add_temp_root(
+    async fn add_temp_root(
         self: Rc<Self>,
         _params: legacy_protocol::AddTempRootParams,
         _results: legacy_protocol::AddTempRootResults,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move { Ok(()) }
+    ) -> Result<(), capnp::Error> {
+        Ok(())
     }
 
-    fn add_indirect_root(
+    async fn add_indirect_root(
         self: Rc<Self>,
         _params: legacy_protocol::AddIndirectRootParams,
         _results: legacy_protocol::AddIndirectRootResults,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move { Ok(()) }
+    ) -> Result<(), capnp::Error> {
+        Ok(())
     }
 
     /// Accept a NAR the client already has `ValidPathInfo` for. This is how a
@@ -1122,195 +1120,196 @@ impl NarSink {
 }
 
 impl legacy_protocol::stream::Server for NarSink {
-    fn feed(
+    async fn feed(
         self: Rc<Self>,
         params: legacy_protocol::stream::FeedParams,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            let raw = params.get()?.get_raw()?;
-            self.buffer.borrow_mut().extend_from_slice(raw);
-            Ok(())
-        }
+    ) -> Result<(), capnp::Error> {
+        let raw = params.get()?.get_raw()?;
+        self.buffer.borrow_mut().extend_from_slice(raw);
+        Ok(())
     }
 
-    fn finalize(
+    async fn finalize(
         self: Rc<Self>,
         _params: legacy_protocol::stream::FinalizeParams,
         _results: legacy_protocol::stream::FinalizeResults,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        async move {
-            let nar = std::mem::take(&mut *self.buffer.borrow_mut());
+    ) -> Result<(), capnp::Error> {
+        let nar = std::mem::take(&mut *self.buffer.borrow_mut());
 
-            // Decide what the frontend is willing to say about this path before
-            // recording it. A content address can be checked against the bytes;
-            // anything else is the client's word, and is quarantined rather than
-            // refused so that ordinary `nix copy` of a build closure keeps
-            // working. See PLAN.md Phase 9.
-            let tier =
-                match &self.ca {
-                    Some(ca) => {
-                        match crate::store_path::StoreDir(&self.connection.store_dir).verify(
-                            &self.info.path,
-                            ca,
-                            &self.info.references,
-                            &nar,
-                        ) {
-                            Ok(()) => Tier::Verified,
-                            // A *failed* check is different from an absent one: the
-                            // client asserted something checkable and it was false,
-                            // which is either corruption or an attempt to register
-                            // content at a path that is not its own.
-                            Err(rejection) => {
-                                tracing::warn!(
-                                    path = %self.info.path,
-                                    tenant = %self.connection.tenant.id,
-                                    %rejection,
-                                    "refusing a push whose content address does not check out"
-                                );
-                                return Err(rpc_error::failed_with_traces(
-                                format!("kubernix: refusing {}: {rejection}", self.info.path),
-                                &["the frontend verifies content-addressed paths against their \
-                                   bytes"
-                                    .to_string()],
-                            ));
-                            }
+        // Decide what the frontend is willing to say about this path before
+        // recording it. A content address can be checked against the bytes;
+        // anything else is the client's word, and is quarantined rather than
+        // refused so that ordinary `nix copy` of a build closure keeps
+        // working. See PLAN.md Phase 9.
+        let tier =
+            match &self.ca {
+                Some(ca) => {
+                    match crate::store_path::StoreDir(&self.connection.store_dir).verify(
+                        &self.info.path,
+                        ca,
+                        &self.info.references,
+                        &nar,
+                    ) {
+                        Ok(()) => Tier::Verified,
+                        // A *failed* check is different from an absent one: the
+                        // client asserted something checkable and it was false,
+                        // which is either corruption or an attempt to register
+                        // content at a path that is not its own.
+                        Err(rejection) => {
+                            tracing::warn!(
+                                path = %self.info.path,
+                                tenant = %self.connection.tenant.id,
+                                %rejection,
+                                "refusing a push whose content address does not check out"
+                            );
+                            return Err(rpc_error::failed_with_traces(
+                            format!("kubernix: refusing {}: {rejection}", self.info.path),
+                            &["the frontend verifies content-addressed paths against their \
+                               bytes"
+                                .to_string()],
+                        ));
                         }
                     }
-                    None => Tier::Quarantined,
-                };
-
-            // A path we already vouch for must not be demoted by someone pushing
-            // it back at us. Nix does exactly that: it builds a dependency
-            // remotely, copies it home, then pushes it up again as an input for
-            // the next build. Taking the push at face value would replace a
-            // `built` path with a `quarantined` one, discard its signature, and
-            // make the cache start 404ing something it had been serving — while
-            // storing a second copy of identical bytes.
-            //
-            // Keeping what we have is safe precisely because the existing tier
-            // is the *stronger* claim: we derived or produced that path, so a
-            // client's assertion about it adds nothing.
-            let tenant = &self.connection.tenant.id;
-            if let Some(existing) = self.store.tier(tenant, &self.info.path).await
-                && existing.is_vouchable()
-                && !matches!(tier, Tier::Verified)
-            {
-                tracing::debug!(
-                    path = %self.info.path,
-                    tier = existing.as_str(),
-                    "already vouched for; keeping it rather than accepting the push"
-                );
-                self.connection
-                    .staged
-                    .borrow_mut()
-                    .push(crate::jobs::InputRef {
-                        store_path: self.info.path.clone(),
-                        key: self
-                            .store
-                            .output_object(tenant, &self.info.path)
-                            .await
-                            .map(|o| o.key)
-                            .unwrap_or_default(),
-                        references: self.info.references.clone(),
-                        deriver: self.info.deriver.clone().unwrap_or_default(),
-                    });
-                return Ok(());
-            }
-
-            // The bytes go to the object store, never into the database. One
-            // representation of a path exists — a compressed bare NAR — and it
-            // is the same one a worker fetches, `narFromPath` streams, and the
-            // binary cache serves. See PLAN.md Phase 10b.
-            let Some(uploader) = self.uploader.clone() else {
-                return Err(rpc_error::failed(
-                    "kubernix: no object store configured; cannot accept a path",
-                ));
-            };
-            let Some(key) =
-                crate::store::nar_key(&self.connection.tenant.id, tier, &self.info.path)
-            else {
-                return Err(rpc_error::failed(format!(
-                    "kubernix: not a store path: {}",
-                    self.info.path
-                )));
+                }
+                None => Tier::Quarantined,
             };
 
-            let compressed = zstd::stream::encode_all(nar.as_slice(), 3).map_err(|e| {
-                eyre::Report::new(e).into_capnp_error("compressing a pushed path")
-            })?;
-            let file_size = compressed.len() as u64;
-            let file_hash = <sha2::Sha256 as sha2::Digest>::digest(&compressed);
-
-            // A `Verified` key carries no tenant prefix (PLAN.md Phase 9c), so
-            // another tenant pushing the same content may already have put
-            // these exact bytes at this exact key. Recomputing and
-            // re-uploading them would be correct but wasteful — this is the
-            // saving the sharing exists for. `Built`/`Quarantined` keys are
-            // tenant-scoped and effectively never collide, so they always
-            // upload as before.
-            let already_there =
-                matches!(tier, Tier::Verified) && self.store.object_known(&key).await;
-
-            if already_there {
-                tracing::debug!(
-                    path = %self.info.path,
-                    %key,
-                    "content already in the object store under this shared key; skipping upload"
-                );
-            } else {
-                tracing::debug!(
-                    path = %self.info.path,
-                    %key,
-                    nar_bytes = nar.len(),
-                    object_bytes = file_size,
-                    "storing pushed path in the object store"
-                );
-
-                // Uploaded before the row is written, so a failure here cannot
-                // leave a path registered with no bytes behind it.
-                uploader
-                    .put_object(&key, compressed)
-                    .await
-                    .map_err(|e| e.into_capnp_error("uploading a pushed path"))?;
-            }
-
-            // Signed here, on the way in, so the signature lands in the same row
-            // as the path. A verified push is one we derived ourselves, so it is
-            // ours to vouch for; a quarantined one is left unsigned.
-            let mut info = self.info.clone();
-            self.connection.sign_if_vouchable(&mut info, tier).await;
-
-            let references = info.references.clone();
-            let deriver = info.deriver.clone().unwrap_or_default();
-
-            self.store
-                .record_path(
-                    &self.connection.tenant.id,
-                    info,
-                    crate::store::RemoteObject {
-                        key: key.clone(),
-                        file_size,
-                        file_hash,
-                    },
-                    tier,
-                )
+        // A path we already vouch for must not be demoted by someone pushing
+        // it back at us. Nix does exactly that: it builds a dependency
+        // remotely, copies it home, then pushes it up again as an input for
+        // the next build. Taking the push at face value would replace a
+        // `built` path with a `quarantined` one, discard its signature, and
+        // make the cache start 404ing something it had been serving — while
+        // storing a second copy of identical bytes.
+        //
+        // Keeping what we have is safe precisely because the existing tier
+        // is the *stronger* claim: we derived or produced that path, so a
+        // client's assertion about it adds nothing.
+        let tenant = &self.connection.tenant.id;
+        if let Some(existing) = self.store.tier(tenant, &self.info.path).await
+            && existing.is_vouchable()
+            && !matches!(tier, Tier::Verified)
+        {
+            tracing::debug!(
+                path = %self.info.path,
+                tier = existing.as_str(),
+                "already vouched for; keeping it rather than accepting the push"
+            );
+            // Resolved before the borrow below is taken, not inline in the
+            // `InputRef` literal — holding `staged`'s `RefCell` guard across
+            // this `.await` would risk a panic if anything else on this
+            // single-threaded connection tries to borrow it while suspended.
+            let key = self
+                .store
+                .output_object(tenant, &self.info.path)
                 .await
-                .map_err(capnp::Error::from)?;
-
-            // A bare NAR cannot be imported on its own, so the references and
-            // deriver travel with the key rather than being stored a second time
-            // in export form.
+                .map(|o| o.key)
+                .unwrap_or_default();
             self.connection
                 .staged
                 .borrow_mut()
                 .push(crate::jobs::InputRef {
                     store_path: self.info.path.clone(),
                     key,
-                    references,
-                    deriver,
+                    references: self.info.references.clone(),
+                    deriver: self.info.deriver.clone().unwrap_or_default(),
                 });
-            Ok(())
+            return Ok(());
         }
+
+        // The bytes go to the object store, never into the database. One
+        // representation of a path exists — a compressed bare NAR — and it
+        // is the same one a worker fetches, `narFromPath` streams, and the
+        // binary cache serves. See PLAN.md Phase 10b.
+        let Some(uploader) = self.uploader.clone() else {
+            return Err(rpc_error::failed(
+                "kubernix: no object store configured; cannot accept a path",
+            ));
+        };
+        let Some(key) =
+            crate::store::nar_key(&self.connection.tenant.id, tier, &self.info.path)
+        else {
+            return Err(rpc_error::failed(format!(
+                "kubernix: not a store path: {}",
+                self.info.path
+            )));
+        };
+
+        let compressed = zstd::stream::encode_all(nar.as_slice(), 3).map_err(|e| {
+            eyre::Report::new(e).into_capnp_error("compressing a pushed path")
+        })?;
+        let file_size = compressed.len() as u64;
+        let file_hash = <sha2::Sha256 as sha2::Digest>::digest(&compressed);
+
+        // A `Verified` key carries no tenant prefix (PLAN.md Phase 9c), so
+        // another tenant pushing the same content may already have put
+        // these exact bytes at this exact key. Recomputing and
+        // re-uploading them would be correct but wasteful — this is the
+        // saving the sharing exists for. `Built`/`Quarantined` keys are
+        // tenant-scoped and effectively never collide, so they always
+        // upload as before.
+        let already_there =
+            matches!(tier, Tier::Verified) && self.store.object_known(&key).await;
+
+        if already_there {
+            tracing::debug!(
+                path = %self.info.path,
+                %key,
+                "content already in the object store under this shared key; skipping upload"
+            );
+        } else {
+            tracing::debug!(
+                path = %self.info.path,
+                %key,
+                nar_bytes = nar.len(),
+                object_bytes = file_size,
+                "storing pushed path in the object store"
+            );
+
+            // Uploaded before the row is written, so a failure here cannot
+            // leave a path registered with no bytes behind it.
+            uploader
+                .put_object(&key, compressed)
+                .await
+                .map_err(|e| e.into_capnp_error("uploading a pushed path"))?;
+        }
+
+        // Signed here, on the way in, so the signature lands in the same row
+        // as the path. A verified push is one we derived ourselves, so it is
+        // ours to vouch for; a quarantined one is left unsigned.
+        let mut info = self.info.clone();
+        self.connection.sign_if_vouchable(&mut info, tier).await;
+
+        let references = info.references.clone();
+        let deriver = info.deriver.clone().unwrap_or_default();
+
+        self.store
+            .record_path(
+                &self.connection.tenant.id,
+                info,
+                crate::store::RemoteObject {
+                    key: key.clone(),
+                    file_size,
+                    file_hash,
+                },
+                tier,
+            )
+            .await
+            .map_err(capnp::Error::from)?;
+
+        // A bare NAR cannot be imported on its own, so the references and
+        // deriver travel with the key rather than being stored a second time
+        // in export form.
+        self.connection
+            .staged
+            .borrow_mut()
+            .push(crate::jobs::InputRef {
+                store_path: self.info.path.clone(),
+                key,
+                references,
+                deriver,
+            });
+        Ok(())
     }
 }
 
