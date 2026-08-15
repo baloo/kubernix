@@ -35,4 +35,8 @@ in rec {
       crates}
     chmod -R u+w $out
   '';
+
+  outputHashes = {
+    "digest-io-async-0.1.0" = "sha256-2Cserl5dYxw3YwAq0abc8+lmVlfHrbr8BLa3N7UyTBU=";
+  };
 }

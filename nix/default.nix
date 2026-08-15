@@ -13,9 +13,10 @@ let
     name = "kubernix-src";
     crates = [ "server" "signing" "types" "worker" ];
   };
+  inherit (source) outputHashes;
 
-  kubernix-server = pkgs.callPackage ./server.nix { inherit workspaceSource; };
-  kubernix-worker = pkgs.callPackage ./worker.nix { inherit workspaceSource; };
+  kubernix-server = pkgs.callPackage ./server.nix { inherit workspaceSource outputHashes; };
+  kubernix-worker = pkgs.callPackage ./worker.nix { inherit workspaceSource outputHashes; };
   kubernix-plugin = pkgs.callPackage ./plugin.nix { };
 in {
   inherit kubernix-server kubernix-worker kubernix-plugin;

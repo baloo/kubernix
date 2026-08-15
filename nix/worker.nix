@@ -1,4 +1,4 @@
-{ rustPlatform, capnproto, workspaceSource }:
+{ rustPlatform, capnproto, workspaceSource, outputHashes }:
 
 rustPlatform.buildRustPackage {
   pname = "kubernix-worker";
@@ -9,9 +9,7 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFile = ../Cargo.lock;
-    outputHashes = {
-      "digest-io-0.1.0" = "sha256-K2VCEXmgH73uH2oAOfjjB9n20d2ii4XmHJluigUCti4=";
-    };
+    inherit outputHashes;
   };
 
   nativeBuildInputs = [ capnproto ];

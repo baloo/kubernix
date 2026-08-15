@@ -1388,9 +1388,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "digest-io"
+name = "digest-io-async"
 version = "0.1.0"
-source = "git+https://github.com/baloo/utils.git?branch=push-lrlwvoqosqno#9e01b31e29daa654401b9a1f7d23c8139629223d"
+source = "git+https://github.com/baloo/utils.git?branch=push-kxltlypsyruw#33ba71ae07bc65736fdd964e7adefc0cf0c37151"
 dependencies = [
  "digest 0.11.3",
  "pin-project-lite",
@@ -2559,7 +2559,7 @@ dependencies = [
  "capnp",
  "capnpc",
  "color-eyre",
- "digest-io",
+ "digest-io-async",
  "eyre",
  "futures-util",
  "kubernix-types",

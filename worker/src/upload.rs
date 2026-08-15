@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_compression::tokio::write::ZstdEncoder;
-use digest_io::{HashReader, HashWriter};
+use digest_io_async::{HashReader, HashWriter};
 use eyre::{Context as _, bail};
 use sha2::{Digest, Sha256, digest::Output};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
