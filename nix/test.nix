@@ -253,6 +253,60 @@ pkgs.testers.nixosTest {
         assert "StoreDir: /nix/store" in info, info
 
 
+    with subtest("row-level security blocks a cross-tenant read even without an application predicate"):
+        # Run early, right after the path this checks is created — not
+        # later, after several slower subtests. `services.kubernix-gc`'s
+        # cutoffs are deliberately tight in this test (60s, see below), and
+        # by now kubernix-gc actually reaps an idle row on schedule; a row
+        # this check depends on could otherwise be gone by the time it runs
+        # if enough wall-clock time has passed since it was built.
+        #
+        # Every check elsewhere in this test (e.g. "tenants are isolated")
+        # proves the *application*'s own `WHERE tenant = $1` isolates
+        # tenants. This proves the *database* does too — against the real
+        # `kubernix_app` role kubernix-sshd/kubernix-cache actually connect
+        # as after migrating (`server/migrations/20260814120000_row_level_
+        # security.sql`), not the `postgres` superuser every other `psql`
+        # call in this test uses, which always bypasses row-level security
+        # regardless of policy.
+        # Two statements in one session (`set_config(..., false)` sets a
+        # session-level GUC, so it has to be the same connection as the
+        # query that follows it — a second `psql` invocation would start a
+        # fresh session with the GUC back to unset), sent as one
+        # semicolon-separated `-tAc` string so they run in that order on
+        # that one connection. `psql -tAc` prints the result set of *every*
+        # statement it runs, though, and `set_config(...)` returns its own
+        # new value as a one-row result — so the raw output is two lines:
+        # the echoed tenant, then the path query's (possibly empty) answer.
+        # Dropping the first line is simpler and more robust than trying to
+        # suppress it psql-side (`\o` redirection turned out not to nest
+        # cleanly inside a `-c` string here).
+        def scoped_path_query(as_tenant: str) -> str:
+            output = machine.succeed(
+                "psql -U kubernix_app -h 127.0.0.1 kubernix -tAc "
+                f"\"SELECT set_config('app.current_tenant', '{as_tenant}', false); "
+                f"SELECT path FROM store_paths WHERE path = '{out_bare}'\""
+            )
+            lines = output.splitlines()
+            assert lines and lines[0] == as_tenant, (
+                f"expected set_config's own echoed value first, got: {lines!r}"
+            )
+            return "\n".join(lines[1:]).strip()
+
+        other = "user-nobody-0000000000000000"
+        result = scoped_path_query(other)
+        assert result == "", (
+            f"kubernix_app scoped to a different tenant must not see this row "
+            f"from a query with no tenant predicate of its own, got: {result!r}"
+        )
+
+        # Sanity check on the same role, so the empty result above cannot be
+        # mistaken for "row-level security blocks everything": the owning
+        # tenant must still see its own row.
+        result = scoped_path_query(tenant)
+        assert result == out_bare, f"the owning tenant must still see its own row, got: {result!r}"
+
+
     with subtest("a stock client substitutes from the cache"):
         # The real test of the narinfo, the signature and the NAR redirect: a
         # client that has never seen this path fetches it with verification on.
@@ -317,37 +371,6 @@ pkgs.testers.nixosTest {
             f"http://127.0.0.1:3000/{other}/{hash_part}.narinfo"
         ).strip()
         assert status == "404", f"cross-tenant read should 404, got {status}"
-
-
-    with subtest("row-level security blocks a cross-tenant read even without an application predicate"):
-        # Every check above (including "tenants are isolated" just above)
-        # proves the *application*'s own `WHERE tenant = $1` isolates
-        # tenants. This proves the *database* does too — against the real
-        # `kubernix_app` role kubernix-sshd/kubernix-cache actually connect
-        # as after migrating (`server/migrations/20260814120000_row_level_
-        # security.sql`), not the `postgres` superuser every other `psql`
-        # call in this test uses, which always bypasses row-level security
-        # regardless of policy.
-        other = "user-nobody-0000000000000000"
-        result = machine.succeed(
-            "psql -U kubernix_app -h 127.0.0.1 kubernix -tAc "
-            f"\"SELECT set_config('app.current_tenant', '{other}', false); "
-            f"SELECT path FROM store_paths WHERE path = '{out_bare}'\""
-        ).strip()
-        assert result == "", (
-            f"kubernix_app scoped to a different tenant must not see this row "
-            f"from a query with no tenant predicate of its own, got: {result!r}"
-        )
-
-        # Sanity check on the same role, so the empty result above cannot be
-        # mistaken for "row-level security blocks everything": the owning
-        # tenant must still see its own row.
-        result = machine.succeed(
-            "psql -U kubernix_app -h 127.0.0.1 kubernix -tAc "
-            f"\"SELECT set_config('app.current_tenant', '{tenant}', false); "
-            f"SELECT path FROM store_paths WHERE path = '{out_bare}'\""
-        ).strip()
-        assert result == out_bare, f"the owning tenant must still see its own row, got: {result!r}"
 
 
     with subtest("the capability secret is provisioned and rotates"):

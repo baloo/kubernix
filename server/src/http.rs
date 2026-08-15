@@ -35,13 +35,15 @@ use axum::routing::get;
 
 use kubernix_types::{ObjectKey, StorePath};
 
-use crate::store::{PathInfo, Store};
+use crate::store::{PathInfo, PathStore};
 use crate::tenant::TenantId;
 use crate::uploads::UploadSigner;
 
 #[derive(Clone)]
 pub struct HttpState {
-    pub store: Arc<dyn Store>,
+    /// `PathStore`, not the whole `Store`: this surface never mints or
+    /// verifies a capability token, only ever reads path data.
+    pub store: Arc<dyn PathStore>,
     /// Needed to hand out object URLs. Without one, NAR and log routes cannot be
     /// served at all — the frontend does not hold those bytes.
     pub uploader: Option<Arc<UploadSigner>>,

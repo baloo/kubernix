@@ -441,7 +441,7 @@ pub(crate) async fn reap_jobs(conn: &mut PgConnection, row_after: Duration) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Hash, HashType, PathInfo, RemoteObject, Store, Tier};
+    use crate::store::{Hash, HashType, PathInfo, PathStore, RemoteObject, Tier};
     use crate::tenant::{Tenant, TenantId};
     use serial_test::serial;
     use sha2::{Sha256, digest::Output};

@@ -11,11 +11,14 @@
 //! no tenant parameter left at each call site to accidentally pass the wrong
 //! variable for (there being only one to pass).
 //!
-//! Deliberately narrower than [`Store`] itself: only the methods that take a
-//! tenant are here. `object_known`, `find_verified_by_hash_part`,
-//! `current_capability_secret`, `capability_secret`, and `register_tenant`
-//! are cross-tenant or tenant-registering by design (see their doc comments
-//! on `Store`) and stay reached through the plain `Arc<dyn Store>`.
+//! Deliberately narrower than [`Store`] itself: only the tenant-taking
+//! methods of [`crate::store::PathStore`] are here. `object_known` and
+//! `find_verified_by_hash_part` are cross-tenant by design (see their own
+//! doc comments) and `register_tenant`/[`crate::store::CapabilitySecretStore`]'s
+//! methods are not tenant-scoped at all — all reached through the plain
+//! `Arc<dyn Store>` instead. `ClientOptions` isn't reached through here
+//! either any more — it is connection-local state now, not store state; see
+//! its own doc comment.
 
 use std::sync::Arc;
 
@@ -24,7 +27,7 @@ use kubernix_types::StorePath;
 use uuid::Uuid;
 
 use crate::jobs::JobOutcome;
-use crate::store::{ClientOptions, MissingPaths, PathInfo, RemoteObject, Result, Store, Tier};
+use crate::store::{MissingPaths, PathInfo, RemoteObject, Result, Store, Tier};
 use crate::tenant::TenantId;
 
 #[derive(Clone)]
@@ -109,10 +112,6 @@ impl TenantView {
 
     pub async fn signer(&self) -> Option<Arc<dyn Signer>> {
         self.store.signer(&self.tenant).await
-    }
-
-    pub async fn set_options(&self, options: ClientOptions) {
-        self.store.set_options(&self.tenant, options).await
     }
 
     pub async fn record_access(&self, path: &StorePath) {

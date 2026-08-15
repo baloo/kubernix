@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use kubernix_types::{CapabilityToken, StorePath};
 
-use crate::store::Store;
+use crate::store::CapabilitySecretStore;
 use crate::tenant::TenantId;
 
 /// What a job is authorized to do: which tenant it belongs to, and which
@@ -116,7 +116,14 @@ impl Capability {
     /// tampered with — deliberately one outcome for every failure mode, so a
     /// caller cannot treat "unknown key id" any differently from "forged
     /// signature".
-    pub async fn verify(token: &CapabilityToken, store: &dyn Store) -> Option<Self> {
+    ///
+    /// Takes `&dyn CapabilitySecretStore`, not the whole `Store` — capability
+    /// verification never touches path data, and this is that fact enforced
+    /// by the compiler rather than left as convention.
+    pub async fn verify(
+        token: &CapabilityToken,
+        store: &dyn CapabilitySecretStore,
+    ) -> Option<Self> {
         let token = std::str::from_utf8(token.as_bytes()).ok()?;
         let kid: u64 = decode_header(token).ok()?.kid?.parse().ok()?;
         let secret = store.capability_secret(kid).await?;

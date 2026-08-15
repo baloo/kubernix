@@ -124,8 +124,14 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Options a client pushes with `setOptions`. Recorded so build dispatch can
-/// honour them later.
+/// Options a client pushes with `setOptions`.
+///
+/// Deliberately *not* part of [`Store`] any more — see PLAN.md and the
+/// history of this type: these are a per-connection client preference, not
+/// backing-store state, and never outlived the connection even when a
+/// `Store` impl technically had a place to write them. They live on
+/// `daemon_rpc::LegacyProtocolImpl` directly now, alongside `staged`, which
+/// is the same kind of connection-local state.
 #[derive(Clone, Debug, Default)]
 pub struct ClientOptions {
     pub keep_failed: bool,
@@ -138,11 +144,14 @@ pub struct ClientOptions {
     pub overrides: Vec<(String, String)>,
 }
 
-/// What the frontend can answer about paths and builds.
+/// Path and object data — everything the frontend can answer about paths and
+/// builds.
 ///
-/// **Every path-facing method is scoped by tenant.** A path is only valid for
-/// the tenant it was recorded under, so one tenant cannot observe — or overwrite
-/// — another's.
+/// **Every tenant-taking method is scoped by that tenant.** A path is only
+/// valid for the tenant it was recorded under, so one tenant cannot observe —
+/// or overwrite — another's. The exceptions ([`Self::object_known`],
+/// [`Self::find_verified_by_hash_part`]) are content-addressed lookups,
+/// deliberately tenant-agnostic by design — see their own doc comments.
 ///
 /// Each path also carries a [`Tier`] saying how much the frontend can vouch for
 /// it. Tenant scoping is the containment; the tier is what decides whether a
@@ -156,8 +165,17 @@ pub struct ClientOptions {
 /// The futures are `Send` (sqlx's are), while the capnp-rpc caller is `!Send` and
 /// runs on a `LocalSet`. Awaiting a `Send` future from a `!Send` task is fine —
 /// see NOTES.md item 7.
+///
+/// Split from capability-secret management ([`CapabilitySecretStore`])
+/// deliberately: verifying a capability token (`uploads.rs`, on every
+/// pre-signed-URL request a worker makes) and minting one (`daemon_rpc.rs`,
+/// once per dispatched build) never need to touch path data at all, and a
+/// caller accepting `&dyn CapabilitySecretStore` rather than the whole store
+/// is proof of that at the type level, not just by convention or unenforced
+/// discipline. [`Store`] is the union of both, for callers (`daemon_rpc.rs`,
+/// `main.rs`) that genuinely need everything.
 #[async_trait::async_trait]
-pub trait Store: Send + Sync {
+pub trait PathStore: Send + Sync {
     async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool;
 
     async fn query_valid_paths(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath>;
@@ -251,20 +269,6 @@ pub trait Store: Send + Sync {
     /// path is inert to clients, which is the safe direction to fall.
     async fn signer(&self, tenant: &TenantId) -> Option<Arc<dyn Signer>>;
 
-    /// The secret currently used to mint capability tokens (`crate::capability`),
-    /// and the id that selects it. Generated lazily on first use if none
-    /// exists — like [`Self::signer`], correctness never depends on a
-    /// separate rotation step having run first; rotation only improves on
-    /// this by keying every new token under a fresh id.
-    async fn current_capability_secret(&self) -> (u64, [u8; 32]);
-
-    /// The capability secret for a specific `kid`, for verifying a token that
-    /// may predate the most recent rotation. `None` once it has aged out of
-    /// the retention window and been deleted.
-    async fn capability_secret(&self, kid: u64) -> Option<[u8; 32]>;
-
-    async fn set_options(&self, tenant: &TenantId, options: ClientOptions);
-
     /// Note that a path was read — either its metadata (`queryPathInfo`, a
     /// narinfo) or its bytes (`narFromPath`, a NAR fetch). PLAN.md Phase 12:
     /// this is what retention ages against, so both count, and missing either
@@ -309,6 +313,35 @@ pub trait Store: Send + Sync {
     }
 }
 
+/// The secret(s) used to mint and verify capability tokens (`crate::
+/// capability`) — see [`PathStore`]'s doc comment for why this is a separate
+/// trait rather than a couple more methods bundled onto it.
+#[async_trait::async_trait]
+pub trait CapabilitySecretStore: Send + Sync {
+    /// The secret currently used to mint capability tokens, and the id that
+    /// selects it. Generated lazily on first use if none exists — like
+    /// [`PathStore::signer`], correctness never depends on a separate
+    /// rotation step having run first; rotation only improves on this by
+    /// keying every new token under a fresh id.
+    async fn current_capability_secret(&self) -> (u64, [u8; 32]);
+
+    /// The capability secret for a specific `kid`, for verifying a token that
+    /// may predate the most recent rotation. `None` once it has aged out of
+    /// the retention window and been deleted.
+    async fn capability_secret(&self, kid: u64) -> Option<[u8; 32]>;
+}
+
+/// Everything a full connection needs — the union of [`PathStore`] and
+/// [`CapabilitySecretStore`].
+///
+/// A blanket impl, not a hand-written one: implementing both smaller traits
+/// is what it takes to implement this one, so `MemoryStore`/`PostgresStore`
+/// need only ever implement the two narrower traits, and every caller that
+/// genuinely needs the whole store (`daemon_rpc.rs`'s `Arc<dyn Store>`
+/// fields, `main.rs`) keeps working exactly as before the split.
+pub trait Store: PathStore + CapabilitySecretStore {}
+impl<T: PathStore + CapabilitySecretStore + ?Sized> Store for T {}
+
 #[derive(Clone, Debug, Default)]
 pub struct MissingPaths {
     pub will_build: Vec<StorePath>,
@@ -351,7 +384,6 @@ struct Inner {
     signer: Option<Arc<dyn Signer>>,
     /// How much each path can be vouched for.
     tiers: HashMap<StorePath, Tier>,
-    options: ClientOptions,
 }
 
 /// Object key for a path's compressed NAR.
@@ -424,7 +456,7 @@ impl MemoryStore {
 }
 
 #[async_trait::async_trait]
-impl Store for MemoryStore {
+impl PathStore for MemoryStore {
     async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool {
         self.read(tenant, |inner| inner.paths.contains_key(path))
     }
@@ -578,7 +610,10 @@ impl Store for MemoryStore {
             )
         })
     }
+}
 
+#[async_trait::async_trait]
+impl CapabilitySecretStore for MemoryStore {
     async fn current_capability_secret(&self) -> (u64, [u8; 32]) {
         let mut guard = self.capability_secret.lock().unwrap();
         let secret = *guard.get_or_insert_with(rand::random);
@@ -590,11 +625,6 @@ impl Store for MemoryStore {
             return None;
         }
         *self.capability_secret.lock().unwrap()
-    }
-
-    async fn set_options(&self, tenant: &TenantId, options: ClientOptions) {
-        tracing::debug!(%tenant, ?options, "client options");
-        self.write(tenant, |inner| inner.options = options);
     }
 }
 

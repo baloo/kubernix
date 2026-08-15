@@ -220,6 +220,7 @@ impl legacy_boot::Server for LegacyBootImpl {
                 tenant,
                 staged: RefCell::new(Vec::new()),
                 store_dir,
+                options: RefCell::new(ClientOptions::default()),
             });
 
             let mut results = results.get();
@@ -254,6 +255,12 @@ pub struct LegacyProtocolImpl {
     staged: RefCell<Vec<crate::jobs::InputRef>>,
     /// The store directory this connection's client prepends to every path.
     store_dir: String,
+    /// What the client last pushed with `setOptions`. Connection-local, not
+    /// store state — see [`ClientOptions`]'s own doc comment for why it
+    /// moved here rather than staying on `Store`. Nothing reads this back
+    /// yet; it is recorded so a future build-dispatch path can, without
+    /// needing another wire round trip to get it.
+    options: RefCell<ClientOptions>,
 }
 
 impl LegacyProtocolImpl {
@@ -472,40 +479,37 @@ impl LegacyProtocolImpl {
 }
 
 impl legacy_protocol::Server for LegacyProtocolImpl {
-    fn set_options(
+    async fn set_options(
         self: Rc<Self>,
         params: legacy_protocol::SetOptionsParams,
         _results: legacy_protocol::SetOptionsResults,
-    ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
-        let store = self.tenant_view();
-        async move {
-            let params = params.get()?;
-            let overrides = params
-                .get_settings_overrides()?
-                .get_map()?
-                .iter()
-                .map(|setting| {
-                    Ok((
-                        String::from_utf8_lossy(setting.get_name()?).into_owned(),
-                        String::from_utf8_lossy(setting.get_value()?).into_owned(),
-                    ))
-                })
-                .collect::<capnp::Result<Vec<_>>>()?;
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let overrides = params
+            .get_settings_overrides()?
+            .get_map()?
+            .iter()
+            .map(|setting| {
+                Ok((
+                    String::from_utf8_lossy(setting.get_name()?).into_owned(),
+                    String::from_utf8_lossy(setting.get_value()?).into_owned(),
+                ))
+            })
+            .collect::<capnp::Result<Vec<_>>>()?;
 
-            store
-                .set_options(ClientOptions {
-                    keep_failed: params.get_keep_failed(),
-                    keep_going: params.get_keep_going(),
-                    try_fallback: params.get_try_fallback(),
-                    verbosity: params.get_verbosity()? as u16,
-                    max_build_jobs: params.get_max_build_jobs(),
-                    build_cores: params.get_build_cores(),
-                    use_substitutes: params.get_use_substitutes(),
-                    overrides,
-                })
-                .await;
-            Ok(())
-        }
+        let options = ClientOptions {
+            keep_failed: params.get_keep_failed(),
+            keep_going: params.get_keep_going(),
+            try_fallback: params.get_try_fallback(),
+            verbosity: params.get_verbosity()? as u16,
+            max_build_jobs: params.get_max_build_jobs(),
+            build_cores: params.get_build_cores(),
+            use_substitutes: params.get_use_substitutes(),
+            overrides,
+        };
+        tracing::debug!(tenant = %self.tenant.id, ?options, "client options");
+        *self.options.borrow_mut() = options;
+        Ok(())
     }
 
     fn is_valid_path(
@@ -1311,7 +1315,7 @@ impl legacy_protocol::stream::Server for NarSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Hash, HashType, MemoryStore, PathInfo};
+    use crate::store::{Hash, HashType, MemoryStore, PathInfo, PathStore};
 
     const STORE_DIR: &str = "/nix/store";
     const DRV: &str = "00000000000000000000000000000000-thing.drv";
@@ -1342,6 +1346,7 @@ mod tests {
                 },
                 staged: RefCell::new(Vec::new()),
                 store_dir: STORE_DIR.to_string(),
+                options: RefCell::new(ClientOptions::default()),
             }
         }
     }

@@ -19,7 +19,7 @@ use kubernix_types::{CapabilityToken, ObjectKey};
 
 use crate::capability::Capability;
 use crate::kubernix_capnp;
-use crate::store::{Store, Tier};
+use crate::store::{CapabilitySecretStore, Tier};
 use crate::tenant::TenantId;
 
 pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
@@ -234,11 +234,13 @@ impl UploadSigner {
     ///
     /// Uses a queue group so that with several frontends exactly one answers
     /// each request. `store` is consulted for every request's capability
-    /// secret — see [`Capability::verify`] — never for anything else here.
+    /// secret — see [`Capability::verify`] — never for anything else here,
+    /// which is why it is `Arc<dyn CapabilitySecretStore>` rather than the
+    /// whole `Store`.
     pub async fn serve(
         self,
         client: async_nats::Client,
-        store: Arc<dyn Store>,
+        store: Arc<dyn CapabilitySecretStore>,
     ) -> eyre::Result<()> {
         let mut requests = client
             .queue_subscribe(UPLOADS_SUBJECT, "kubernix-frontends".to_string())
@@ -271,7 +273,11 @@ impl UploadSigner {
         Ok(())
     }
 
-    async fn handle(&self, payload: &[u8], store: &dyn Store) -> Result<Vec<String>, UploadError> {
+    async fn handle(
+        &self,
+        payload: &[u8],
+        store: &dyn CapabilitySecretStore,
+    ) -> Result<Vec<String>, UploadError> {
         // Decode to owned values first. capnp readers are !Send, and holding one
         // across the presigning awaits would make this future !Send — which it
         // cannot be, since it runs under tokio::spawn.

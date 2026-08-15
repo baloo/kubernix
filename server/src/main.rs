@@ -22,7 +22,7 @@ use std::sync::Arc;
 use eyre::Context as _;
 use kubernix_server::http::{self, HttpState};
 use kubernix_server::postgres_store::{PostgresStore, ServingRole};
-use kubernix_server::store::{MemoryStore, Store};
+use kubernix_server::store::{MemoryStore, PathStore};
 use kubernix_server::uploads::UploadSigner;
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -41,7 +41,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     // A cache with no database has nothing to serve: every path it could offer
     // is a row. Starting anyway would answer 404 to everything, which looks like
     // a cache miss rather than a misconfiguration — so say so loudly instead.
-    let store: Arc<dyn Store> = match std::env::var("DATABASE_URL") {
+    let store: Arc<dyn PathStore> = match std::env::var("DATABASE_URL") {
         // Tenant-scoped, same as kubernix-sshd: every read here is already
         // scoped to the URL's `{tenant}` path segment.
         Ok(url) => PostgresStore::connect(&url, ServingRole::App)

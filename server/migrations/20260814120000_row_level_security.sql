@@ -75,9 +75,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON jobs TO kubernix_gc;
 
 -- `path_access`: kubernix-sshd only ever appends to its own tenant's queue
 -- (`Store::record_access`); nothing on the serving path reads it back. Only
--- kubernix-gc's drain pass reads and deletes, across every tenant at once.
+-- kubernix-gc's drain pass reads and deletes, across every tenant at once —
+-- `UPDATE`, not just `SELECT`/`DELETE`, because its `SELECT ... FOR UPDATE
+-- SKIP LOCKED` (claiming rows to drain without contending with concurrent
+-- inserts) takes a row lock, and Postgres requires `UPDATE` privilege to do
+-- that regardless of whether the row ends up updated or deleted.
 GRANT INSERT ON path_access TO kubernix_app;
-GRANT SELECT, DELETE ON path_access TO kubernix_gc;
+GRANT SELECT, UPDATE, DELETE ON path_access TO kubernix_gc;
 
 -- `objects`, `tenants`, `capability_secrets`: not tenant-keyed (see their own
 -- table comments — a `Verified` object is shared across tenants by
