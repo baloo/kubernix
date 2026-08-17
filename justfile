@@ -102,6 +102,12 @@ nix-test:
 nix-test-guest-vm:
     nix-build nix -A guest-vm-test
 
+# Phase 15 Step 2: confirm a store.img block device survives a real
+# cloud-hypervisor stop/reboot cycle unmodified. Needs /dev/kvm, same as
+# nix-test-guest-vm.
+nix-test-vm-lifecycle:
+    nix-build nix -A vm-lifecycle-test
+
 # Remove build artifacts.
 clean:
     cargo clean

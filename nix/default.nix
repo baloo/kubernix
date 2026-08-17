@@ -20,11 +20,15 @@ let
   kubernix-plugin = pkgs.callPackage ./plugin.nix { };
   kubernix-guest-agent = pkgs.callPackage ./guest-agent.nix { inherit workspaceSource outputHashes; };
   guest-vm = pkgs.callPackage ./guest-vm.nix { inherit kubernix-guest-agent; };
+  vm-lifecycle-test = pkgs.callPackage ./vm-lifecycle-test.nix {
+    inherit (guest-vm) kernel initrd;
+  };
 in {
   inherit kubernix-server kubernix-worker kubernix-plugin kubernix-guest-agent;
   kubernix-guest-vm-kernel = guest-vm.kernel;
   kubernix-guest-vm-initrd = guest-vm.initrd;
   guest-vm-test = guest-vm.test;
+  inherit vm-lifecycle-test;
   test = import ./test.nix {
     inherit pkgs kubernix-server kubernix-worker kubernix-plugin;
   };

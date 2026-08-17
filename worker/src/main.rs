@@ -15,6 +15,7 @@ pub mod kubernix_capnp {
 mod nar_export;
 mod serve;
 mod upload;
+mod vm;
 
 /// Request/reply subject for pre-signed upload URLs. The frontend holds the S3
 /// credentials; this worker never does.
@@ -181,6 +182,17 @@ async fn main() -> color_eyre::eyre::Result<()> {
         store_dir: &store_dir,
     };
 
+    // Phase 15 Step 2: per-tenant VM lifecycle. Opt-in for now — nothing
+    // downstream (`run_build`, `serve.rs`, `upload.rs`) consumes a `VmHandle`
+    // yet, that's Step 3 — so a worker that hasn't set KUBERNIX_VM_KERNEL/
+    // KUBERNIX_VM_INITRD keeps building exactly as it does today.
+    let mut vm_pool = vm::VmConfig::from_env()?.map(vm::VmPool::new);
+    if vm_pool.is_none() {
+        tracing::info!(
+            "KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD not set; per-tenant VM lifecycle disabled"
+        );
+    }
+
     tracing::info!(%subject, "waiting for jobs");
     let mut messages = consumer.messages().await?;
 
@@ -205,6 +217,32 @@ async fn main() -> color_eyre::eyre::Result<()> {
         };
 
         tracing::info!(job_id = %job.job_id, drv = %job.derivation_path, inputs = job.inputs.len(), "building");
+
+        if let Some(pool) = vm_pool.as_mut() {
+            match pool.ensure_vm_for(&job.tenant).await {
+                Ok(handle) => {
+                    tracing::info!(
+                        job_id = %job.job_id, tenant = %job.tenant,
+                        vsock = %handle.vsock_socket.display(),
+                        "tenant VM ready"
+                    );
+                }
+                Err(report) => {
+                    tracing::error!(job_id = %job.job_id, error = ?report, "could not start the tenant VM");
+                    let outcome = Outcome::Failed(infra_failure_message(
+                        &job.job_id,
+                        "starting the tenant VM failed",
+                    ));
+                    if let Err(e) = job.publish_result(&jetstream, &outcome, &[], None).await {
+                        tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
+                    }
+                    if let Err(e) = message.ack().await {
+                        tracing::error!(job_id = %job.job_id, error = %e, "failed to ack job");
+                    }
+                    continue;
+                }
+            }
+        }
 
         if let Err(report) = job.fetch_inputs(&client, &http, nix).await {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
