@@ -88,13 +88,19 @@ plugin lix_src=lix_source:
     fi
     ninja -C plugin/build
 
-# Build the Nix packages (server, worker, plugin).
+# Build the Nix packages (server, worker, plugin, guest-agent).
 nix-build:
-    nix-build nix -A kubernix-server -A kubernix-worker -A kubernix-plugin
+    nix-build nix -A kubernix-server -A kubernix-worker -A kubernix-plugin -A kubernix-guest-agent
 
 # Run the NixOS integration test.
 nix-test:
     nix-build nix -A test
+
+# Phase 15 Step 1: boot the guest-vm kernel+initrd standalone under
+# cloud-hypervisor and confirm guest-agent accepts a vsock connection. Needs
+# /dev/kvm -- see nix/guest-vm-test.nix for the sandbox config that requires.
+nix-test-guest-vm:
+    nix-build nix -A guest-vm-test
 
 # Remove build artifacts.
 clean:

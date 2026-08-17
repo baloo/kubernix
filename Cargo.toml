@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "guest-agent",
     "server",
     "signing",
     "types",

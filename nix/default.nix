@@ -11,15 +11,20 @@ let
   # the source is realised once and reused.
   workspaceSource = source.workspace {
     name = "kubernix-src";
-    crates = [ "server" "signing" "types" "worker" ];
+    crates = [ "guest-agent" "server" "signing" "types" "worker" ];
   };
   inherit (source) outputHashes;
 
   kubernix-server = pkgs.callPackage ./server.nix { inherit workspaceSource outputHashes; };
   kubernix-worker = pkgs.callPackage ./worker.nix { inherit workspaceSource outputHashes; };
   kubernix-plugin = pkgs.callPackage ./plugin.nix { };
+  kubernix-guest-agent = pkgs.callPackage ./guest-agent.nix { inherit workspaceSource outputHashes; };
+  guest-vm = pkgs.callPackage ./guest-vm.nix { inherit kubernix-guest-agent; };
 in {
-  inherit kubernix-server kubernix-worker kubernix-plugin;
+  inherit kubernix-server kubernix-worker kubernix-plugin kubernix-guest-agent;
+  kubernix-guest-vm-kernel = guest-vm.kernel;
+  kubernix-guest-vm-initrd = guest-vm.initrd;
+  guest-vm-test = guest-vm.test;
   test = import ./test.nix {
     inherit pkgs kubernix-server kubernix-worker kubernix-plugin;
   };

@@ -1,0 +1,14 @@
+[package]
+name = "kubernix-guest-agent"
+version = "0.1.0"
+edition = "2024"
+
+# Deliberately minimal: this binary runs as PID 1 inside a stripped-down
+# initrd (Phase 15), not alongside the frontend/worker's S3/Postgres/SSH
+# stack. It needs only enough to accept a vsock connection and exec
+# `nix-daemon --stdio` on the other end of it.
+[dependencies]
+color-eyre.workspace = true
+eyre.workspace = true
+tokio.workspace = true
+tokio-vsock = "0.7.2"
