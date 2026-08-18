@@ -108,6 +108,12 @@ nix-test-guest-vm:
 nix-test-vm-lifecycle:
     nix-build nix -A vm-lifecycle-test
 
+# Phase 15 Step 3: drive kubernix_daemon_protocol's real handshake and a
+# QueryPathInfo round trip against a real nix-daemon inside the guest VM.
+# Needs /dev/kvm, same as nix-test-guest-vm.
+nix-test-vm-build:
+    nix-build nix -A vm-build-test
+
 # Remove build artifacts.
 clean:
     cargo clean

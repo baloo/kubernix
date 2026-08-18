@@ -2488,6 +2488,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kubernix-daemon-protocol"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "futures-util",
+ "kubernix-types",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kubernix-guest-agent"
 version = "0.1.0"
 dependencies = [
@@ -2573,6 +2585,7 @@ dependencies = [
  "digest-io-async",
  "eyre",
  "futures-util",
+ "kubernix-daemon-protocol",
  "kubernix-types",
  "reqwest",
  "sha2 0.11.0",

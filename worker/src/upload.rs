@@ -159,7 +159,7 @@ impl<'a> NixStore<'a> {
     /// [`InspectWriter`]) rather than read back from the sink afterwards
     /// (e.g. `tokio::fs::File::metadata`), which is what makes this generic
     /// over any sink at all, not just a real file.
-    async fn dump_hash_and_compress<R, W>(
+    pub(crate) async fn dump_hash_and_compress<R, W>(
         nar: R,
         sink: W,
     ) -> eyre::Result<(Output<Sha256>, u64, Output<Sha256>, u64)>
@@ -209,9 +209,9 @@ impl<'a> NixStore<'a> {
     /// point for a large closure.
     ///
     /// TODO: the `nix store dump-path` child below has no timeout — see
-    /// `serve::ServeConnection::open`'s doc comment for the same hang risk
-    /// and the same real fix (a direct connection to the daemon socket
-    /// instead of shelling out).
+    /// `serve::ServeConnection::open`'s doc comment for the same hang risk.
+    /// `vm_ops::upload_output` is the real fix, over `Op::NarFromPath`, but
+    /// only when a tenant VM is available; this remains the fallback.
     pub async fn upload_output(
         &self,
         http: &reqwest::Client,
@@ -304,8 +304,9 @@ impl<'a> NixStore<'a> {
     /// input.
     ///
     /// TODO: same unbounded-hang risk on the `--import` child as
-    /// `upload_output`'s `dump-path` child — see `serve::ServeConnection::
-    /// open`'s doc comment.
+    /// `upload_output`'s `dump-path` child. `vm_ops::fetch_input` is the real
+    /// fix, over `Op::AddToStoreNar`, but only when a tenant VM is available;
+    /// this remains the fallback.
     pub async fn fetch_input(
         &self,
         http: &reqwest::Client,
@@ -436,8 +437,10 @@ pub async fn upload_log(
 impl<'a> NixStore<'a> {
     // TODO: the `nix-store --query` children spawned below (via `.output()`,
     // which waits for exit with no timeout) share the same unbounded-hang
-    // risk as `upload_output`'s and `fetch_input`'s — see
-    // `serve::ServeConnection::open`'s doc comment.
+    // risk as `upload_output`'s and `fetch_input`'s. `vm_ops::path_metadata`
+    // is the real fix, one `Op::QueryPathInfo` round trip instead of two
+    // subprocesses, but only when a tenant VM is available; this remains the
+    // fallback.
     async fn query_path_metadata(
         &self,
         store_path: &StorePath,

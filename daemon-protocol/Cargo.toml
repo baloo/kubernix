@@ -1,0 +1,15 @@
+[package]
+name = "kubernix-daemon-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kubernix-types.workspace = true
+eyre.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "io-util"] }

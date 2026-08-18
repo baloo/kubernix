@@ -16,6 +16,13 @@ mod nar_export;
 mod serve;
 mod upload;
 mod vm;
+mod vm_ops;
+
+/// One VM's `nix-daemon` session, as `main.rs`'s job loop and `Job`'s methods
+/// see it — a `DaemonConnection` over the `UnixStream` `VmHandle::connect`
+/// dials. Named here so `Option<&mut VmConn>` reads as one thing rather than
+/// the full generic spelled out at every call site.
+type VmConn = kubernix_daemon_protocol::DaemonConnection<tokio::net::UnixStream>;
 
 /// Request/reply subject for pre-signed upload URLs. The frontend holds the S3
 /// credentials; this worker never does.
@@ -73,6 +80,7 @@ impl Job {
         client: &async_nats::Client,
         http: &reqwest::Client,
         nix: upload::NixStore<'_>,
+        mut vm: Option<&mut VmConn>,
     ) -> eyre::Result<()> {
         if self.inputs.is_empty() {
             return Ok(());
@@ -85,15 +93,29 @@ impl Job {
 
         for (input, url) in self.inputs.iter().zip(urls) {
             tracing::info!(job_id = %self.job_id, path = %input.store_path, "importing input");
-            nix.fetch_input(
-                http,
-                &url,
-                &input.store_path,
-                &input.references,
-                &input.deriver,
-            )
-            .await
-            .wrap_err_with(|| format!("importing {}", input.store_path))?;
+            match &mut vm {
+                Some(conn) => vm_ops::fetch_input(
+                    conn,
+                    http,
+                    &url,
+                    &input.store_path,
+                    &input.references,
+                    &input.deriver,
+                    nix.store_dir,
+                )
+                .await
+                .wrap_err_with(|| format!("importing {}", input.store_path))?,
+                None => nix
+                    .fetch_input(
+                        http,
+                        &url,
+                        &input.store_path,
+                        &input.references,
+                        &input.deriver,
+                    )
+                    .await
+                    .wrap_err_with(|| format!("importing {}", input.store_path))?,
+            }
         }
 
         tracing::info!(job_id = %self.job_id, count = self.inputs.len(), "inputs imported");
@@ -218,17 +240,32 @@ async fn main() -> color_eyre::eyre::Result<()> {
 
         tracing::info!(job_id = %job.job_id, drv = %job.derivation_path, inputs = job.inputs.len(), "building");
 
+        // Phase 15 Step 3: a `VmHandle` alone (Step 2) proved nothing beyond
+        // "the VM boots" — dialing it and speaking the daemon protocol is
+        // what actually routes this job's build through it instead of the
+        // worker's own local store. `vm_conn` stays `None` (falling back to
+        // the subprocess path everywhere below) whenever `vm_pool` itself is
+        // disabled, exactly as before this step.
+        let mut vm_conn: Option<VmConn> = None;
         if let Some(pool) = vm_pool.as_mut() {
-            match pool.ensure_vm_for(&job.tenant).await {
+            let dialed = match pool.ensure_vm_for(&job.tenant).await {
                 Ok(handle) => {
                     tracing::info!(
                         job_id = %job.job_id, tenant = %job.tenant,
                         vsock = %handle.vsock_socket.display(),
                         "tenant VM ready"
                     );
+                    match handle.connect().await {
+                        Ok(stream) => VmConn::open(stream).await.map_err(eyre::Report::from),
+                        Err(report) => Err(report),
+                    }
                 }
+                Err(report) => Err(report),
+            };
+            match dialed {
+                Ok(conn) => vm_conn = Some(conn),
                 Err(report) => {
-                    tracing::error!(job_id = %job.job_id, error = ?report, "could not start the tenant VM");
+                    tracing::error!(job_id = %job.job_id, error = ?report, "could not reach the tenant VM's daemon");
                     let outcome = Outcome::Failed(infra_failure_message(
                         &job.job_id,
                         "starting the tenant VM failed",
@@ -244,7 +281,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
             }
         }
 
-        if let Err(report) = job.fetch_inputs(&client, &http, nix).await {
+        if let Err(report) = job.fetch_inputs(&client, &http, nix, vm_conn.as_mut()).await {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
             let outcome =
                 Outcome::Failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
@@ -277,13 +314,20 @@ async fn main() -> color_eyre::eyre::Result<()> {
         };
 
         let (mut outcome, log) = job
-            .run_build(&client, outputs, &builder, store_uri.as_deref(), &store_dir)
+            .run_build(
+                &client,
+                outputs,
+                &builder,
+                store_uri.as_deref(),
+                &store_dir,
+                vm_conn.as_mut(),
+            )
             .await;
 
         // Artifacts first, then the result: publishing a success whose outputs
         // are not yet fetchable would be worse than reporting the upload failure.
         let (artifacts, log_key) = match job
-            .upload_artifacts(&client, &http, &outcome, log, nix)
+            .upload_artifacts(&client, &http, &outcome, log, nix, vm_conn.as_mut())
             .await
         {
             Ok(uploaded) => uploaded,
@@ -390,6 +434,7 @@ impl Job {
         outcome: &Outcome,
         log: Vec<u8>,
         nix: upload::NixStore<'_>,
+        mut vm: Option<&mut VmConn>,
     ) -> eyre::Result<(Vec<upload::OutputArtifact>, Option<ObjectKey>)> {
         let outputs: Vec<StorePath> = match outcome {
             Outcome::Completed(paths) => paths.clone(),
@@ -432,11 +477,18 @@ impl Job {
         for (i, path) in outputs.iter().enumerate() {
             let key = keys[i + 1].clone();
             tracing::info!(job_id = %self.job_id, %path, %key, "uploading output");
-            artifacts.push(
-                nix.upload_output(http, &urls[i + 1], key, path)
+            let artifact = match &mut vm {
+                Some(conn) => {
+                    vm_ops::upload_output(conn, http, &urls[i + 1], key, path, nix.store_dir)
+                        .await
+                        .wrap_err_with(|| format!("uploading {path}"))?
+                }
+                None => nix
+                    .upload_output(http, &urls[i + 1], key, path)
                     .await
                     .wrap_err_with(|| format!("uploading {path}"))?,
-            );
+            };
+            artifacts.push(artifact);
         }
 
         Ok((artifacts, log_key))
@@ -459,8 +511,53 @@ impl Job {
         builder: &str,
         store_uri: Option<&str>,
         store_dir: &str,
+        vm: Option<&mut VmConn>,
     ) -> (Outcome, Vec<u8>) {
         let log_subject = format!("kubernix.logs.{}", self.job_id);
+
+        // Phase 15 Step 3: over the tenant VM's daemon connection when one is
+        // available, `nix-store --serve` otherwise. The VM path's log is not
+        // streamed live — see `DaemonConnection::build_derivation`'s doc
+        // comment — so it publishes every collected line only once the build
+        // has already finished, unlike the subprocess path's `pump_log`.
+        if let Some(conn) = vm {
+            let result = vm_ops::build_derivation(
+                conn,
+                &self.derivation_path.to_full(store_dir),
+                &self.drv,
+            )
+            .await;
+
+            return match result {
+                Ok(outcome) => {
+                    let (archive, tail) =
+                        publish_collected_log(client, &log_subject, &outcome.log).await;
+                    let _ = client.flush().await;
+
+                    let outcome = if outcome.succeeded() {
+                        Outcome::Completed(outputs)
+                    } else {
+                        let mut message = outcome.describe();
+                        if !tail.is_empty() {
+                            message.push('\n');
+                            message.push_str(&tail.join("\n"));
+                        }
+                        Outcome::Failed(message)
+                    };
+                    (outcome, archive)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        job_id = %self.job_id, drv = %self.derivation_path, error = ?e,
+                        "builder invocation failed over the VM connection"
+                    );
+                    let message =
+                        infra_failure_message(&self.job_id, "running the builder failed");
+                    let _ = client.publish(log_subject, message.clone().into()).await;
+                    (Outcome::Failed(message.clone()), message.into_bytes())
+                }
+            };
+        }
 
         let mut conn = match serve::ServeConnection::open(builder, store_uri).await {
             Ok(conn) => conn,
@@ -517,6 +614,29 @@ impl Job {
 
         (outcome, archive)
     }
+}
+
+/// Publish a build's already-collected log lines (the VM path's shape — see
+/// `DaemonConnection::build_derivation`) one at a time, the same way
+/// [`pump_log`] does for a live stream. Returns the same `(archive, tail)`
+/// shape so both paths converge on identical failure-message construction.
+async fn publish_collected_log(
+    client: &async_nats::Client,
+    subject: &str,
+    lines: &[String],
+) -> (Vec<u8>, Vec<String>) {
+    let mut archive = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+    for line in lines {
+        let _ = client.publish(subject.to_string(), line.clone().into()).await;
+        archive.extend_from_slice(line.as_bytes());
+        archive.push(b'\n');
+        if tail.len() == 20 {
+            tail.remove(0);
+        }
+        tail.push(line.clone());
+    }
+    (archive, tail)
 }
 
 /// Relay the builder's output to `kubernix.logs.<job_id>` as it arrives.

@@ -11,7 +11,7 @@ let
   # the source is realised once and reused.
   workspaceSource = source.workspace {
     name = "kubernix-src";
-    crates = [ "guest-agent" "server" "signing" "types" "worker" ];
+    crates = [ "daemon-protocol" "guest-agent" "server" "signing" "types" "worker" ];
   };
   inherit (source) outputHashes;
 
@@ -23,12 +23,16 @@ let
   vm-lifecycle-test = pkgs.callPackage ./vm-lifecycle-test.nix {
     inherit (guest-vm) kernel initrd;
   };
+  vm-build-test = pkgs.callPackage ./vm-build-test.nix {
+    inherit (guest-vm) kernel initrd;
+    inherit kubernix-worker;
+  };
 in {
   inherit kubernix-server kubernix-worker kubernix-plugin kubernix-guest-agent;
   kubernix-guest-vm-kernel = guest-vm.kernel;
   kubernix-guest-vm-initrd = guest-vm.initrd;
   guest-vm-test = guest-vm.test;
-  inherit vm-lifecycle-test;
+  inherit vm-lifecycle-test vm-build-test;
   test = import ./test.nix {
     inherit pkgs kubernix-server kubernix-worker kubernix-plugin;
   };

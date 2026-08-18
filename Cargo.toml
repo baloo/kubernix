@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "daemon-protocol",
     "guest-agent",
     "server",
     "signing",
@@ -9,6 +10,7 @@ members = [
 ]
 
 [workspace.dependencies]
+kubernix-daemon-protocol = { version = "0.1.0", path = "./daemon-protocol" }
 kubernix-signing = { version = "0.1.0", path = "./signing" }
 kubernix-types = { version = "0.1.0", path = "./types" }
 

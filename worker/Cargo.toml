@@ -13,6 +13,7 @@ capnp.workspace = true
 color-eyre.workspace = true
 digest-io-async.workspace = true
 eyre.workspace = true
+kubernix-daemon-protocol.workspace = true
 futures-util.workspace = true
 kubernix-types.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "stream"] }

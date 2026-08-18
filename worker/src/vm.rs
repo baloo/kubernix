@@ -119,15 +119,53 @@ where
 /// Constructed and logged already (`main.rs`); every field here is Step 3's
 /// eventual read, not Step 2's — hence `allow(dead_code)` rather than trimming
 /// fields a daemon-protocol client will need on day one.
-#[allow(dead_code)]
 pub struct VmHandle {
+    /// Kept for callers that want to attribute a handle to its tenant
+    /// (logging, error messages) without threading a second parameter
+    /// alongside it — not read by `connect` itself, which only needs
+    /// `vsock_socket`/`guest_port`.
+    #[allow(dead_code)]
     pub tenant: TenantId,
     /// Host-side UNIX socket `cloud-hypervisor`'s `--vsock ...,socket=`
     /// exposes. Dialing it and sending `CONNECT <port>\n` reaches
-    /// `guest_port` inside the guest — see `wait_for_vsock_ready`.
+    /// `guest_port` inside the guest — see `wait_for_vsock_ready`, and
+    /// [`Self::connect`] for the same handshake kept open for real use.
     pub vsock_socket: PathBuf,
     pub guest_port: u32,
+    #[allow(dead_code)]
     pub store_img: PathBuf,
+}
+
+impl VmHandle {
+    /// Dial `vsock_socket` and reach `guest_port` inside the guest — the
+    /// same `CONNECT <port>\n` / `OK` inetd-style handshake
+    /// `wait_for_vsock_ready` polls with during boot (`handshake_once`), but
+    /// keeping the resulting stream open afterwards instead of dropping it.
+    /// The returned `UnixStream` is a raw byte pipe straight through to
+    /// `guest-agent`'s spawned `nix-daemon --stdio` — hand it to
+    /// `kubernix_daemon_protocol::DaemonConnection::open` for a real session.
+    pub async fn connect(&self) -> eyre::Result<tokio::net::UnixStream> {
+        let mut stream = tokio::net::UnixStream::connect(&self.vsock_socket)
+            .await
+            .wrap_err_with(|| format!("dialing {}", self.vsock_socket.display()))?;
+        stream
+            .write_all(format!("CONNECT {}\n", self.guest_port).as_bytes())
+            .await
+            .wrap_err("sending the vsock CONNECT handshake")?;
+        let mut buf = [0u8; 32];
+        let n = stream
+            .read(&mut buf)
+            .await
+            .wrap_err("reading the vsock CONNECT reply")?;
+        if !buf[..n].starts_with(b"OK") {
+            return Err(eyre!(
+                "vsock CONNECT to guest port {} refused: {:?}",
+                self.guest_port,
+                String::from_utf8_lossy(&buf[..n])
+            ));
+        }
+        Ok(stream)
+    }
 }
 
 /// A booted VM, as far as this module cares: a child process and the paths

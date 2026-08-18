@@ -150,12 +150,17 @@ impl ServeConnection {
     /// block this connection's I/O — the only backstop is the worker's NATS
     /// `ack_wait` (3600s), which affects redelivery, not killing the stuck
     /// process. A `tokio::time::timeout` around this and `build_derivation`
-    /// would be a bandage; the real fix is to stop shelling out to
-    /// `nix-store --serve` at all and speak the Nix/Lix daemon protocol
-    /// directly over its Unix socket instead — the same kind of worker
-    /// protocol `kubernix-server` already speaks over SSH
-    /// (`server/src/daemon_rpc.rs`) — which makes a hung build a connection
-    /// the worker controls rather than a subprocess it has to babysit.
+    /// would be a bandage; the real fix — implemented, but only when a
+    /// tenant VM is available (Phase 15 Step 3) — is to stop shelling out to
+    /// `nix-store --serve` at all and speak the real Nix/Lix daemon protocol
+    /// (`kubernix_daemon_protocol`, over the VM's vsock connection) instead,
+    /// which makes a hung build a connection the worker controls rather than
+    /// a subprocess it has to babysit. **Not** the same protocol
+    /// `kubernix-server` speaks over SSH (`server/src/daemon_rpc.rs`) — that
+    /// is Cap'n Proto, a kubernix-specific surface a real `nix-daemon` never
+    /// serves over stdio (`NOTES.md` item 4b); `kubernix_daemon_protocol`
+    /// implements the actual legacy worker protocol instead. This module
+    /// stays the fallback for deployments without a VM.
     pub async fn open(nix_store: &str, store_uri: Option<&str>) -> eyre::Result<Self> {
         let mut command = Command::new(nix_store);
         command.arg("--serve").arg("--write");
@@ -226,8 +231,8 @@ impl ServeConnection {
     /// output, which is exactly what the far side's `readDerivation` expects.
     ///
     /// TODO: same unbounded-hang risk as [`Self::open`] — no timeout on this
-    /// exchange, same real fix (talk to the daemon socket directly rather
-    /// than through this subprocess).
+    /// exchange; see its doc comment for the real fix and why it only
+    /// applies when a tenant VM is available.
     pub async fn build_derivation(
         &mut self,
         drv_path: &str,
