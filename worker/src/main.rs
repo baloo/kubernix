@@ -204,16 +204,25 @@ async fn main() -> color_eyre::eyre::Result<()> {
         store_dir: &store_dir,
     };
 
-    // Phase 15 Step 2: per-tenant VM lifecycle. Opt-in for now — nothing
-    // downstream (`run_build`, `serve.rs`, `upload.rs`) consumes a `VmHandle`
-    // yet, that's Step 3 — so a worker that hasn't set KUBERNIX_VM_KERNEL/
-    // KUBERNIX_VM_INITRD keeps building exactly as it does today.
-    let mut vm_pool = vm::VmConfig::from_env()?.map(vm::VmPool::new);
-    if vm_pool.is_none() {
+    // Phase 15 Steps 2-4: per-tenant VM lifecycle, opt-in on
+    // KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD — a worker without them keeps
+    // building exactly as it does today.
+    let vm_config = vm::VmConfig::from_env()?;
+    let mut vm_pool = if let Some(config) = vm_config {
+        // Step 4: every `store.img` left on disk by a previous run of this
+        // process is ciphertext this process holds no key for — wipe them
+        // before serving a single job rather than let them sit as
+        // unrecoverable dead weight.
+        vm::wipe_orphaned_store_images(&config.state_dir)
+            .await
+            .wrap_err("wiping orphaned tenant store images")?;
+        Some(vm::VmPool::new(config))
+    } else {
         tracing::info!(
             "KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD not set; per-tenant VM lifecycle disabled"
         );
-    }
+        None
+    };
 
     tracing::info!(%subject, "waiting for jobs");
     let mut messages = consumer.messages().await?;
@@ -281,7 +290,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
             }
         }
 
-        if let Err(report) = job.fetch_inputs(&client, &http, nix, vm_conn.as_mut()).await {
+        if let Err(report) = job
+            .fetch_inputs(&client, &http, nix, vm_conn.as_mut())
+            .await
+        {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
             let outcome =
                 Outcome::Failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
@@ -521,12 +533,9 @@ impl Job {
         // comment — so it publishes every collected line only once the build
         // has already finished, unlike the subprocess path's `pump_log`.
         if let Some(conn) = vm {
-            let result = vm_ops::build_derivation(
-                conn,
-                &self.derivation_path.to_full(store_dir),
-                &self.drv,
-            )
-            .await;
+            let result =
+                vm_ops::build_derivation(conn, &self.derivation_path.to_full(store_dir), &self.drv)
+                    .await;
 
             return match result {
                 Ok(outcome) => {
@@ -551,8 +560,7 @@ impl Job {
                         job_id = %self.job_id, drv = %self.derivation_path, error = ?e,
                         "builder invocation failed over the VM connection"
                     );
-                    let message =
-                        infra_failure_message(&self.job_id, "running the builder failed");
+                    let message = infra_failure_message(&self.job_id, "running the builder failed");
                     let _ = client.publish(log_subject, message.clone().into()).await;
                     (Outcome::Failed(message.clone()), message.into_bytes())
                 }
@@ -628,7 +636,9 @@ async fn publish_collected_log(
     let mut archive = Vec::new();
     let mut tail: Vec<String> = Vec::new();
     for line in lines {
-        let _ = client.publish(subject.to_string(), line.clone().into()).await;
+        let _ = client
+            .publish(subject.to_string(), line.clone().into())
+            .await;
         archive.extend_from_slice(line.as_bytes());
         archive.push(b'\n');
         if tail.len() == 20 {

@@ -16,6 +16,7 @@ eyre.workspace = true
 kubernix-daemon-protocol.workspace = true
 futures-util.workspace = true
 kubernix-types.workspace = true
+rand.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "stream"] }
 sha2.workspace = true
 tempfile = "3.27.0"

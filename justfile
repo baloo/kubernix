@@ -114,6 +114,13 @@ nix-test-vm-lifecycle:
 nix-test-vm-build:
     nix-build nix -A vm-build-test
 
+# Phase 15 Step 4: drive the dm-crypt key handshake against a real guest --
+# FRESH mkfs+mount, REUSE with the same key, REUSE rejected with a wrong key,
+# and store.img is opaque on the host without the key. Needs /dev/kvm, same
+# as nix-test-guest-vm.
+nix-test-vm-encryption:
+    nix-build nix -A vm-encryption-test
+
 # Remove build artifacts.
 clean:
     cargo clean

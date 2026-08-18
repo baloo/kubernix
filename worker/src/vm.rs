@@ -1,4 +1,5 @@
-//! Phase 15 Step 2: per-tenant `cloud-hypervisor` VM lifecycle.
+//! Phase 15 Steps 2 and 4: per-tenant `cloud-hypervisor` VM lifecycle, and
+//! at-rest encryption of each tenant's `store.img`.
 //!
 //! Owns exactly one warm VM per worker process (matching today's
 //! one-job-at-a-time job loop in `main.rs`), keyed by [`TenantId`]. A job for
@@ -8,24 +9,36 @@
 //! tenant's Nix store survives across warm-VM cycles as long as the image
 //! stays on this worker's local disk.
 //!
-//! This module only proves the VM comes up and answers on its vsock socket.
-//! It does not yet speak the Nix daemon protocol over that socket, or make
-//! any build actually use it — `worker/src/serve.rs` and `upload.rs` still
-//! shell out to `nix-store --serve` exactly as before. Wiring a real build
-//! through the VM is Phase 15 Step 3; this module hands it a dialable
-//! [`VmHandle`] to build against.
+//! `store.img` is plain-`dm-crypt` ciphertext, not a plaintext filesystem.
+//! [`VmPool`] generates a random 256-bit key the first time it creates a
+//! tenant's image, keeps it only in this process's memory (never on disk,
+//! never logged), and pushes it to `guest-agent`'s control channel
+//! (`CONTROL_PORT`) right after every boot for that tenant — the guest opens
+//! the encrypted device and mounts it at `/nix/store` before `nix-daemon`
+//! ever starts. A worker restart loses every key it held, permanently
+//! orphaning the `store.img` files that process created; see
+//! [`wipe_orphaned_store_images`], which a fresh process runs before serving
+//! any job so those images don't linger as unrecoverable dead weight.
 //!
-//! Process spawning is behind the [`VmLauncher`] trait so the reuse/evict
-//! decision in [`VmPool::ensure_vm_for`] — the actual thing this step needs
-//! to prove — is unit-testable without `/dev/kvm`. [`CloudHypervisorLauncher`]
-//! is the real implementation; tests supply a fake.
+//! This module does not itself speak the Nix daemon protocol over the
+//! resulting connection, or make any build actually use it — that is Step
+//! 3's `kubernix_daemon_protocol`/`vm_ops.rs`, layered on top of the
+//! [`VmHandle`] this module hands out.
+//!
+//! Process spawning (and, since Step 4, key pushing) is behind the
+//! [`VmLauncher`] trait so the reuse/evict decision in
+//! [`VmPool::ensure_vm_for`] — the actual thing these steps need to prove —
+//! is unit-testable without `/dev/kvm`. [`CloudHypervisorLauncher`] is the
+//! real implementation; tests supply a fake.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use eyre::{Context as _, eyre};
 use kubernix_types::TenantId;
+use rand::Rng as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
@@ -36,6 +49,22 @@ use tokio::process::{Child, Command};
 /// Step 3's connection test) should pin down rather than paper over with an
 /// artificial shared dependency.
 const NIX_DAEMON_PORT: u32 = 620;
+
+/// `guest-agent`'s fixed control-channel vsock port
+/// (`guest-agent/src/main.rs::CONTROL_PORT`), duplicated here for the same
+/// reason as `NIX_DAEMON_PORT` above. Carries the Step 4 `KEY ... FRESH|REUSE`
+/// handshake that unlocks and mounts the tenant's `store.img` before any
+/// daemon-protocol traffic is sent to `NIX_DAEMON_PORT`.
+const CONTROL_PORT: u32 = 621;
+
+/// A tenant's plain-`dm-crypt` key: 256-bit, CSPRNG-generated, held only in
+/// this process's memory (see `VmPool::keys`). Never `Debug`/`Display` —
+/// accidentally logging one would defeat the entire point.
+type StoreKey = [u8; 32];
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Worker-side VM lifecycle configuration, read once at startup.
 #[derive(Clone, Debug)]
@@ -84,8 +113,8 @@ impl VmConfig {
 
         let state_dir = std::env::var("KUBERNIX_VM_STATE_DIR")
             .unwrap_or_else(|_| "/var/lib/kubernix-worker".to_string());
-        let cloud_hypervisor = std::env::var("KUBERNIX_VM_CH_BIN")
-            .unwrap_or_else(|_| "cloud-hypervisor".to_string());
+        let cloud_hypervisor =
+            std::env::var("KUBERNIX_VM_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
 
         Ok(Some(VmConfig {
             state_dir: PathBuf::from(state_dir),
@@ -93,12 +122,9 @@ impl VmConfig {
             initrd: PathBuf::from(initrd),
             cloud_hypervisor: PathBuf::from(cloud_hypervisor),
             vcpus: parse_env_or("KUBERNIX_VM_VCPUS", 1)?,
-            memory_mb: parse_env_or("KUBERNIX_VM_MEMORY_MB", 512)?,
+            memory_mb: parse_env_or("KUBERNIX_VM_MEMORY_MB", 768)?,
             store_img_size_mb: parse_env_or("KUBERNIX_VM_STORE_IMG_MB", 8192)?,
-            boot_timeout: Duration::from_secs(parse_env_or(
-                "KUBERNIX_VM_BOOT_TIMEOUT_SECS",
-                30,
-            )?),
+            boot_timeout: Duration::from_secs(parse_env_or("KUBERNIX_VM_BOOT_TIMEOUT_SECS", 30)?),
             cid: parse_env_or("KUBERNIX_VM_CID", 3)?,
         }))
     }
@@ -196,6 +222,14 @@ pub trait VmLauncher: Send + Sync {
     /// Takes ownership: the caller has already decided this VM is going
     /// away, so there is no "still holds it" state to return to.
     async fn stop(&self, vm: LaunchedVm);
+
+    /// Push a tenant's plain-`dm-crypt` key to `guest-agent`'s control
+    /// channel over `vsock_socket`, right after `boot` has returned — the
+    /// guest opens `/dev/vda` with it and mounts the result at `/nix/store`
+    /// before `nix-daemon` is exec'd on the `NIX_DAEMON_PORT` connection that
+    /// follows. `fresh` selects `FRESH` (mkfs a newly-decrypted device) vs
+    /// `REUSE` (mount an existing one) — see [`VmPool::ensure_vm_for`].
+    async fn push_key(&self, vsock_socket: &Path, key: &StoreKey, fresh: bool) -> eyre::Result<()>;
 }
 
 /// The real launcher: spawns `cloud-hypervisor` as a subprocess, replicating
@@ -290,6 +324,51 @@ impl VmLauncher for CloudHypervisorLauncher {
             Err(e) => tracing::warn!(error = %e, "waiting for VM process failed"),
         }
     }
+
+    async fn push_key(&self, vsock_socket: &Path, key: &StoreKey, fresh: bool) -> eyre::Result<()> {
+        let mut stream = tokio::net::UnixStream::connect(vsock_socket)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "dialing {} for the control-channel key push",
+                    vsock_socket.display()
+                )
+            })?;
+        stream
+            .write_all(format!("CONNECT {CONTROL_PORT}\n").as_bytes())
+            .await
+            .wrap_err("sending the vsock CONNECT handshake to the control channel")?;
+        let mut buf = [0u8; 32];
+        let n = stream
+            .read(&mut buf)
+            .await
+            .wrap_err("reading the control-channel CONNECT reply")?;
+        if !buf[..n].starts_with(b"OK") {
+            return Err(eyre!(
+                "vsock CONNECT to guest control port {CONTROL_PORT} refused: {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ));
+        }
+
+        let mode = if fresh { "FRESH" } else { "REUSE" };
+        stream
+            .write_all(format!("KEY {} {mode}\n", encode_hex(key)).as_bytes())
+            .await
+            .wrap_err("sending the KEY control message")?;
+
+        let mut reply = Vec::new();
+        stream
+            .read_to_end(&mut reply)
+            .await
+            .wrap_err("reading the KEY control reply")?;
+        if !reply.starts_with(b"OK") {
+            return Err(eyre!(
+                "guest-agent rejected the store key: {:?}",
+                String::from_utf8_lossy(&reply)
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Poll `vsock_socket` until `guest-agent` accepts the inetd-style handshake
@@ -351,10 +430,12 @@ fn store_img_path(config: &VmConfig, tenant: &TenantId) -> PathBuf {
 }
 
 /// Create `path` as a sparse file of `size_mb` if it doesn't already exist.
-/// A no-op — not a truncate — if it does: reuse is the entire point.
-async fn create_store_img_if_absent(path: &Path, size_mb: u64) -> eyre::Result<()> {
+/// A no-op — not a truncate — if it does: reuse is the entire point. Returns
+/// whether it was just created, which is exactly what tells the caller
+/// whether to push a `FRESH` (mkfs) or `REUSE` (mount as-is) key handshake.
+async fn create_store_img_if_absent(path: &Path, size_mb: u64) -> eyre::Result<bool> {
     if tokio::fs::metadata(path).await.is_ok() {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -368,6 +449,42 @@ async fn create_store_img_if_absent(path: &Path, size_mb: u64) -> eyre::Result<(
         .await
         .wrap_err_with(|| format!("sizing {}", path.display()))?;
     tracing::info!(path = %path.display(), size_mb, "created tenant store image");
+    Ok(true)
+}
+
+/// Remove every leftover `tenants/*/store.img` under `state_dir`. Called once
+/// at worker startup, before any job is served: a freshly started process
+/// holds no in-memory keys for any tenant, so every image left behind by a
+/// previous process is permanently unrecoverable ciphertext already — this
+/// just stops it from occupying disk indefinitely. Not an error if
+/// `state_dir/tenants` doesn't exist yet (a worker that has never booted a
+/// VM).
+pub async fn wipe_orphaned_store_images(state_dir: &Path) -> eyre::Result<()> {
+    let tenants_dir = state_dir.join("tenants");
+    let mut entries = match tokio::fs::read_dir(&tenants_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).wrap_err_with(|| format!("reading {}", tenants_dir.display()));
+        }
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .wrap_err_with(|| format!("reading {}", tenants_dir.display()))?
+    {
+        let store_img = entry.path().join("store.img");
+        match tokio::fs::remove_file(&store_img).await {
+            Ok(()) => tracing::info!(
+                path = %store_img.display(),
+                "wiped orphaned tenant store image from a previous worker process"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).wrap_err_with(|| format!("removing {}", store_img.display()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -386,6 +503,12 @@ pub struct VmPool<L: VmLauncher = CloudHypervisorLauncher> {
     config: VmConfig,
     launcher: L,
     warm: Option<WarmVm>,
+    /// Each tenant's plain-`dm-crypt` key, generated once per process
+    /// lifetime and reused across that tenant's later evict/reboot cycles —
+    /// exactly as `store.img` itself is reused, and for the same reason: the
+    /// image on disk only decrypts with the key it was written with. Never
+    /// persisted; see the module doc and [`wipe_orphaned_store_images`].
+    keys: HashMap<TenantId, StoreKey>,
 }
 
 impl VmPool<CloudHypervisorLauncher> {
@@ -397,6 +520,7 @@ impl VmPool<CloudHypervisorLauncher> {
             config,
             launcher,
             warm: None,
+            keys: HashMap::new(),
         }
     }
 }
@@ -408,6 +532,7 @@ impl<L: VmLauncher> VmPool<L> {
             config,
             launcher,
             warm: None,
+            keys: HashMap::new(),
         }
     }
 
@@ -432,7 +557,7 @@ impl<L: VmLauncher> VmPool<L> {
             self.evict().await;
         }
 
-        create_store_img_if_absent(&store_img, self.config.store_img_size_mb).await?;
+        let fresh = create_store_img_if_absent(&store_img, self.config.store_img_size_mb).await?;
 
         let tenant_dir = store_img
             .parent()
@@ -449,6 +574,22 @@ impl<L: VmLauncher> VmPool<L> {
             .boot(tenant, &store_img, &vsock_socket, &console_log)
             .await?;
         tracing::info!(%tenant, "VM ready");
+
+        // Generated once per tenant per process lifetime; a still-`fresh`
+        // image can only ever pair with a key generated in this same call
+        // (nothing else could have written to it), so a cached key from an
+        // earlier tenant of this same name within this process is never
+        // stale here.
+        let key = *self.keys.entry(tenant.clone()).or_insert_with(|| {
+            let mut key = [0u8; 32];
+            rand::rng().fill_bytes(&mut key);
+            key
+        });
+        if let Err(e) = self.launcher.push_key(&vsock_socket, &key, fresh).await {
+            self.launcher.stop(vm).await;
+            return Err(e.wrap_err(format!("pushing store key to tenant {tenant}'s VM")));
+        }
+        tracing::info!(%tenant, fresh, "store key pushed");
 
         self.warm = Some(WarmVm {
             tenant: tenant.clone(),
@@ -481,6 +622,10 @@ mod tests {
     struct FakeLauncher {
         boots: Arc<AtomicUsize>,
         stops: Arc<AtomicUsize>,
+        /// `(key, fresh)` for every `push_key` call, in order — lets tests
+        /// assert both bookkeeping (same key reused, `FRESH` only on first
+        /// creation) without a real vsock control channel to talk to.
+        pushed_keys: Arc<std::sync::Mutex<Vec<(StoreKey, bool)>>>,
     }
 
     impl FakeLauncher {
@@ -489,6 +634,9 @@ mod tests {
         }
         fn stop_count(&self) -> usize {
             self.stops.load(Ordering::SeqCst)
+        }
+        fn pushed_keys(&self) -> Vec<(StoreKey, bool)> {
+            self.pushed_keys.lock().unwrap().clone()
         }
     }
 
@@ -525,6 +673,16 @@ mod tests {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
+
+        async fn push_key(
+            &self,
+            _vsock_socket: &Path,
+            key: &StoreKey,
+            fresh: bool,
+        ) -> eyre::Result<()> {
+            self.pushed_keys.lock().unwrap().push((*key, fresh));
+            Ok(())
+        }
     }
 
     fn test_config(state_dir: &Path) -> VmConfig {
@@ -556,16 +714,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.img");
 
-        create_store_img_if_absent(&path, 4).await.unwrap();
+        let created = create_store_img_if_absent(&path, 4).await.unwrap();
+        assert!(created, "first call creates the image");
         let meta = tokio::fs::metadata(&path).await.unwrap();
         assert_eq!(meta.len(), 4 * 1024 * 1024);
 
         // A second call, with existing content, must not truncate it away —
         // that content is exactly what makes the image worth keeping.
         tokio::fs::write(&path, b"marker").await.unwrap();
-        create_store_img_if_absent(&path, 4).await.unwrap();
+        let created = create_store_img_if_absent(&path, 4).await.unwrap();
+        assert!(!created, "second call reuses the existing image");
         let content = tokio::fs::read(&path).await.unwrap();
         assert_eq!(content, b"marker");
+    }
+
+    #[tokio::test]
+    async fn wipe_orphaned_store_images_removes_every_tenant_image() {
+        let dir = tempfile::tempdir().unwrap();
+        for tenant in ["tenant-a", "tenant-b"] {
+            let tenant_dir = dir.path().join("tenants").join(tenant);
+            tokio::fs::create_dir_all(&tenant_dir).await.unwrap();
+            tokio::fs::write(tenant_dir.join("store.img"), b"ciphertext")
+                .await
+                .unwrap();
+        }
+
+        wipe_orphaned_store_images(dir.path()).await.unwrap();
+
+        for tenant in ["tenant-a", "tenant-b"] {
+            let store_img = dir.path().join("tenants").join(tenant).join("store.img");
+            assert!(
+                tokio::fs::metadata(&store_img).await.is_err(),
+                "{} should have been wiped",
+                store_img.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wipe_orphaned_store_images_is_a_noop_without_a_tenants_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        wipe_orphaned_store_images(dir.path()).await.unwrap();
     }
 
     #[tokio::test]
@@ -606,6 +795,52 @@ mod tests {
             launcher.boot_count(),
             2,
             "a dead 'warm' VM must not be handed back as reusable"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_is_generated_fresh_and_reused_on_reboot() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = FakeLauncher::default();
+        let mut pool = VmPool::with_launcher(test_config(dir.path()), launcher.clone());
+
+        let tenant_a = TenantId::from_wire("tenant-a").unwrap();
+        let tenant_b = TenantId::from_wire("tenant-b").unwrap();
+
+        // First boot for A: image didn't exist yet, so FRESH.
+        pool.ensure_vm_for(&tenant_a).await.unwrap();
+        // Evict by dispatching B, then come back to A: image now exists, so
+        // this reboot must be REUSE with the *same* key as the first push.
+        pool.ensure_vm_for(&tenant_b).await.unwrap();
+        pool.ensure_vm_for(&tenant_a).await.unwrap();
+
+        let pushed = launcher.pushed_keys();
+        assert_eq!(pushed.len(), 3, "one push per fresh boot, none on reuse");
+        let (key_a1, fresh_a1) = pushed[0];
+        let (key_b, fresh_b) = pushed[1];
+        let (key_a2, fresh_a2) = pushed[2];
+
+        assert!(fresh_a1, "A's first ever boot creates the image");
+        assert!(fresh_b, "B's first ever boot creates its own image");
+        assert!(!fresh_a2, "A's image already existed by the second boot");
+        assert_eq!(key_a1, key_a2, "A's key must survive across a reboot");
+        assert_ne!(key_a1, key_b, "different tenants must get different keys");
+    }
+
+    #[tokio::test]
+    async fn warm_vm_reuse_does_not_repush_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = FakeLauncher::default();
+        let mut pool = VmPool::with_launcher(test_config(dir.path()), launcher.clone());
+
+        let tenant_a = TenantId::from_wire("tenant-a").unwrap();
+        pool.ensure_vm_for(&tenant_a).await.unwrap();
+        pool.ensure_vm_for(&tenant_a).await.unwrap();
+
+        assert_eq!(
+            launcher.pushed_keys().len(),
+            1,
+            "reusing a still-warm VM must not push the key again"
         );
     }
 }

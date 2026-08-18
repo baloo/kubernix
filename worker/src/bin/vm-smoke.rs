@@ -47,7 +47,10 @@ async fn run(vsock_socket: String, port: u32) -> eyre::Result<()> {
     let mut buf = [0u8; 32];
     let n = stream.read(&mut buf)?;
     if !buf[..n].starts_with(b"OK") {
-        eyre::bail!("vsock CONNECT to guest port {port} refused: {:?}", &buf[..n]);
+        eyre::bail!(
+            "vsock CONNECT to guest port {port} refused: {:?}",
+            &buf[..n]
+        );
     }
 
     let stream = tokio::net::UnixStream::from_std(stream)?;

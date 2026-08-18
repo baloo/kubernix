@@ -39,9 +39,9 @@ stdenvNoCC.mkDerivation {
         --initramfs ${initrd}/initrd \
         --cmdline "console=ttyS0 reboot=t panic=1" \
         --cpus boot=1 \
-        --memory size=256M \
+        --memory size=768M \
         --vsock cid=3,socket=$vsock_socket \
-        --disk path=$store_img \
+        --disk path=$store_img,image_type=raw \
         --console off \
         --serial file=$console_log \
         &
@@ -68,20 +68,28 @@ stdenvNoCC.mkDerivation {
     }
 
     # Boot #1: attach the freshly created image, confirm the VM comes up
-    # with the disk attached at all, then stop it.
+    # with the disk attached at all, then stop it. SIGKILL, not a plain
+    # `kill` (SIGTERM): this guest has no ACPI/graceful-shutdown handler
+    # (`guest-agent` is PID 1 with nothing else running, same as
+    # `worker/src/vm.rs`'s `CloudHypervisorLauncher::stop` doc comment
+    # explains), so cloud-hypervisor's own SIGTERM handling can sit waiting
+    # on a shutdown the guest will never perform -- and unlike
+    # `guest-vm-test.nix`'s fire-and-forget kill, this script actually
+    # `wait`s for the process to exit before reusing the same disk image, so
+    # a hung SIGTERM here hangs the whole test.
     vsock1="$PWD/vsock1.sock"; console1="$PWD/console1.log"
     ch1_pid=$(boot_vm "$vsock1" "$console1")
-    trap 'kill $ch1_pid 2>/dev/null || true' EXIT
+    trap 'kill -9 $ch1_pid 2>/dev/null || true' EXIT
     wait_for_vsock "$vsock1" || { echo "boot #1 never came up"; cat "$console1"; exit 1; }
-    kill "$ch1_pid"; wait "$ch1_pid" 2>/dev/null || true
+    kill -9 "$ch1_pid"; wait "$ch1_pid" 2>/dev/null || true
 
     # Boot #2: same image, a fresh VM process -- the "evict, then reboot for
     # the same tenant" case `vm.rs`'s `ensure_vm_for` drives in production.
     vsock2="$PWD/vsock2.sock"; console2="$PWD/console2.log"
     ch2_pid=$(boot_vm "$vsock2" "$console2")
-    trap 'kill $ch2_pid 2>/dev/null || true' EXIT
+    trap 'kill -9 $ch2_pid 2>/dev/null || true' EXIT
     wait_for_vsock "$vsock2" || { echo "boot #2 never came up"; cat "$console2"; exit 1; }
-    kill "$ch2_pid"; wait "$ch2_pid" 2>/dev/null || true
+    kill -9 "$ch2_pid"; wait "$ch2_pid" 2>/dev/null || true
 
     # The actual assertion: the marker written before boot #1 is still
     # exactly there after a full stop/reboot cycle -- no truncation, no

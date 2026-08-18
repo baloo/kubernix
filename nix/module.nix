@@ -296,10 +296,9 @@ in {
       default = null;
       example = "\${kubernix-guest-vm-kernel}/bzImage";
       description = ''
-        Phase 15 Step 2: kernel image for the per-tenant `cloud-hypervisor`
-        VM. Leaving this (and `vmInitrd`) unset disables VM lifecycle
-        entirely — the worker builds exactly as it does today, since nothing
-        downstream consumes a VM yet (Step 3).
+        Phase 15: kernel image for the per-tenant `cloud-hypervisor` VM.
+        Leaving this (and `vmInitrd`) unset disables VM lifecycle entirely —
+        the worker builds exactly as it does today.
       '';
     };
 
@@ -307,7 +306,7 @@ in {
       type = types.nullOr types.path;
       default = null;
       example = "\${kubernix-guest-vm-initrd}/initrd";
-      description = "Phase 15 Step 2: initrd image, paired with `vmKernel`.";
+      description = "Phase 15: initrd image, paired with `vmKernel`.";
     };
 
     vmVcpus = mkOption {
@@ -318,7 +317,7 @@ in {
 
     vmMemoryMb = mkOption {
       type = types.int;
-      default = 512;
+      default = 768;
       description = "Memory (MB) given to the per-tenant VM.";
     };
 
@@ -430,7 +429,7 @@ in {
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" "nats.service" ];
         # The worker shells out to `nix-store` and `nix store dump-path`, and,
-        # when Phase 15 Step 2's VM lifecycle is enabled below, to
+        # when Phase 15's per-tenant VM lifecycle is enabled below, to
         # `cloud-hypervisor` itself.
         path = [ pkgs.lix pkgs.cloud-hypervisor ];
 

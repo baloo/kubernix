@@ -189,8 +189,11 @@ where
     let mut body = response.bytes_stream();
     let mut nar_size: u64 = 0;
     while let Some(chunk) = body.next().await {
-        std::io::Write::write_all(&mut decoder, &chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
-            .wrap_err_with(|| format!("decompressing {store_path}"))?;
+        std::io::Write::write_all(
+            &mut decoder,
+            &chunk.wrap_err_with(|| format!("fetching {store_path}"))?,
+        )
+        .wrap_err_with(|| format!("decompressing {store_path}"))?;
         let decoded = std::mem::take(decoder.get_mut());
         if !decoded.is_empty() {
             nar_size += decoded.len() as u64;

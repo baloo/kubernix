@@ -37,7 +37,7 @@ stdenvNoCC.mkDerivation {
       --initramfs ${initrd}/initrd \
       --cmdline "console=ttyS0 reboot=t panic=1" \
       --cpus boot=1 \
-      --memory size=256M \
+      --memory size=768M \
       --vsock cid=3,socket=$vsock_socket \
       --console off \
       --serial file=$console_log \
