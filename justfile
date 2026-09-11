@@ -92,6 +92,31 @@ plugin lix_src=lix_source:
 nix-build:
     nix-build nix -A kubernix-server -A kubernix-worker -A kubernix-plugin -A kubernix-guest-agent
 
+# Build the two OCI images `charts/kubernix/` deploys (nix/images.nix):
+# kubernix-server (sshd/cache/gc/rotate, one image) and kubernix-worker, as
+# `./result-server-image`/`./result-worker-image`. `docker load < result-
+# server-image` to load either locally; `just image-push` reuses these same
+# two outputs to skip straight to a registry instead.
+image-build:
+    nix-build nix -A kubernix-server-image -o result-server-image
+    nix-build nix -A kubernix-worker-image -o result-worker-image
+
+# Push the images `image-build` produces to `registry` without a local Docker
+# daemon (skopeo copies straight from the Nix-built tarball). `tag` applies
+# to both.
+image-push registry tag="latest": image-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # skopeo refuses to run without a trust policy at all (not just one that
+    # permits everything) — a minimal `insecureAcceptAnything` one, scoped to
+    # this invocation rather than written into ~/.config, since we don't
+    # verify image signatures either way.
+    policy=$(mktemp)
+    trap 'rm -f "$policy"' EXIT
+    echo '{"default": [{"type": "insecureAcceptAnything"}]}' > "$policy"
+    skopeo --policy "$policy" copy docker-archive:result-server-image docker://{{registry}}/kubernix-server:{{tag}}
+    skopeo --policy "$policy" copy docker-archive:result-worker-image docker://{{registry}}/kubernix-worker:{{tag}}
+
 # Run the NixOS integration test.
 nix-test:
     nix-build nix -A test

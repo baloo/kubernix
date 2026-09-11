@@ -1,0 +1,18 @@
+{{- if and .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ include "kubernix.postgresCluster" . }}-backup
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  # Seconds-first cron (github.com/robfig/cron), not a plain 5-field k8s
+  # CronJob schedule — see values.yaml's comment on this field.
+  schedule: {{ .Values.postgres.backup.schedule | quote }}
+  backupOwnerReference: cluster
+  cluster:
+    name: {{ include "kubernix.postgresCluster" . }}
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+{{- end }}

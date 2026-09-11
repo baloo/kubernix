@@ -1,0 +1,125 @@
+{{- $secretName := printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+{{- if not (lookup "v1" "Secret" .Release.Namespace $secretName) }}
+# Generates the SSH host key `sshd-deployment.yaml` mounts, once, on first
+# install only (`pre-install`, no `pre-upgrade`) — clients pin it in their own
+# known_hosts, so a key that changes on every `helm upgrade` would trip host
+# key verification for everyone. The `lookup` guard above additionally covers
+# a `helm install` retargeting a release whose Secret survived (see its
+# `resource-policy: keep` below) from an earlier install/uninstall cycle.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $secretName | quote }}]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+subjects:
+  - kind: ServiceAccount
+    name: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+roleRef:
+  kind: Role
+  name: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "kubernix.selectorLabels" (dict "context" $ "component" "sshd-hostkey") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+      restartPolicy: Never
+      initContainers:
+        - name: generate
+          image: alpine:3.20
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              apk add --no-cache openssh-keygen >/dev/null
+              ssh-keygen -t ed25519 -f /keys/host_ed25519 -N "" -C kubernix-sshd
+          volumeMounts:
+            - name: keys
+              mountPath: /keys
+      containers:
+        - name: store
+          image: alpine:3.20
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # Alpine's own community-repo kubectl, not a dedicated kubectl
+              # image (bitnami/kubectl's free-tier tags were retired) — one
+              # fewer external image to track, and this only ever needs to
+              # apply one Secret, nothing version-sensitive.
+              apk add --no-cache kubectl >/dev/null
+              # Built by hand, not `kubectl create secret --dry-run=client`,
+              # so the `resource-policy: keep` annotation (an uninstall must
+              # never take the host key with it) is there from the Secret's
+              # very first creation rather than a second patch.
+              cat <<YAML | kubectl apply -f -
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: {{ $secretName }}
+                annotations:
+                  helm.sh/resource-policy: keep
+              type: Opaque
+              data:
+                host_ed25519: $(base64 -w0 /keys/host_ed25519)
+                host_ed25519.pub: $(base64 -w0 /keys/host_ed25519.pub)
+              YAML
+          volumeMounts:
+            - name: keys
+              mountPath: /keys
+              readOnly: true
+      volumes:
+        - name: keys
+          emptyDir: {}
+{{- end }}

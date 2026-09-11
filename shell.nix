@@ -35,6 +35,8 @@ mkShell {
     gdb
 
     lix
+
+    kubernetes-helm skopeo
   ];
 
   buildInputs = [

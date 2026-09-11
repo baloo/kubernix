@@ -1,0 +1,3 @@
+# `helm dependency update` downloads these from Chart.lock's pinned
+# versions/repos — regenerate with that command rather than committing them.
+charts/*.tgz

@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-rotate" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kubernix.selectorLabels" (dict "context" $ "component" "rotate") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubernix.selectorLabels" (dict "context" $ "component" "rotate") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: rotate
+          image: "{{ .Values.image.server.repository }}:{{ .Values.image.server.tag }}"
+          imagePullPolicy: {{ .Values.image.server.pullPolicy }}
+          command: ["/bin/kubernix-rotate-capability-secret"]
+          env:
+            {{- include "kubernix.databaseUrlEnv" . | nindent 12 }}
+            - name: KUBERNIX_ROTATE_INTERVAL
+              value: {{ .Values.rotate.interval | quote }}
+            - name: KUBERNIX_ROTATE_RETENTION
+              value: {{ .Values.rotate.retention | quote }}
+            - name: RUST_LOG
+              value: debug
+          resources:
+            {{- toYaml .Values.rotate.resources | nindent 12 }}
+      {{- with .Values.rotate.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.rotate.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.rotate.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

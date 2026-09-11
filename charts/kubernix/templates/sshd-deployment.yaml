@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-sshd" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  # Not horizontally scalable yet: the generated SSH host key and any
+  # in-flight session live on one pod. A v1 limitation, not solved here —
+  # see PLAN.md Phase 13.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kubernix.selectorLabels" (dict "context" $ "component" "sshd") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubernix.selectorLabels" (dict "context" $ "component" "sshd") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: sshd
+          image: "{{ .Values.image.server.repository }}:{{ .Values.image.server.tag }}"
+          imagePullPolicy: {{ .Values.image.server.pullPolicy }}
+          command: ["/bin/kubernix-sshd"]
+          ports:
+            - name: ssh
+              containerPort: 2222
+          env:
+            {{- include "kubernix.databaseUrlEnv" . | nindent 12 }}
+            {{- include "kubernix.s3Env" . | nindent 12 }}
+            - name: NATS_URL
+              value: {{ printf "nats://%s-nats:4222" .Release.Name | quote }}
+            - name: KUBERNIX_SSH_LISTEN
+              value: {{ .Values.sshd.listen | quote }}
+            - name: KUBERNIX_SSH_HOST_KEY
+              value: /etc/kubernix/ssh/host_ed25519
+            {{- if .Values.sshd.authorizedKeys }}
+            - name: KUBERNIX_SSH_AUTHORIZED_KEYS
+              value: /etc/kubernix/ssh-authorized-keys/authorized_keys
+            {{- end }}
+            - name: RUST_LOG
+              value: debug
+          volumeMounts:
+            - name: host-key
+              mountPath: /etc/kubernix/ssh
+              readOnly: true
+            {{- if .Values.sshd.authorizedKeys }}
+            - name: authorized-keys
+              mountPath: /etc/kubernix/ssh-authorized-keys
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.sshd.resources | nindent 12 }}
+      volumes:
+        - name: host-key
+          secret:
+            secretName: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
+            defaultMode: 0400
+        {{- if .Values.sshd.authorizedKeys }}
+        - name: authorized-keys
+          secret:
+            # Name of an existing Secret with an `authorized_keys` key —
+            # unset (the default) means accept any client key, deriving the
+            # tenant from the SSH username instead. See nix/module.nix's
+            # `authorizedKeys` option for the same trade-off.
+            secretName: {{ .Values.sshd.authorizedKeys }}
+        {{- end }}
+      {{- with .Values.sshd.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sshd.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sshd.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

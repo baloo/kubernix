@@ -1,0 +1,25 @@
+{{- if and .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
+# Continuous WAL archiving + base backups, via the Barman Cloud CNPG-I
+# plugin (see Chart.yaml's plugin-barman-cloud dependency), to the same
+# S3-compatible store every Kubernix service already writes NARs/logs to —
+# just under its own prefix (values.postgres.backup.path), not a separate
+# bucket, so no new S3 credential/bucket to provision.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ include "kubernix.postgresCluster" . }}-backup
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  retentionPolicy: {{ .Values.postgres.backup.retentionPolicy | quote }}
+  configuration:
+    destinationPath: {{ printf "s3://%s/%s" .Values.s3.bucket .Values.postgres.backup.path | quote }}
+    endpointURL: {{ .Values.s3.endpoint | quote }}
+    s3Credentials:
+      accessKeyId:
+        name: {{ .Values.s3.existingSecret | default (printf "%s-s3" (include "kubernix.fullname" .)) }}
+        key: accessKeyId
+      secretAccessKey:
+        name: {{ .Values.s3.existingSecret | default (printf "%s-s3" (include "kubernix.fullname" .)) }}
+        key: secretAccessKey
+{{- end }}

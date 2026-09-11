@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-worker" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kubernix.selectorLabels" (dict "context" $ "component" "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubernix.selectorLabels" (dict "context" $ "component" "worker") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: worker
+          image: "{{ .Values.image.worker.repository }}:{{ .Values.image.worker.tag }}"
+          imagePullPolicy: {{ .Values.image.worker.pullPolicy }}
+          {{- if .Values.worker.privileged }}
+          # TEMPORARY, not a real default (values.yaml keeps this false) —
+          # Lix's build sandbox is mandatory once the store is "diverted"
+          # (KUBERNIX_NIX_STORE's chroot root differs from the image's own
+          # /nix/store), which in turn needs kernel namespaces this pod
+          # doesn't have without it. The real fix is Phase 15: builds move
+          # into a per-tenant cloud-hypervisor VM with its own independent
+          # kernel, where the sandbox just works with no elevated pod
+          # privilege at all — see PLAN.md. Not wired into this chart yet.
+          securityContext:
+            privileged: true
+          {{- end }}
+          # No DB/S3 credentials, by design — the worker only ever talks to
+          # NATS and to pre-signed S3 URLs it's handed over NATS. No
+          # /dev/kvm, no VM-related env either: Phase 15's per-tenant
+          # cloud-hypervisor VM feature stays off (values.worker has no knob
+          # for it in this chart).
+          env:
+            - name: NATS_URL
+              value: {{ printf "nats://%s-nats:4222" .Release.Name | quote }}
+            - name: NIX_SYSTEM
+              value: {{ .Values.worker.system | quote }}
+            - name: RUST_LOG
+              value: debug
+          # $HOME and KUBERNIX_NIX_STORE both point under here — baked into
+          # the image itself (nix/images.nix), not set here, since they're a
+          # property of how this image runs a worker at all, not something
+          # deployment-specific. The chart's job is just to make that path
+          # real, writable storage.
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/kubernix-worker
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      volumes:
+        # Ephemeral by design — Phase 15's own storage decisions treat a
+        # worker's local store as a disposable cache, never the source of
+        # truth (S3 holds verified outputs), so a pod restart losing it is a
+        # cold-cache cost, not a correctness problem.
+        - name: state
+          emptyDir: {}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

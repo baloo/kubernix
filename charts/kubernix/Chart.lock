@@ -1,0 +1,15 @@
+dependencies:
+- name: cloudnative-pg
+  repository: https://cloudnative-pg.github.io/charts
+  version: 0.29.0
+- name: plugin-barman-cloud
+  repository: https://cloudnative-pg.github.io/charts
+  version: 0.8.0
+- name: cert-manager
+  repository: https://charts.jetstack.io
+  version: v1.21.1
+- name: nats
+  repository: https://nats-io.github.io/k8s/helm/charts/
+  version: 2.14.6
+digest: sha256:bbf9a2d6566bb0b8595d0fcddca54cb20c9bc523cdb3d891379868dc280e1810
+generated: "2026-09-11T04:29:06.26878756Z"

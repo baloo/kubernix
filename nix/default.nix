@@ -30,8 +30,10 @@ let
   vm-encryption-test = pkgs.callPackage ./vm-encryption-test.nix {
     inherit (guest-vm) kernel initrd;
   };
+  images = pkgs.callPackage ./images.nix { inherit kubernix-server kubernix-worker; };
 in {
   inherit kubernix-server kubernix-worker kubernix-plugin kubernix-guest-agent;
+  inherit (images) kubernix-server-image kubernix-worker-image;
   kubernix-guest-vm-kernel = guest-vm.kernel;
   kubernix-guest-vm-initrd = guest-vm.initrd;
   guest-vm-test = guest-vm.test;

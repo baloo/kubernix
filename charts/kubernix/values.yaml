@@ -1,0 +1,167 @@
+# Defaults here follow nix/module.nix, the NixOS module that is the source of
+# truth for every env var/flag each binary takes.
+
+# Names of existing `kubernetes.io/dockerconfigjson` Secrets in this release's
+# namespace, e.g. [{name: registry-creds}] — needed whenever image.*.repository
+# points at a private registry requiring auth to pull, not just to push.
+imagePullSecrets: []
+
+image:
+  # kubernix-sshd, kubernix-server (cache), kubernix-gc and
+  # kubernix-rotate-capability-secret all ship from this one image
+  # (nix/images.nix: kubernix-server-image) — only the container `command:`
+  # differs between their Deployments.
+  server:
+    repository: kubernix-server
+    tag: latest
+    pullPolicy: IfNotPresent
+  worker:
+    repository: kubernix-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# The object store every service reads/writes NARs, logs and (via the CNPG
+# backup plugin below, under a distinct prefix) database backups to. Stays
+# external — no MinIO subchart — matching nix/module.nix's `s3Options`.
+s3:
+  endpoint: http://minio:9000
+  bucket: kubernix
+  region: us-east-1
+  # Set to use an existing Secret instead of the accessKeyId/secretAccessKey
+  # below (dev-only default, same as nix/module.nix's). Expected keys:
+  # accessKeyId, secretAccessKey.
+  existingSecret: ""
+  accessKeyId: minioadmin
+  secretAccessKey: minioadmin
+
+postgres:
+  cluster:
+    # Gates the Cluster/ObjectStore/ScheduledBackup CRs themselves,
+    # independently of cnpg.enabled (which gates the operator/plugin/
+    # cert-manager subchart dependencies). Needed because Helm validates
+    # every object in a release against the API server's known types before
+    # applying any of them — a CRD and a custom resource of that CRD's kind
+    # can't land in the same `helm install`. Bring the operators up first
+    # with this set to `false`, then `helm upgrade --set
+    # postgres.cluster.enabled=true` once their CRDs are registered.
+    enabled: true
+  # Streaming replication instance count: 1 primary + (instances - 1)
+  # standbys. 2 is the minimum that gives you a standby at all.
+  instances: 2
+  storage:
+    size: 10Gi
+    storageClass: ""
+  backup:
+    # CNPG ScheduledBackup cron (note: seconds-first, like
+    # github.com/robfig/cron, not a plain 5-field k8s CronJob schedule).
+    schedule: "0 0 2 * * *"
+    # Prefix under s3.bucket that WAL/base backups are written to.
+    path: pgbackups
+    retentionPolicy: "30d"
+
+nats:
+  enabled: true
+  # Forced on regardless of what the subchart's own values.yaml defaults to —
+  # kubernix-worker/-sshd refuse to queue/dequeue jobs without it. Nested
+  # under `config`, not top-level `jetstream` — that's this subchart's own
+  # structure (`charts/nats/values.yaml`), easy to get wrong since NATS'
+  # upstream docs/CLI talk about "jetstream" as if it were top-level.
+  config:
+    jetstream:
+      enabled: true
+
+# Own condition, not folded into cnpg.enabled — see Chart.yaml's comment on
+# the cert-manager dependency for why installing this one stage earlier
+# matters.
+certManager:
+  enabled: true
+
+cnpg:
+  enabled: true
+
+# Values passed through to the cert-manager subchart itself. It doesn't
+# install its own CRDs by default; plugin-barman-cloud's Issuer/Certificate
+# can't be created without them.
+cert-manager:
+  crds:
+    enabled: true
+
+sshd:
+  replicas: 1
+  listen: "0.0.0.0:2222"
+  # authorizedKeys: null — accepts any client key, tenant derived from the SSH
+  # username, matching nix/module.nix's dev-only default. Set to the name of a
+  # Secret key (`authorized_keys`) to restrict this in a real deployment.
+  authorizedKeys: ""
+  service:
+    type: LoadBalancer
+    port: 2222
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+cache:
+  replicas: 2
+  listen: "0.0.0.0:3000"
+  cachePriority: 50
+  service:
+    type: ClusterIP
+    port: 3000
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: cache.kubernix.example
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+gc:
+  interval: 300
+  batchSize: 10000
+  cutoffs:
+    verified: 2592000 # 30d
+    built: 2592000 # 30d
+    quarantined: 86400 # 1d
+  jobRetention:
+    logAfter: 604800 # 7d
+    rowAfter: 7776000 # 90d
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+rotate:
+  interval: 21600 # 6h
+  retention: 86400 # 24h
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+worker:
+  replicas: 1
+  system: x86_64-linux
+  # NOT a real fix — Lix's build sandbox is mandatory once KUBERNIX_NIX_STORE
+  # diverges from the image's own /nix/store, and that needs kernel
+  # namespaces this pod doesn't have without full privilege. Phase 15 (VM-
+  # isolated builds, PLAN.md) is the actual answer and isn't wired into this
+  # chart yet. Leave this false; only set true for throwaway verification.
+  privileged: false
+  # Phase 15's per-tenant cloud-hypervisor VM feature stays off in this
+  # chart — no /dev/kvm passthrough, no vm* env. See PLAN.md step 7.
+  # KEDA scaling on NATS queue depth (PLAN.md Phase 13) isn't wired up here
+  # either; this stub is left for that follow-up.
+  autoscaling:
+    enabled: false
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

@@ -1,0 +1,37 @@
+{{- if and .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
+# Streaming replication: `instances` PostgreSQL pods, one primary and
+# (instances - 1) synchronous/async standbys, managed entirely by the CNPG
+# operator (failover, switchover, replica reattachment). See
+# postgres-objectstore.yaml/postgres-scheduledbackup.yaml for the continuous
+# WAL archiving + scheduled base backups to the object store.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "kubernix.postgresCluster" . }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  instances: {{ .Values.postgres.instances }}
+
+  # `db-role-passwords-job.yaml` and every app Deployment's DATABASE_URL
+  # (kubernix.databaseUrlEnv) authenticate as `postgres` — see that helper's
+  # comment for why the `-app` owner role isn't enough here.
+  enableSuperuserAccess: true
+
+  storage:
+    size: {{ .Values.postgres.storage.size | quote }}
+    {{- with .Values.postgres.storage.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+
+  bootstrap:
+    initdb:
+      database: kubernix
+      owner: kubernix
+
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: {{ include "kubernix.postgresCluster" . }}-backup
+{{- end }}

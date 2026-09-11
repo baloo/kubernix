@@ -1,0 +1,42 @@
+apiVersion: v2
+name: kubernix
+description: >-
+  Kubernix: a distributed remote builder for Lix — SSH/daemon-protocol
+  frontend, binary cache, worker pool, and retention/GC, backed by PostgreSQL
+  (via CloudNativePG) and NATS JetStream.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/superbaloo/kubernix
+dependencies:
+  # Installs the CloudNativePG operator (cluster-scoped CRDs + controller).
+  # Normally a once-per-cluster install — see the README's note on
+  # `cnpg.enabled` before using this on a cluster that already runs one.
+  - name: cloudnative-pg
+    version: "0.29.0"
+    repository: https://cloudnative-pg.github.io/charts
+    condition: cnpg.enabled
+  # The Barman Cloud CNPG-I plugin: gives the CNPG `Cluster` continuous WAL
+  # archiving and base backups to an S3-compatible object store (see
+  # `templates/postgres-objectstore.yaml`). Same lifecycle as the operator
+  # itself, so it shares `cnpg.enabled`.
+  - name: plugin-barman-cloud
+    version: "0.8.0"
+    repository: https://cloudnative-pg.github.io/charts
+    condition: cnpg.enabled
+  # plugin-barman-cloud always creates a self-signed Issuer/Certificate for
+  # its webhook — cert-manager is a hard dependency of that chart, not
+  # something cnpg.enabled: false avoids. Its own condition, not cnpg.enabled,
+  # because cert-manager's CRDs have to exist *before* plugin-barman-cloud's
+  # Certificate/Issuer resources can be built — the same "CRD and a custom
+  # resource of that CRD's kind can't land in the same `helm install`"
+  # constraint `postgres.cluster.enabled` exists for below, one dependency
+  # layer up. See the README's Quickstart for the staged-install this forces.
+  - name: cert-manager
+    version: "v1.21.1"
+    repository: https://charts.jetstack.io
+    condition: certManager.enabled
+  - name: nats
+    version: "2.14.6"
+    repository: https://nats-io.github.io/k8s/helm/charts/
+    condition: nats.enabled

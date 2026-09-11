@@ -1,0 +1,21 @@
+Kubernix is deploying.
+
+Frontend (SSH/daemon-protocol), once its Service has an external address:
+  kubectl get svc {{ include "kubernix.fullname" . }}-sshd -n {{ .Release.Namespace }}
+
+Binary cache (HTTP):
+  kubectl port-forward svc/{{ include "kubernix.fullname" . }}-cache 3000:{{ .Values.cache.service.port }} -n {{ .Release.Namespace }}
+
+PostgreSQL (CloudNativePG):
+{{- if .Values.cnpg.enabled }}
+  kubectl get cluster {{ include "kubernix.postgresCluster" . }} -n {{ .Release.Namespace }}
+  kubectl get scheduledbackup {{ include "kubernix.postgresCluster" . }}-backup -n {{ .Release.Namespace }}
+{{- else }}
+  cnpg.enabled is false — this release expects the CloudNativePG operator and
+  a Cluster named {{ include "kubernix.postgresCluster" . }} to already exist
+  in this namespace.
+{{- end }}
+
+See charts/kubernix/README.md for the cnpg.enabled trade-off (bundled
+operator vs. a cluster-shared one already installed) before running this in
+anything but a single-tenant/dev cluster.

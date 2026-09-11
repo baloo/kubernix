@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-gc" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  # Safe to run more than one replica of (no shared mutable state beyond the
+  # database's own advisory lock), but there is no throughput reason to.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kubernix.selectorLabels" (dict "context" $ "component" "gc") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubernix.selectorLabels" (dict "context" $ "component" "gc") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: gc
+          image: "{{ .Values.image.server.repository }}:{{ .Values.image.server.tag }}"
+          imagePullPolicy: {{ .Values.image.server.pullPolicy }}
+          command: ["/bin/kubernix-gc"]
+          env:
+            {{- include "kubernix.databaseUrlEnv" . | nindent 12 }}
+            {{- include "kubernix.s3Env" . | nindent 12 }}
+            - name: KUBERNIX_GC_INTERVAL
+              value: {{ .Values.gc.interval | quote }}
+            - name: KUBERNIX_GC_BATCH
+              value: {{ .Values.gc.batchSize | quote }}
+            - name: KUBERNIX_GC_CUTOFF_VERIFIED
+              value: {{ .Values.gc.cutoffs.verified | quote }}
+            - name: KUBERNIX_GC_CUTOFF_BUILT
+              value: {{ .Values.gc.cutoffs.built | quote }}
+            - name: KUBERNIX_GC_CUTOFF_QUARANTINED
+              value: {{ .Values.gc.cutoffs.quarantined | quote }}
+            - name: KUBERNIX_GC_JOB_LOG_CUTOFF
+              value: {{ .Values.gc.jobRetention.logAfter | quote }}
+            - name: KUBERNIX_GC_JOB_ROW_CUTOFF
+              value: {{ .Values.gc.jobRetention.rowAfter | quote }}
+            - name: RUST_LOG
+              value: debug
+          resources:
+            {{- toYaml .Values.gc.resources | nindent 12 }}
+      {{- with .Values.gc.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gc.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gc.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-cache" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.cache.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kubernix.selectorLabels" (dict "context" $ "component" "cache") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubernix.selectorLabels" (dict "context" $ "component" "cache") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: cache
+          image: "{{ .Values.image.server.repository }}:{{ .Values.image.server.tag }}"
+          imagePullPolicy: {{ .Values.image.server.pullPolicy }}
+          command: ["/bin/kubernix-server"]
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            {{- include "kubernix.databaseUrlEnv" . | nindent 12 }}
+            {{- include "kubernix.s3Env" . | nindent 12 }}
+            - name: KUBERNIX_HTTP_LISTEN
+              value: {{ .Values.cache.listen | quote }}
+            - name: KUBERNIX_CACHE_PRIORITY
+              value: {{ .Values.cache.cachePriority | quote }}
+            - name: RUST_LOG
+              value: debug
+          # TCP, not an HTTP path probe: every route in server/src/http.rs is
+          # nested under `/{tenant}/...` (see its `router()`), so there is no
+          # tenant-agnostic path that returns 200 to probe against — the port
+          # accepting connections is what "up" means here.
+          readinessProbe:
+            tcpSocket:
+              port: http
+          livenessProbe:
+            tcpSocket:
+              port: http
+          resources:
+            {{- toYaml .Values.cache.resources | nindent 12 }}
+      {{- with .Values.cache.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cache.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cache.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
