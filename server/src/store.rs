@@ -13,7 +13,7 @@ use sha2::{Sha256, digest::Output};
 use uuid::Uuid;
 
 use crate::jobs::JobOutcome;
-use crate::tenant::TenantId;
+use crate::tenant::{KeyType, TenantId};
 
 /// Hash algorithms the daemon protocol can carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,16 +331,36 @@ pub trait CapabilitySecretStore: Send + Sync {
     async fn capability_secret(&self, kid: u64) -> Option<[u8; 32]>;
 }
 
-/// Everything a full connection needs — the union of [`PathStore`] and
-/// [`CapabilitySecretStore`].
+/// Resolving an auth credential to the tenant it is bound to —
+/// `tenant_auth_bindings`.
 ///
-/// A blanket impl, not a hand-written one: implementing both smaller traits
-/// is what it takes to implement this one, so `MemoryStore`/`PostgresStore`
-/// need only ever implement the two narrower traits, and every caller that
+/// Split out for the same reason as [`CapabilitySecretStore`]: this runs
+/// *before* a tenant is known (it is what establishes one for a connection),
+/// so a caller that only authenticates connections (`ssh.rs`) needs none of
+/// the rest of the store.
+#[async_trait::async_trait]
+pub trait TenantAuthStore: Send + Sync {
+    /// Look up a manually-provisioned binding by its credential type and id
+    /// (an SSH key's fingerprint today). `Ok(None)` if no row exists for it —
+    /// callers must treat that as "no tenant", never fall back to attributing
+    /// one from the credential itself.
+    async fn find_tenant_by_binding(
+        &self,
+        key_type: KeyType,
+        key_id: &str,
+    ) -> Result<Option<TenantId>>;
+}
+
+/// Everything a full connection needs — the union of [`PathStore`],
+/// [`CapabilitySecretStore`] and [`TenantAuthStore`].
+///
+/// A blanket impl, not a hand-written one: implementing all three narrower
+/// traits is what it takes to implement this one, so `MemoryStore`/
+/// `PostgresStore` need only ever implement those, and every caller that
 /// genuinely needs the whole store (`daemon_rpc.rs`'s `Arc<dyn Store>`
 /// fields, `main.rs`) keeps working exactly as before the split.
-pub trait Store: PathStore + CapabilitySecretStore {}
-impl<T: PathStore + CapabilitySecretStore + ?Sized> Store for T {}
+pub trait Store: PathStore + CapabilitySecretStore + TenantAuthStore {}
+impl<T: PathStore + CapabilitySecretStore + TenantAuthStore + ?Sized> Store for T {}
 
 #[derive(Clone, Debug, Default)]
 pub struct MissingPaths {
@@ -625,6 +645,20 @@ impl CapabilitySecretStore for MemoryStore {
             return None;
         }
         *self.capability_secret.lock().unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+impl TenantAuthStore for MemoryStore {
+    /// No bindings persistence in-memory — see the struct's own doc comment
+    /// ("not the eventual backing"). Every credential is therefore unbound,
+    /// which is correct: nothing has provisioned one to look up.
+    async fn find_tenant_by_binding(
+        &self,
+        _key_type: KeyType,
+        _key_id: &str,
+    ) -> Result<Option<TenantId>> {
+        Ok(None)
     }
 }
 

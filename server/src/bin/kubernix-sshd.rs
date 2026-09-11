@@ -11,11 +11,21 @@
 //! ```
 //!
 //! Environment:
-//!   `KUBERNIX_SSH_LISTEN`          bind address (default `0.0.0.0:2222`)
-//!   `KUBERNIX_SSH_HOST_KEY`        host key path (generated if absent)
-//!   `KUBERNIX_SSH_AUTHORIZED_KEYS` authorized_keys path; if unset, any key is accepted
-//!   `DATABASE_URL`                 PostgreSQL; if unset, an in-memory store is used
-//!   `KUBERNIX_STORE_DIR`           store dir a client's paths are prefixed with (default `/nix/store`)
+//!   `KUBERNIX_SSH_LISTEN`     bind address (default `0.0.0.0:2222`)
+//!   `KUBERNIX_SSH_HOST_KEY`   host key path (generated if absent)
+//!   `KUBERNIX_SSH_ACCEPT_ALL` if set, also accept clients that offer no key
+//!                             at all, attributed by username alone and
+//!                             unverified (`ssh::AuthPolicy::AcceptAll`).
+//!                             Development only: this bypasses
+//!                             `tenant_auth_bindings` for every client, not
+//!                             just keyless ones, since OpenSSH always tries
+//!                             `auth_none` first. Unset means `RequireKey`.
+//!   `DATABASE_URL`            PostgreSQL; if unset, an in-memory store is used,
+//!                             and every SSH key is rejected (see
+//!                             `ssh::AuthPolicy`) — there is nowhere to look up
+//!                             a `tenant_auth_bindings` row without a database
+//!   `KUBERNIX_STORE_DIR`      store dir a client's paths are prefixed with
+//!                             (default `/nix/store`)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,14 +57,18 @@ async fn main() -> color_eyre::eyre::Result<()> {
 
     let host_key = load_or_create_host_key()?;
 
-    let auth = match std::env::var("KUBERNIX_SSH_AUTHORIZED_KEYS") {
-        Ok(path) => AuthPolicy::from_authorized_keys_file(&PathBuf::from(path))?,
-        Err(_) => {
-            tracing::warn!(
-                "KUBERNIX_SSH_AUTHORIZED_KEYS unset - accepting ANY public key. Development only."
-            );
-            AuthPolicy::AcceptAll
-        }
+    // Governs only the keyless `auth_none` path (see `ssh::AuthPolicy`'s doc
+    // comment); every presented key is checked against `tenant_auth_bindings`
+    // regardless of this. `RequireKey` by default: a client that offers no
+    // key gets no attributed tenant at all, which is what makes the bindings
+    // table an actual gate rather than one only some clients pass through.
+    let auth = if std::env::var("KUBERNIX_SSH_ACCEPT_ALL").is_ok() {
+        tracing::warn!(
+            "KUBERNIX_SSH_ACCEPT_ALL set - accepting keyless clients, unverified. Development only."
+        );
+        AuthPolicy::AcceptAll
+    } else {
+        AuthPolicy::RequireKey
     };
 
     let config = Arc::new(russh::server::Config {

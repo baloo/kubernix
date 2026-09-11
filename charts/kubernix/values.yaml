@@ -89,10 +89,9 @@ cert-manager:
 sshd:
   replicas: 1
   listen: "0.0.0.0:2222"
-  # authorizedKeys: null — accepts any client key, tenant derived from the SSH
-  # username, matching nix/module.nix's dev-only default. Set to the name of a
-  # Secret key (`authorized_keys`) to restrict this in a real deployment.
-  authorizedKeys: ""
+  # Which SSH keys resolve to a tenant is controlled entirely by the
+  # `tenant_auth_bindings` table (server/migrations/), provisioned by hand —
+  # there is no per-deployment auth setting here any more.
   service:
     type: LoadBalancer
     port: 2222

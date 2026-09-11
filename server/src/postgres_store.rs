@@ -23,13 +23,13 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use crate::jobs::JobOutcome;
 use crate::store::{
     CapabilitySecretStore, Hash, HashType, MissingPaths, PathInfo, PathStore, RemoteObject, Result,
-    StoreError, Tier,
+    StoreError, TenantAuthStore, Tier,
 };
 use kubernix_signing::{KIND_LOCAL_ED25519, LocalSigner, Signer, key_name_for};
 use kubernix_types::{ObjectKey, StorePath};
 use uuid::Uuid;
 
-use crate::tenant::{Tenant, TenantId};
+use crate::tenant::{KeyType, Tenant, TenantId};
 
 pub struct PostgresStore {
     // `pub(crate)` rather than private: `crate::gc` runs its own statements
@@ -875,6 +875,45 @@ impl CapabilitySecretStore for PostgresStore {
     }
 }
 
+#[async_trait::async_trait]
+impl TenantAuthStore for PostgresStore {
+    async fn find_tenant_by_binding(
+        &self,
+        key_type: KeyType,
+        key_id: &str,
+    ) -> Result<Option<TenantId>> {
+        let row = sqlx::query(
+            "SELECT tenant FROM tenant_auth_bindings WHERE key_type = $1 AND key_id = $2",
+        )
+        .bind(key_type.as_str())
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let tenant: String = row.get("tenant");
+        match TenantId::from_wire(&tenant) {
+            Some(id) => Ok(Some(id)),
+            // `tenant` is a foreign key into `tenants(id)`, and every id this
+            // process has ever written there came from `TenantId::from_wire`
+            // or `derive_id` - both wire-safe by construction. Reaching this
+            // means a row was inserted with an id neither produced (a manual
+            // `INSERT` typo, most likely), which is an operator error, not
+            // something to trust a connection's identity to.
+            None => {
+                tracing::error!(
+                    tenant,
+                    "tenant_auth_bindings row references a malformed tenant id"
+                );
+                Ok(None)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,6 +969,32 @@ mod tests {
     /// A tenant unique to one test.
     fn tenant(test: &str) -> TenantId {
         Tenant::from_ssh(&format!("test-{test}"), None, false).id
+    }
+
+    /// Provision a tenant and a binding for it, the way an operator would by
+    /// hand — over a privileged connection, since `kubernix_app` (what `db()`
+    /// connects as, matching the real serving role) only has `SELECT` on
+    /// `tenant_auth_bindings`, deliberately: see the migration's doc comment.
+    async fn provision_binding(url: &str, tenant: &TenantId, key_id: &str) {
+        let privileged = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(url)
+            .await
+            .expect("KUBERNIX_TEST_DATABASE_URL is set but unusable");
+        sqlx::query("INSERT INTO tenants (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+            .bind(tenant.as_str())
+            .execute(&privileged)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tenant_auth_bindings (key_type, key_id, tenant) VALUES ('ssh', $1, $2)
+             ON CONFLICT (key_type, key_id) DO NOTHING",
+        )
+        .bind(key_id)
+        .bind(tenant.as_str())
+        .execute(&privileged)
+        .await
+        .unwrap();
     }
 
     fn info(path: &str) -> PathInfo {
@@ -1494,5 +1559,32 @@ mod tests {
             .await
             .unwrap();
         assert!(verified);
+    }
+
+    #[tokio::test]
+    async fn find_tenant_by_binding_resolves_a_provisioned_key() {
+        let Some(store) = db().await else { return };
+        let Ok(url) = std::env::var("KUBERNIX_TEST_DATABASE_URL") else {
+            return;
+        };
+        let t = tenant("binding-found");
+        let key_id = format!("SHA256:{}", t.as_str());
+        provision_binding(&url, &t, &key_id).await;
+
+        let found = store
+            .find_tenant_by_binding(KeyType::Ssh, &key_id)
+            .await
+            .unwrap();
+        assert_eq!(found, Some(t));
+    }
+
+    #[tokio::test]
+    async fn find_tenant_by_binding_is_none_for_an_unprovisioned_key() {
+        let Some(store) = db().await else { return };
+        let found = store
+            .find_tenant_by_binding(KeyType::Ssh, "SHA256:never-provisioned")
+            .await
+            .unwrap();
+        assert_eq!(found, None);
     }
 }

@@ -42,21 +42,12 @@ spec:
               value: {{ .Values.sshd.listen | quote }}
             - name: KUBERNIX_SSH_HOST_KEY
               value: /etc/kubernix/ssh/host_ed25519
-            {{- if .Values.sshd.authorizedKeys }}
-            - name: KUBERNIX_SSH_AUTHORIZED_KEYS
-              value: /etc/kubernix/ssh-authorized-keys/authorized_keys
-            {{- end }}
             - name: RUST_LOG
               value: debug
           volumeMounts:
             - name: host-key
               mountPath: /etc/kubernix/ssh
               readOnly: true
-            {{- if .Values.sshd.authorizedKeys }}
-            - name: authorized-keys
-              mountPath: /etc/kubernix/ssh-authorized-keys
-              readOnly: true
-            {{- end }}
           resources:
             {{- toYaml .Values.sshd.resources | nindent 12 }}
       volumes:
@@ -64,15 +55,6 @@ spec:
           secret:
             secretName: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
             defaultMode: 0400
-        {{- if .Values.sshd.authorizedKeys }}
-        - name: authorized-keys
-          secret:
-            # Name of an existing Secret with an `authorized_keys` key —
-            # unset (the default) means accept any client key, deriving the
-            # tenant from the SSH username instead. See nix/module.nix's
-            # `authorizedKeys` option for the same trade-off.
-            secretName: {{ .Values.sshd.authorizedKeys }}
-        {{- end }}
       {{- with .Values.sshd.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -8,8 +8,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::Arc;
 
 use russh::keys::PublicKey;
 use russh::server::{Auth, Handler, Msg, Server, Session};
@@ -17,47 +15,33 @@ use russh::{Channel, ChannelId};
 
 use crate::daemon_capnp::bootstrap;
 use crate::daemon_rpc::{BootstrapImpl, Config as RpcConfig};
-use crate::tenant::Tenant;
+use crate::tenant::{KeyType, Tenant};
 
-/// Which public keys may connect.
-#[derive(Clone, Default)]
+/// Whether a client that offers no key at all may still connect.
+///
+/// This is unrelated to key-based auth: a presented key is always checked
+/// against `tenant_auth_bindings` (see [`SshHandler::auth_publickey`]),
+/// unconditionally, regardless of this policy. It exists only for
+/// `auth_none`, the step a keyless client is accepted or rejected at before
+/// ever reaching `auth_publickey`.
+///
+/// This is load-bearing, not cosmetic: OpenSSH clients send `auth_none` as
+/// their first request unconditionally (to learn what the server requires),
+/// regardless of `PreferredAuthentications` — so as long as this accepts,
+/// `tenant_auth_bindings` never even gets consulted. `RequireKey` is what
+/// makes the bindings table an actual access control rather than a lookup
+/// table nothing forces a client through.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthPolicy {
-    /// Accept any key, recording its fingerprint. Development only.
-    #[default]
+    /// Accept a keyless connection, attributing it to the claimed username
+    /// alone, unverified. Development only — bypasses `tenant_auth_bindings`
+    /// entirely, for every client, not just ones without a key.
     AcceptAll,
-    /// Accept only keys listed in an `authorized_keys` file.
-    AuthorizedKeys(Arc<Vec<PublicKey>>),
-}
-
-impl AuthPolicy {
-    pub fn from_authorized_keys_file(path: &Path) -> std::io::Result<Self> {
-        let contents = std::fs::read_to_string(path)?;
-        let mut keys = Vec::new();
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            match PublicKey::from_openssh(line) {
-                Ok(key) => keys.push(key),
-                Err(e) => tracing::warn!(error = %e, "skipping unparseable authorized_keys entry"),
-            }
-        }
-        tracing::info!(count = keys.len(), path = %path.display(), "loaded authorized keys");
-        Ok(AuthPolicy::AuthorizedKeys(Arc::new(keys)))
-    }
-
-    fn permits(&self, key: &PublicKey) -> bool {
-        match self {
-            AuthPolicy::AcceptAll => true,
-            // Compare the *key data*, not the `PublicKey`. `PublicKey` equality
-            // includes the trailing comment, which an `authorized_keys` line
-            // carries (`ssh-ed25519 AAAA… user@host`) and the key a client
-            // offers over the wire does not — so comparing whole values rejects
-            // every legitimate key.
-            AuthPolicy::AuthorizedKeys(keys) => keys.iter().any(|k| k.key_data() == key.key_data()),
-        }
-    }
+    /// Reject `auth_none` outright, forcing every client through
+    /// `auth_publickey` — the only path a `tenant_auth_bindings` row can
+    /// attribute a tenant from.
+    #[default]
+    RequireKey,
 }
 
 #[derive(Clone)]
@@ -79,7 +63,7 @@ impl Server for SshServer {
         tracing::info!(peer = ?peer_addr, "connection");
         SshHandler {
             rpc_config: self.rpc_config.clone(),
-            auth: self.auth.clone(),
+            auth: self.auth,
             peer_addr,
             user: None,
             tenant: None,
@@ -95,10 +79,11 @@ pub struct SshHandler {
     user: Option<String>,
     /// Who this connection is attributed to, once it has authenticated.
     ///
-    /// Derived from the identity the client presented rather than assigned, so
-    /// the same client is the same tenant across connections. `verified` records
-    /// whether the [`AuthPolicy`] actually checked it — under `AcceptAll` it did
-    /// not, and the attribution is a claim rather than a fact.
+    /// Under `auth_publickey`, the id comes straight from the matching
+    /// `tenant_auth_bindings` row and `verified` is always true — the bound
+    /// key is what "verified" means here. Under keyless `auth_none`
+    /// (`AuthPolicy::AcceptAll`), it is derived from the username alone and
+    /// `verified` is false: pure assertion, not a fact.
     tenant: Option<Tenant>,
     /// Channels opened but not yet claimed by an `exec` request.
     channels: HashMap<ChannelId, Channel<Msg>>,
@@ -108,8 +93,9 @@ impl Handler for SshHandler {
     type Error = russh::Error;
 
     /// Accepted under `AcceptAll`, so a client that offers no key at all still
-    /// gets in. Development convenience; real deployments set an
-    /// `authorized_keys` file, which rejects here.
+    /// gets in. Development convenience only — unrelated to whether a
+    /// *presented* key is accepted, which `auth_publickey` always checks
+    /// against `tenant_auth_bindings` regardless of this policy.
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         match self.auth {
             AuthPolicy::AcceptAll => {
@@ -127,32 +113,51 @@ impl Handler for SshHandler {
                 self.tenant = Some(tenant);
                 Ok(Auth::Accept)
             }
-            AuthPolicy::AuthorizedKeys(_) => Ok(Auth::reject()),
+            // Forces every client through `auth_publickey`, the only path
+            // that can attribute a real tenant.
+            AuthPolicy::RequireKey => Ok(Auth::reject()),
         }
     }
 
+    /// The tenant follows the key, looked up in `tenant_auth_bindings` — not
+    /// derived from anything the client presented. A key with no binding row
+    /// is rejected outright: `tenants`/bindings are provisioned by hand, so
+    /// there is no "attribute an unverified tenant" fallback here the way
+    /// `auth_none` has one. `AuthPolicy` plays no part in this decision.
     async fn auth_publickey(
         &mut self,
         user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
         let fingerprint = public_key.fingerprint(Default::default()).to_string();
-        let permitted = self.auth.permits(public_key);
-        if !permitted {
-            tracing::warn!(user, %fingerprint, "rejected: key not authorized");
-            return Ok(Auth::reject());
+        match self
+            .rpc_config
+            .store
+            .find_tenant_by_binding(KeyType::Ssh, &fingerprint)
+            .await
+        {
+            Ok(Some(id)) => {
+                let tenant = Tenant {
+                    id,
+                    identity: format!("key:{fingerprint}"),
+                    verified: true,
+                };
+                tracing::info!(user, %fingerprint, tenant = %tenant.id, "authenticated");
+                self.user = Some(user.to_string());
+                self.tenant = Some(tenant);
+                Ok(Auth::Accept)
+            }
+            Ok(None) => {
+                tracing::warn!(user, %fingerprint, "rejected: key not bound to any tenant");
+                Ok(Auth::reject())
+            }
+            Err(e) => {
+                // Fail closed: a lookup we could not perform is not evidence
+                // of a binding, so treat it the same as none found.
+                tracing::error!(error = %e, user, %fingerprint, "tenant binding lookup failed");
+                Ok(Auth::reject())
+            }
         }
-
-        // The tenant follows the key, not the username: the key is what auth
-        // verifies, so deriving from it means enabling auth does not renumber
-        // anyone. Under `AcceptAll` the key was accepted without being checked,
-        // which is exactly what `verified` records.
-        let verified = matches!(self.auth, AuthPolicy::AuthorizedKeys(_));
-        let tenant = Tenant::from_ssh(user, Some(&fingerprint), verified);
-        tracing::info!(user, %fingerprint, tenant = %tenant.id, verified, "authenticated");
-        self.user = Some(user.to_string());
-        self.tenant = Some(tenant);
-        Ok(Auth::Accept)
     }
 
     async fn channel_open_session(
@@ -292,9 +297,6 @@ fn is_stdio_request(command: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// An `authorized_keys` line, i.e. with a trailing comment.
-    const AUTHORIZED: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z baloo@khany";
-    /// The same key as a client presents it: no comment.
     const OFFERED: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z";
     const OTHER: &str =
@@ -304,20 +306,22 @@ mod tests {
         PublicKey::from_openssh(openssh).expect("parseable")
     }
 
-    #[test]
-    fn an_authorized_key_is_recognised_despite_its_comment() {
-        // Regression: `PublicKey` equality includes the comment, so comparing
-        // whole values rejected every key in an `authorized_keys` file.
-        let policy = AuthPolicy::AuthorizedKeys(Arc::new(vec![key(AUTHORIZED)]));
-        assert!(policy.permits(&key(OFFERED)));
-        assert!(policy.permits(&key(AUTHORIZED)));
-    }
+    /// `MemoryStore` (what `RpcConfig::default()` carries) never has a
+    /// binding for anything — see its `TenantAuthStore` impl — so this
+    /// exercises the "no row" branch of `auth_publickey` without a database:
+    /// a key nobody provisioned must be rejected, not attributed a tenant.
+    #[tokio::test]
+    async fn an_unbound_key_is_rejected() {
+        let mut server = SshServer::new(RpcConfig::default(), AuthPolicy::AcceptAll);
+        let mut handler = server.new_client(None);
 
-    #[test]
-    fn an_unlisted_key_is_refused() {
-        let policy = AuthPolicy::AuthorizedKeys(Arc::new(vec![key(AUTHORIZED)]));
-        assert!(!policy.permits(&key(OTHER)));
-        assert!(!AuthPolicy::AuthorizedKeys(Arc::new(Vec::new())).permits(&key(OFFERED)));
+        let auth = handler
+            .auth_publickey("alice", &key(OFFERED))
+            .await
+            .unwrap();
+
+        assert!(matches!(auth, Auth::Reject { .. }), "{auth:?}");
+        assert!(handler.tenant.is_none());
     }
 
     #[test]

@@ -21,6 +21,24 @@ use sha2::{Digest, Sha256};
 /// process: how a tenant is attributed from what an SSH client presented.
 pub use kubernix_types::TenantId;
 
+/// A binding's credential type — `key_type` in `tenant_auth_bindings`.
+///
+/// Only one variant today, deliberately: `KeyType::Tls` and the CHECK
+/// constraint that allows it both land together with the mTLS API that would
+/// actually issue a TLS-bound credential, not ahead of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyType {
+    Ssh,
+}
+
+impl KeyType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyType::Ssh => "ssh",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Tenant {
     pub id: TenantId,

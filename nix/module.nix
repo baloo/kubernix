@@ -70,16 +70,6 @@ in {
       '';
     };
 
-    authorizedKeys = mkOption {
-      type = types.nullOr types.path;
-      default = null;
-      description = ''
-        `authorized_keys` file. When null the frontend accepts **any** client,
-        and derives each tenant from the username rather than the key — see
-        PLAN.md "Deferred deliberately".
-      '';
-    };
-
     databaseUrl = mkOption {
       type = types.str;
       default = "postgres://postgres@localhost:5432/kubernix";
@@ -341,10 +331,7 @@ in {
           KUBERNIX_SSH_LISTEN = cfg_sshd.listen;
           KUBERNIX_SSH_HOST_KEY = cfg_sshd.hostKey;
           RUST_LOG = "debug";
-        } // s3Env cfg_sshd
-          // optionalAttrs (cfg_sshd.authorizedKeys != null) {
-            KUBERNIX_SSH_AUTHORIZED_KEYS = toString cfg_sshd.authorizedKeys;
-          };
+        } // s3Env cfg_sshd;
 
         serviceConfig = {
           ExecStart = "${cfg_sshd.package}/bin/kubernix-sshd";
