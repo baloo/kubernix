@@ -22,4 +22,7 @@ spec:
       secretAccessKey:
         name: {{ .Values.s3.existingSecret | default (printf "%s-s3" (include "kubernix.fullname" .)) }}
         key: secretAccessKey
+      region:
+        name: {{ printf "%s-s3-region" (include "kubernix.fullname" .) }}
+        key: region
 {{- end }}
