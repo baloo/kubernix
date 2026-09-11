@@ -144,13 +144,21 @@ where
         stream.write_wire_u64(0).await?; // obsolete CPU affinity
         stream.write_wire_bool(false).await?; // obsolete reserveSpace
 
-        // Daemon's own version string, then `optional<TrustedFlag>` — a bool
-        // "present" flag followed by a bool value when present. Neither is
-        // acted on here; both must still be drained to stay in sync.
+        // Daemon's own version string, then `optional<TrustedFlag>`. The
+        // latter is a *single* 8-byte tristate word -- `0` absent, `1`
+        // Trusted, `2` NotTrusted (`worker-protocol.cc`'s
+        // `Serialise<std::optional<TrustedFlag>>::read`, which calls
+        // `readNum<uint8_t>`, itself always an 8-byte wire read regardless of
+        // the narrower C++ return type) -- not a present-flag bool followed
+        // by a separate value, which was this code's bug until it was found
+        // against a real daemon: the extra read that shape implies consumes
+        // the first word of `drain_stderr`'s own framing below, desyncing
+        // everything after it and leaving the daemon waiting forever for a
+        // `SetOptions` this client never actually got around to sending.
+        // Neither field is acted on here, but both must still be drained
+        // correctly to stay in sync with the rest of the stream.
         stream.read_wire_str().await?; // daemonNixVersion
-        if stream.read_wire_bool().await? {
-            stream.read_wire_bool().await?; // TrustedFlag
-        }
+        stream.read_wire_u64().await?; // optional<TrustedFlag>: 0/1/2
 
         drain_stderr(&mut stream, None).await?;
 
@@ -450,11 +458,26 @@ mod tests {
     /// A greeting a real daemon would send, immediately followed by whatever
     /// `extra` bytes the test wants appended (a reply to some op).
     fn greeting_with(extra: &[u8]) -> Vec<u8> {
+        greeting_with_trusted_flag(0, extra)
+    }
+
+    /// Same as [`greeting_with`], but with the `optional<TrustedFlag>` word
+    /// explicit — `0` absent, `1` Trusted, `2` NotTrusted (see `open`'s
+    /// comment on this field for why it's a single word, not two).
+    /// `greeting_with`'s `0` alone can't tell the correct one-word read
+    /// apart from the bug this guards against (a present-flag bool followed
+    /// by a separate value bool) — both consume exactly one word when the
+    /// value is `0`. Only a *nonzero* value exercises the difference: the
+    /// buggy reader would consume an extra word here that was never sent,
+    /// desyncing every read after it — this crate's only regression test
+    /// against exactly the behavior found live against a real `nix-daemon`
+    /// (see `PLAN.md`'s Phase 15 Step 3 status note).
+    fn greeting_with_trusted_flag(trusted: u64, extra: &[u8]) -> Vec<u8> {
         let mut w = Vec::new();
         w.write_u64_sync(MAGIC_2);
         w.write_u64_sync(PROTOCOL_VERSION);
         w.write_str_sync("2.96.0-dev-kubernix-test");
-        w.write_bool_sync(false); // no TrustedFlag
+        w.write_u64_sync(trusted);
         // `drain_stderr` after the greeting.
         w.write_u64_sync(STDERR_LAST);
         // `drain_stderr` after `set_options`.
@@ -526,6 +549,21 @@ mod tests {
     async fn opens_against_a_well_formed_greeting() {
         let stream = FakeStream {
             to_read: std::io::Cursor::new(greeting_with(&[])),
+            written: Vec::new(),
+        };
+        let conn = DaemonConnection::open(stream).await.unwrap();
+        assert_eq!(conn.daemon_version, PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn opens_against_a_greeting_reporting_trusted() {
+        // Regression test for the bug found against a real `nix-daemon`: a
+        // nonzero `optional<TrustedFlag>` word used to make `open` read one
+        // extra (nonexistent) word, desyncing `drain_stderr` afterwards and
+        // hanging rather than erroring — see `greeting_with_trusted_flag`'s
+        // doc comment. `1` is `Trusted`.
+        let stream = FakeStream {
+            to_read: std::io::Cursor::new(greeting_with_trusted_flag(1, &[])),
             written: Vec::new(),
         };
         let conn = DaemonConnection::open(stream).await.unwrap();

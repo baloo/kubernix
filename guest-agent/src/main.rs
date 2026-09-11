@@ -8,6 +8,9 @@
 //! - `CONTROL_PORT` (Phase 15 Step 4): a tiny one-shot protocol that unlocks
 //!   and mounts the tenant's `store.img` before any `nix-daemon` connection
 //!   is worth accepting — see [`handle_control`].
+//! - `LOG_PORT`: a debugging aid, not part of the production protocol surface
+//!   — streams this process's `tracing` output to whoever connects. See the
+//!   "Logging" section below for why it's a separate channel.
 //!
 //! Deliberately dumb on the daemon port: unlike `worker/src/serve.rs`'s
 //! `ServeConnection`, which has to parse the `nix-store --serve` wire
@@ -24,18 +27,30 @@
 //! so on exit the kernel panics — cloud-hypervisor's `--console`/reboot
 //! handling determines what happens next, not anything decided here.
 //!
-//! Logging is plain `eprintln!`, not `tracing`: verified empirically against
-//! a real cloud-hypervisor boot (`nix/guest-vm-test.nix`) that
-//! `tracing_subscriber`'s writer produces no output at all on this guest's
-//! serial console, while `eprintln!` does -- and a minimal PID-1 binary has
-//! no need for structured logging's complexity anyway.
+//! # Logging
+//!
+//! Startup and lifecycle messages (mounts, accept-loop errors, spawn
+//! failures) stay plain `eprintln!`, verified empirically against a real
+//! cloud-hypervisor boot (`nix/guest-vm-test.nix`) to actually reach this
+//! guest's serial console when `tracing_subscriber`'s own writer did not.
+//! `tracing` is used *in addition*, for events worth having as a structured,
+//! filterable stream separate from that console -- which is shared with raw
+//! kernel boot messages and every spawned child's inherited stderr, and is
+//! genuinely not the same failure mode `tracing_subscriber` hit before: that
+//! was about writing to the console *tty*, and this writer never does,
+//! streaming instead to whichever debugging client dials `LOG_PORT` (see
+//! [`VsockLogWriter`]). `tokio_vsock`'s own instrumentation is filtered down
+//! (see `main`'s `EnvFilter`) so it doesn't drown out this process's own
+//! events -- the whole point of a second channel is a *cleaner* stream, not
+//! just a different pipe for the same noise.
 
 use std::net::Shutdown;
 use std::process::Stdio;
 
 use eyre::{Context, Result, eyre};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::broadcast;
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
 
 /// Fixed by convention between `guest-agent` and whatever dials it (the
@@ -48,6 +63,42 @@ const NIX_DAEMON_PORT: u32 = 620;
 /// `worker/src/vm.rs::CONTROL_PORT` (duplicated by convention, same as
 /// `NIX_DAEMON_PORT` is on the worker side).
 const CONTROL_PORT: u32 = 621;
+
+/// The debug log-stream port — see the module doc's "Logging" section.
+const LOG_PORT: u32 = 622;
+
+/// Bridges `tracing_subscriber::fmt`'s formatted output into a broadcast
+/// channel that [`log_accept_loop`] fans out to every connected client.
+///
+/// Best-effort by design: a full channel drops the oldest still-unread line
+/// rather than blocking `write` (`broadcast::Sender::send` never blocks —
+/// slow subscribers lag and get told so via `RecvError::Lagged`, they don't
+/// back-pressure the writer), and a line sent with zero subscribers connected
+/// is simply discarded. A debugging log stream has no business stalling the
+/// process it's observing, or buffering for a client that isn't there yet.
+#[derive(Clone)]
+struct VsockLogWriter {
+    tx: broadcast::Sender<Vec<u8>>,
+}
+
+impl std::io::Write for VsockLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.tx.send(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VsockLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// Path to `nix-daemon` inside the initrd. Not configurable: `nix/guest-vm.nix`
 /// symlinks it here (there is no NixOS profile / `/run/current-system` in this
@@ -65,6 +116,16 @@ const RAW_DEVICE: &str = "/dev/vda";
 const DM_NAME: &str = "tenant-store";
 
 const STORE_MOUNT: &str = "/nix/store";
+
+/// Where `/nix/store`, as the initrd itself baked it in, gets bind-mounted
+/// to before anything else is mounted at the real `/nix/store` — see
+/// `mount_store`'s doc comment.
+const STORE_LOWER: &str = "/mnt/store-lower";
+
+/// Where the decrypted `/dev/mapper/tenant-store` ext4 filesystem is mounted
+/// so its `upper`/`work` subdirectories are reachable — the overlay itself
+/// goes at `STORE_MOUNT`, not here.
+const STORE_RAW: &str = "/mnt/store-raw";
 
 // Every exec below uses a fixed absolute path rather than a bare name
 // resolved via `$PATH`, same convention as `NIX_DAEMON_BIN`: this PID-1
@@ -107,6 +168,20 @@ async fn main() -> Result<()> {
     }
     log_dev_contents();
 
+    // `tokio_vsock` (and anything else with its own tracing instrumentation)
+    // gets turned down to `warn` by default so this stream stays focused on
+    // `guest-agent`'s own events — see the module doc's "Logging" section.
+    // `RUST_LOG` still overrides this entirely, same as any `tracing`-based
+    // binary, for whoever's actually debugging with this connected.
+    let (log_tx, _) = broadcast::channel::<Vec<u8>>(1024);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tokio_vsock=warn"));
+    tracing_subscriber::fmt()
+        .with_writer(VsockLogWriter { tx: log_tx.clone() })
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .init();
+
     let daemon_listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, NIX_DAEMON_PORT))
         .wrap_err("binding vsock listener")?;
     eprintln!("guest-agent listening on vsock port {NIX_DAEMON_PORT}");
@@ -115,8 +190,16 @@ async fn main() -> Result<()> {
         .wrap_err("binding control vsock listener")?;
     eprintln!("guest-agent listening on control vsock port {CONTROL_PORT}");
 
+    let log_listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, LOG_PORT))
+        .wrap_err("binding log vsock listener")?;
+    eprintln!("guest-agent listening on log vsock port {LOG_PORT}");
+
     tokio::spawn(async move {
         control_accept_loop(control_listener).await;
+    });
+
+    tokio::spawn(async move {
+        log_accept_loop(log_listener, log_tx).await;
     });
 
     loop {
@@ -178,6 +261,41 @@ async fn control_accept_loop(listener: VsockListener) {
     }
 }
 
+/// Accept loop for the debug log stream. Each connected client gets its own
+/// subscription to the broadcast channel `VsockLogWriter` feeds, so multiple
+/// clients (or repeated reconnects while debugging) can watch at once without
+/// interfering with each other.
+async fn log_accept_loop(listener: VsockListener, tx: broadcast::Sender<Vec<u8>>) {
+    loop {
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("guest-agent: log accept failed: {err}");
+                continue;
+            }
+        };
+        eprintln!("guest-agent: log stream client connected from {peer:?}");
+        let mut rx = tx.subscribe();
+        tokio::spawn(async move {
+            let (_read_half, mut write_half) = stream.split();
+            loop {
+                match rx.recv().await {
+                    Ok(line) => {
+                        if write_half.write_all(&line).await.is_err() {
+                            break;
+                        }
+                    }
+                    // A slow client fell behind and missed some lines --
+                    // nothing to do but keep going with whatever's next;
+                    // this is a best-effort stream, not a reliable log.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+}
+
 /// One-shot control protocol: read a single `KEY <64 hex chars> <FRESH|REUSE>`
 /// line, open `RAW_DEVICE` as plain `dm-crypt` with that key, `mkfs.ext4` it
 /// first if `FRESH`, mount the result at `STORE_MOUNT`, and reply `OK` or
@@ -208,6 +326,12 @@ async fn handle_control(mut stream: VsockStream) -> Result<()> {
         .write_all(reply.as_bytes())
         .await
         .wrap_err("writing control reply")?;
+    // Explicit graceful half-close: a `Drop`-only close (tried while chasing
+    // what turned out to be an unrelated bug -- see `nix/vm-test-lib.nix`'s
+    // `vm_push_key` doc comment) made the client-side `socat` see a less
+    // clean disconnect, enough to exit non-zero even after successfully
+    // reading the reply -- and under the test script's `set -euo pipefail`,
+    // that alone killed the whole script via `pipefail`.
     write_half.shutdown().await.ok();
     Ok(())
 }
@@ -302,16 +426,70 @@ async fn mkfs_ext4() -> Result<()> {
         .wrap_err("mkfs.ext4")
 }
 
+/// Mounts the decrypted `/dev/mapper/tenant-store` ext4 filesystem as the
+/// writable *upper* layer of an overlayfs whose *lower* layer is
+/// `/nix/store` exactly as the initrd baked it in, then mounts that overlay
+/// back at `/nix/store`.
+///
+/// Mounting the tenant's (initially empty) filesystem directly at
+/// `/nix/store`, as an earlier version of this did, shadows the shared
+/// libraries `makeInitrdNG` placed there (`nix/guest-vm.nix`'s comment on
+/// why `nix-daemon` and friends can dynamically link at all) — any
+/// `nix-daemon` this process execs *after* that mount fails to load
+/// outright, `Command::spawn` erroring with no more detail than "spawning
+/// /bin/nix-daemon --stdio" (found by booting far enough to actually dial
+/// the daemon port post-mount, which no earlier step did). The overlay keeps
+/// both visible: the initrd's own content through the read-only lower layer,
+/// and whatever the tenant's daemon writes through the upper one, persisted
+/// on the encrypted disk exactly as a plain mount would have been.
 async fn mount_store() -> Result<()> {
-    tokio::fs::create_dir_all(STORE_MOUNT)
+    // `lowerdir` has to name a path that stays valid *after* the overlay
+    // mount below replaces what's visible at `/nix/store` itself, so the
+    // current contents are bind-mounted elsewhere first -- a bind mount is
+    // metadata-only (no data copy), and unlike a rename/move it doesn't risk
+    // invalidating anything already holding `/nix/store` open.
+    tokio::fs::create_dir_all(STORE_LOWER)
         .await
-        .wrap_err_with(|| format!("creating {STORE_MOUNT}"))?;
+        .wrap_err_with(|| format!("creating {STORE_LOWER}"))?;
+    run(MOUNT_BIN, &["--bind", STORE_MOUNT, STORE_LOWER])
+        .await
+        .wrap_err("bind-mounting /nix/store to the overlay's lower dir")?;
+
+    tokio::fs::create_dir_all(STORE_RAW)
+        .await
+        .wrap_err_with(|| format!("creating {STORE_RAW}"))?;
     run(
         MOUNT_BIN,
-        &["-t", "ext4", &format!("/dev/mapper/{DM_NAME}"), STORE_MOUNT],
+        &["-t", "ext4", &format!("/dev/mapper/{DM_NAME}"), STORE_RAW],
     )
     .await
-    .wrap_err("mount")
+    .wrap_err("mounting the decrypted device")?;
+
+    // Present already on `REUSE` (persisted in the ext4 filesystem from a
+    // prior `FRESH`), created here on `FRESH` — `create_dir_all` is
+    // idempotent either way.
+    let upper = format!("{STORE_RAW}/upper");
+    let work = format!("{STORE_RAW}/work");
+    tokio::fs::create_dir_all(&upper)
+        .await
+        .wrap_err_with(|| format!("creating {upper}"))?;
+    tokio::fs::create_dir_all(&work)
+        .await
+        .wrap_err_with(|| format!("creating {work}"))?;
+
+    run(
+        MOUNT_BIN,
+        &[
+            "-t",
+            "overlay",
+            "overlay",
+            "-o",
+            &format!("lowerdir={STORE_LOWER},upperdir={upper},workdir={work}"),
+            STORE_MOUNT,
+        ],
+    )
+    .await
+    .wrap_err("mounting the overlay")
 }
 
 async fn run(bin: &str, args: &[&str]) -> Result<()> {
@@ -362,6 +540,7 @@ async fn run_with_stdin(bin: &str, args: &[&str], stdin: &[u8]) -> Result<()> {
 /// Spawn `nix-daemon --stdio` and relay `stream` onto its stdin/stdout until
 /// either side closes.
 async fn serve(mut stream: VsockStream) -> Result<()> {
+    tracing::info!("spawning nix-daemon for a new connection");
     let mut child = spawn_nix_daemon()?;
     let mut child_stdin = child.stdin.take().ok_or_else(|| eyre::eyre!("no stdin"))?;
     let mut child_stdout = child
@@ -373,27 +552,85 @@ async fn serve(mut stream: VsockStream) -> Result<()> {
 
     // Two directions, driven concurrently: the vsock peer's writes feed
     // nix-daemon's stdin, and nix-daemon's stdout feeds back to the peer.
-    // Neither `tokio::io::copy` call returns until its source hits EOF, which
-    // is exactly "the peer closed" on one side and "nix-daemon exited" on the
+    // Neither `copy_and_log` call returns until its source hits EOF, which is
+    // exactly "the peer closed" on one side and "nix-daemon exited" on the
     // other — either is a legitimate reason to tear the whole connection down.
+    //
+    // `copy_and_log`, not `tokio::io::copy`: a hang here previously looked
+    // identical to "zero bytes ever moved" from the outside, because
+    // `tokio::io::copy` produces no signal at all until it returns -- and if
+    // the whole VM gets killed while it's still pending (a wedged relay,
+    // exactly the failure being diagnosed), it never gets the chance to.
+    // Logging every chunk as it's relayed means the log stream carries real
+    // signal even from a run that never finishes.
     let relay_in = async {
-        let result = tokio::io::copy(&mut stream_read, &mut child_stdin).await;
+        let result = copy_and_log("vsock->nix-daemon", &mut stream_read, &mut child_stdin).await;
         // nix-daemon reads EOF on its stdin as "no more requests"; without
         // explicitly dropping our end here it would just see the pipe stay
         // open and hang waiting for more.
         drop(child_stdin);
         result
     };
-    let relay_out = tokio::io::copy(&mut child_stdout, &mut stream_write);
+    let relay_out = copy_and_log("nix-daemon->vsock", &mut child_stdout, &mut stream_write);
 
+    // Logging the byte count on whichever side finishes first (in addition
+    // to `copy_and_log`'s own per-chunk logging) says definitively whether
+    // *any* bytes ever crossed the relay in that direction before the
+    // connection ended, which is exactly what "did the client's request ever
+    // reach nix-daemon, and did nix-daemon ever answer" needs distinguishing.
     tokio::select! {
-        result = relay_in => { result.wrap_err("relaying vsock -> nix-daemon")?; }
-        result = relay_out => { result.wrap_err("relaying nix-daemon -> vsock")?; }
+        result = relay_in => {
+            match &result {
+                Ok(n) => tracing::info!(bytes = n, "vsock -> nix-daemon relay ended"),
+                Err(err) => tracing::warn!(%err, "vsock -> nix-daemon relay errored"),
+            }
+            result.wrap_err("relaying vsock -> nix-daemon")?;
+        }
+        result = relay_out => {
+            match &result {
+                Ok(n) => tracing::info!(bytes = n, "nix-daemon -> vsock relay ended"),
+                Err(err) => tracing::warn!(%err, "nix-daemon -> vsock relay errored"),
+            }
+            result.wrap_err("relaying nix-daemon -> vsock")?;
+        }
     }
 
     reap(&mut child).await;
     stream.shutdown(Shutdown::Both).ok();
     Ok(())
+}
+
+/// Like `tokio::io::copy`, but logs every chunk as it's relayed instead of
+/// only the final total once the whole copy finishes — see `serve`'s comment
+/// on why that distinction matters for diagnosing a relay that never
+/// finishes at all.
+async fn copy_and_log<R, W>(direction: &'static str, mut reader: R, mut writer: W) -> Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .wrap_err_with(|| format!("reading ({direction})"))?;
+        if n == 0 {
+            tracing::info!(direction, total, "relay direction hit EOF");
+            return Ok(total);
+        }
+        total += n as u64;
+        // `debug`, not `info`: a real NAR transfer is many 8 KiB chunks, and
+        // this default-off level is exactly what `RUST_LOG=debug` (passed to
+        // `guest-agent` the same way as any `tracing`-based binary) is for --
+        // the EOF summary above stays `info` for normal lifecycle visibility.
+        tracing::debug!(direction, bytes = n, total, "relayed chunk");
+        writer
+            .write_all(&buf[..n])
+            .await
+            .wrap_err_with(|| format!("writing ({direction})"))?;
+    }
 }
 
 fn spawn_nix_daemon() -> Result<Child> {

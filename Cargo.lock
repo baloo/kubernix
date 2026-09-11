@@ -2507,6 +2507,8 @@ dependencies = [
  "eyre",
  "tokio",
  "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2543,7 +2545,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
  "zstd",
 ]

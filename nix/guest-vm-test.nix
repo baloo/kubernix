@@ -11,7 +11,7 @@
 # (matching how NixOS's own KVM-accelerated VM tests are opted into), and
 # `requiredSystemFeatures` below routes the build to a builder that has done
 # so instead of failing it outright on one that hasn't.
-{ stdenvNoCC, cloud-hypervisor, socat, kernel, initrd }:
+{ stdenvNoCC, cloud-hypervisor, socat, kernel, initrd, vm-test-lib }:
 
 stdenvNoCC.mkDerivation {
   name = "kubernix-guest-vm-test";
@@ -24,52 +24,32 @@ stdenvNoCC.mkDerivation {
 
   buildCommand = ''
     set -euo pipefail
+    source ${vm-test-lib}
 
     console_log="$PWD/console.log"
     vsock_socket="$PWD/vsock.sock"
 
-    # Legacy serial (ttyS0), not virtio-console: it needs no guest driver
-    # beyond what every x86 kernel already has built in, so the earliest
-    # kernel boot messages land in the log too, not just guest-agent's own
-    # eprintln! output.
-    cloud-hypervisor \
-      --kernel ${kernel}/bzImage \
-      --initramfs ${initrd}/initrd \
-      --cmdline "console=ttyS0 reboot=t panic=1" \
-      --cpus boot=1 \
-      --memory size=768M \
-      --vsock cid=3,socket=$vsock_socket \
-      --console off \
-      --serial file=$console_log \
-      &
+    vm_boot ${kernel}/bzImage ${initrd}/initrd "$vsock_socket" "$console_log"
     ch_pid=$!
-    trap 'kill $ch_pid 2>/dev/null || true' EXIT
+    log_pid="" # may never be set below; the trap references it either way
+    trap 'kill $ch_pid $log_pid 2>/dev/null || true' EXIT
 
-    # The vsock socket appears once cloud-hypervisor's device is live, well
-    # before the guest kernel finishes booting and `guest-agent` binds its
-    # listener -- the retry loops below absorb that gap instead of needing a
-    # fixed sleep.
-    for i in $(seq 1 100); do
-      [ -S "$vsock_socket" ] && break
-      sleep 0.1
-    done
-    [ -S "$vsock_socket" ] || { echo "cloud-hypervisor never created $vsock_socket"; exit 1; }
+    # `guest-agent`'s `tracing` output, separate from the shared console --
+    # see `nix/vm-test-lib.nix`'s `vm_stream_logs` doc comment for why.
+    # Started as soon as the vsock socket file exists, not gated on the
+    # daemon-port check below succeeding -- it's just as useful for seeing
+    # why that check failed as for anything else.
+    vm_wait_for_socket "$vsock_socket" && { vm_stream_logs "$vsock_socket"; log_pid=$!; }
 
     # `guest-agent`'s NIX_DAEMON_PORT (guest-agent/src/main.rs).
     port=620
-
     ok=0
-    for i in $(seq 1 100); do
-      if reply=$(printf 'CONNECT %d\n' "$port" | timeout 1 socat - "UNIX-CONNECT:$vsock_socket" 2>/dev/null); then
-        case "$reply" in
-          OK*) ok=1; break ;;
-        esac
-      fi
-      sleep 0.2
-    done
+    vm_wait_for_vsock "$vsock_socket" "$port" && ok=1
 
-    kill "$ch_pid" 2>/dev/null || true
-    wait "$ch_pid" 2>/dev/null || true
+    vm_stop "$ch_pid"
+    # `tee`'s process substitution is a separate, untracked child -- give its
+    # last write a moment to land in $console_log before reading it back.
+    sleep 0.2
 
     echo "==> console log:"
     cat "$console_log" || true

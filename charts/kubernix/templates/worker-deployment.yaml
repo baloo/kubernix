@@ -23,40 +23,44 @@ spec:
         - name: worker
           image: "{{ .Values.image.worker.repository }}:{{ .Values.image.worker.tag }}"
           imagePullPolicy: {{ .Values.image.worker.pullPolicy }}
-          {{- if .Values.worker.privileged }}
-          # TEMPORARY, not a real default (values.yaml keeps this false) —
-          # Lix's build sandbox is mandatory once the store is "diverted"
-          # (KUBERNIX_NIX_STORE's chroot root differs from the image's own
-          # /nix/store), which in turn needs kernel namespaces this pod
-          # doesn't have without it. The real fix is Phase 15: builds move
-          # into a per-tenant cloud-hypervisor VM with its own independent
-          # kernel, where the sandbox just works with no elevated pod
-          # privilege at all — see PLAN.md. Not wired into this chart yet.
-          securityContext:
-            privileged: true
-          {{- end }}
           # No DB/S3 credentials, by design — the worker only ever talks to
-          # NATS and to pre-signed S3 URLs it's handed over NATS. No
-          # /dev/kvm, no VM-related env either: Phase 15's per-tenant
-          # cloud-hypervisor VM feature stays off (values.worker has no knob
-          # for it in this chart).
+          # NATS and to pre-signed S3 URLs it's handed over NATS.
+          #
+          # KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD are baked into
+          # image.worker itself (nix/images.nix) — per-tenant VM isolation
+          # is the only mode this worker runs in, not a deployment-time
+          # opt-in. Only the VM's own sizing is a chart concern.
           env:
             - name: NATS_URL
               value: {{ printf "nats://%s-nats:4222" .Release.Name | quote }}
             - name: NIX_SYSTEM
               value: {{ .Values.worker.system | quote }}
+            - name: KUBERNIX_VM_VCPUS
+              value: {{ .Values.worker.vm.vcpus | quote }}
+            - name: KUBERNIX_VM_MEMORY_MB
+              value: {{ .Values.worker.vm.memoryMb | quote }}
+            - name: KUBERNIX_VM_STORE_IMG_MB
+              value: {{ .Values.worker.vm.storeImgMb | quote }}
             - name: RUST_LOG
               value: debug
           # $HOME and KUBERNIX_NIX_STORE both point under here — baked into
           # the image itself (nix/images.nix), not set here, since they're a
           # property of how this image runs a worker at all, not something
-          # deployment-specific. The chart's job is just to make that path
-          # real, writable storage.
+          # deployment-specific.
           volumeMounts:
             - name: state
               mountPath: /var/lib/kubernix-worker
           resources:
-            {{- toYaml .Values.worker.resources | nindent 12 }}
+            # `devices.kubevirt.io/kvm`-style extended resource, merged with
+            # (and overridable by) worker.resources — this is what actually
+            # grants /dev/kvm to the container via whatever device-plugin
+            # DaemonSet on the cluster registers it, with no `privileged:
+            # true` and no node-specific `kvm` group GID to guess at. Bump
+            # worker.resources' own requests/limits to cover each tenant
+            # VM's memoryMb/vcpus on top of the worker process's own
+            # footprint — nothing here does that arithmetic automatically.
+            {{- $vmResources := dict "limits" (dict .Values.worker.vm.kvmResourceName "1") }}
+            {{- toYaml (mergeOverwrite $vmResources .Values.worker.resources) | nindent 12 }}
       volumes:
         # Ephemeral by design — Phase 15's own storage decisions treat a
         # worker's local store as a disposable cache, never the source of

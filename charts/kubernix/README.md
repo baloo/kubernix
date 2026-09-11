@@ -52,8 +52,15 @@ something every application release should bring its own copy of.
 - No KEDA autoscaling on NATS queue depth for the worker pool yet
   (`worker.autoscaling.enabled` is a stub for that follow-up) — scale
   `worker.replicas` manually in the meantime.
-- Phase 15's per-tenant `cloud-hypervisor` VM feature (`/dev/kvm` passthrough)
-  is not wired into this chart; the worker runs exactly as it does without it.
+- Phase 15's per-tenant `cloud-hypervisor` VM isolation is the only mode the
+  worker runs jobs in (`worker.vm.*` sizes each tenant's VM); this needs a
+  `devices.kubevirt.io/kvm`-style device-plugin DaemonSet already running on
+  the cluster (`worker.vm.kvmResourceName` names the extended resource it
+  registers) — without one, the worker pod never gets `/dev/kvm` and every
+  job fails to boot its VM. Networking (Step 5) and per-tenant substituter
+  credentials (Step 6) aren't implemented yet, so a guest can't reach any
+  substituter — only the inputs the worker stages itself are available to a
+  build. See `PLAN.md` Phase 15.
 
 ## Quickstart
 

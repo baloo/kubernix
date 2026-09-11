@@ -149,14 +149,19 @@ rotate:
 worker:
   replicas: 1
   system: x86_64-linux
-  # NOT a real fix — Lix's build sandbox is mandatory once KUBERNIX_NIX_STORE
-  # diverges from the image's own /nix/store, and that needs kernel
-  # namespaces this pod doesn't have without full privilege. Phase 15 (VM-
-  # isolated builds, PLAN.md) is the actual answer and isn't wired into this
-  # chart yet. Leave this false; only set true for throwaway verification.
-  privileged: false
-  # Phase 15's per-tenant cloud-hypervisor VM feature stays off in this
-  # chart — no /dev/kvm passthrough, no vm* env. See PLAN.md step 7.
+  # Per-tenant `cloud-hypervisor` VM isolation (PLAN.md Phase 15) is the only
+  # mode this chart runs the worker in — kernel+initrd ship baked into
+  # image.worker itself (nix/images.nix), so there's nothing to point at
+  # here, only how big each tenant's VM gets. `kvmResourceName` is the
+  # `devices.kubevirt.io/kvm`-style extended resource a device-plugin
+  # DaemonSet on the cluster registers as allocatable — requesting it is
+  # what actually grants /dev/kvm access to the container, with no
+  # `privileged: true` and no node-specific `kvm` group GID to guess at.
+  vm:
+    vcpus: 1
+    memoryMb: 768
+    storeImgMb: 8192
+    kvmResourceName: devices.kubevirt.io/kvm
   # KEDA scaling on NATS queue depth (PLAN.md Phase 13) isn't wired up here
   # either; this stub is left for that follow-up.
   autoscaling:

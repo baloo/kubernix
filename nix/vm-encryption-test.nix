@@ -7,12 +7,13 @@
 #
 # Drives the same `CONNECT <port>\n` / `OK` vsock handshake
 # `nix/guest-vm-test.nix` uses, then speaks the control-channel protocol
-# `guest-agent/src/main.rs::handle_control` implements directly with `socat`
-# (`worker/src/vm.rs::push_key` is the production client of this same
-# protocol) rather than depending on `kubernix-worker` at all.
+# `guest-agent/src/main.rs::handle_control` implements via `vm_push_key`
+# (`nix/vm-test-lib.nix`) -- `worker/src/vm.rs::push_key` is the production
+# client of this same protocol -- rather than depending on `kubernix-worker`
+# at all.
 #
 # Needs `/dev/kvm`, same sandbox requirement as `nix/guest-vm-test.nix`.
-{ stdenvNoCC, cloud-hypervisor, socat, kernel, initrd }:
+{ stdenvNoCC, cloud-hypervisor, socat, kernel, initrd, vm-test-lib }:
 
 stdenvNoCC.mkDerivation {
   name = "kubernix-vm-encryption-test";
@@ -24,78 +25,26 @@ stdenvNoCC.mkDerivation {
 
   buildCommand = ''
     set -euo pipefail
+    source ${vm-test-lib}
 
     store_img="$PWD/store.img"
     truncate -s 256M "$store_img"
-
-    boot_vm() {
-      local vsock_socket="$1" console_log="$2"
-      cloud-hypervisor \
-        --kernel ${kernel}/bzImage \
-        --initramfs ${initrd}/initrd \
-        --cmdline "console=ttyS0 reboot=t panic=1" \
-        --cpus boot=1 \
-        --memory size=768M \
-        --vsock cid=3,socket=$vsock_socket \
-        --disk path=$store_img,image_type=raw \
-        --console off \
-        --serial file=$console_log \
-        &
-      echo $!
-    }
-
-    wait_for_vsock() {
-      local vsock_socket="$1"
-      for i in $(seq 1 100); do
-        [ -S "$vsock_socket" ] && break
-        sleep 0.1
-      done
-      [ -S "$vsock_socket" ]
-      local ok=0
-      for i in $(seq 1 100); do
-        if reply=$(printf 'CONNECT 620\n' | timeout 1 socat - "UNIX-CONNECT:$vsock_socket" 2>/dev/null); then
-          case "$reply" in
-            OK*) ok=1; break ;;
-          esac
-        fi
-        sleep 0.2
-      done
-      [ "$ok" = 1 ]
-    }
-
-    # Speaks the control protocol end to end: CONNECT to the control port,
-    # then the KEY line, over the same still-open socat connection --
-    # exactly the two-step handshake `worker/src/vm.rs::push_key` drives.
-    # Prints guest-agent's final reply line (`OK` or `ERR ...`).
-    push_key() {
-      local vsock_socket="$1" hex_key="$2" mode="$3"
-      printf 'CONNECT 621\nKEY %s %s\n' "$hex_key" "$mode" \
-        | timeout 5 socat - "UNIX-CONNECT:$vsock_socket" \
-        | tail -n 1
-    }
-
-    # SIGKILL, not a plain `kill` (SIGTERM): this guest has no ACPI/
-    # graceful-shutdown handler (`guest-agent` is PID 1, nothing else runs in
-    # the guest -- see `worker/src/vm.rs`'s `CloudHypervisorLauncher::stop`
-    # doc comment), so cloud-hypervisor's SIGTERM handling can sit waiting on
-    # a shutdown the guest will never perform, and this function's own `wait`
-    # would then hang the whole test rather than just this one boot.
-    stop_vm() {
-      local pid="$1"
-      kill -9 "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    }
 
     key=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
     wrong_key=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 
     # Boot #1: fresh image, FRESH key push -- mkfs.ext4 + mount.
     vsock1="$PWD/vsock1.sock"; console1="$PWD/console1.log"
-    ch1_pid=$(boot_vm "$vsock1" "$console1")
-    trap 'stop_vm $ch1_pid' EXIT
-    wait_for_vsock "$vsock1" || { echo "boot #1 never came up"; cat "$console1"; exit 1; }
-    reply1=$(push_key "$vsock1" "$key" FRESH)
-    stop_vm "$ch1_pid"
+    vm_boot ${kernel}/bzImage ${initrd}/initrd "$vsock1" "$console1" --disk path=$store_img,image_type=raw
+    ch1_pid=$!
+    log1_pid="" # may never be set below; the trap references it either way
+    trap 'vm_stop $ch1_pid; kill $log1_pid 2>/dev/null || true' EXIT
+    # `guest-agent`'s `tracing` output, separate from the shared console --
+    # see `nix/vm-test-lib.nix`'s `vm_stream_logs` doc comment for why.
+    vm_wait_for_socket "$vsock1" && { vm_stream_logs "$vsock1"; log1_pid=$!; }
+    vm_wait_for_vsock "$vsock1" || { echo "boot #1 never came up"; cat "$console1"; exit 1; }
+    reply1=$(vm_push_key "$vsock1" "$key" FRESH)
+    vm_stop "$ch1_pid"
     if [[ "$reply1" != OK* ]]; then
       echo "FRESH key push failed: $reply1"; cat "$console1"; exit 1
     fi
@@ -114,11 +63,14 @@ stdenvNoCC.mkDerivation {
     # Boot #2: same image, REUSE with the *same* key -- must mount cleanly,
     # proving the ciphertext from boot #1 round-trips.
     vsock2="$PWD/vsock2.sock"; console2="$PWD/console2.log"
-    ch2_pid=$(boot_vm "$vsock2" "$console2")
-    trap 'stop_vm $ch2_pid' EXIT
-    wait_for_vsock "$vsock2" || { echo "boot #2 never came up"; cat "$console2"; exit 1; }
-    reply2=$(push_key "$vsock2" "$key" REUSE)
-    stop_vm "$ch2_pid"
+    vm_boot ${kernel}/bzImage ${initrd}/initrd "$vsock2" "$console2" --disk path=$store_img,image_type=raw
+    ch2_pid=$!
+    log2_pid=""
+    trap 'vm_stop $ch2_pid; kill $log2_pid 2>/dev/null || true' EXIT
+    vm_wait_for_socket "$vsock2" && { vm_stream_logs "$vsock2"; log2_pid=$!; }
+    vm_wait_for_vsock "$vsock2" || { echo "boot #2 never came up"; cat "$console2"; exit 1; }
+    reply2=$(vm_push_key "$vsock2" "$key" REUSE)
+    vm_stop "$ch2_pid"
     if [[ "$reply2" != OK* ]]; then
       echo "REUSE with the correct key failed: $reply2"; cat "$console2"; exit 1
     fi
@@ -128,11 +80,14 @@ stdenvNoCC.mkDerivation {
     # resulting garbage is not a valid ext4 filesystem, so the mount itself
     # must fail and guest-agent must report ERR.
     vsock3="$PWD/vsock3.sock"; console3="$PWD/console3.log"
-    ch3_pid=$(boot_vm "$vsock3" "$console3")
-    trap 'stop_vm $ch3_pid' EXIT
-    wait_for_vsock "$vsock3" || { echo "boot #3 never came up"; cat "$console3"; exit 1; }
-    reply3=$(push_key "$vsock3" "$wrong_key" REUSE)
-    stop_vm "$ch3_pid"
+    vm_boot ${kernel}/bzImage ${initrd}/initrd "$vsock3" "$console3" --disk path=$store_img,image_type=raw
+    ch3_pid=$!
+    log3_pid=""
+    trap 'vm_stop $ch3_pid; kill $log3_pid 2>/dev/null || true' EXIT
+    vm_wait_for_socket "$vsock3" && { vm_stream_logs "$vsock3"; log3_pid=$!; }
+    vm_wait_for_vsock "$vsock3" || { echo "boot #3 never came up"; cat "$console3"; exit 1; }
+    reply3=$(vm_push_key "$vsock3" "$wrong_key" REUSE)
+    vm_stop "$ch3_pid"
     if [[ "$reply3" != ERR* ]]; then
       echo "REUSE with the wrong key should have failed, got: $reply3"; cat "$console3"; exit 1
     fi

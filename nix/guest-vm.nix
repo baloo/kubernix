@@ -9,19 +9,124 @@
 # `mkfs.ext4`/`mount`, and their shared-library closures -- lives in the
 # initrd itself, which is also the guest's *entire* root filesystem; there is
 # still no separate disk image to boot the guest's own root from.
-{ pkgs, lib, kubernix-guest-agent }:
+{ pkgs, lib, kubernix-guest-agent, vm-test-lib }:
 
 let
-  # Built-in (not module) vsock/virtio/ext4 support, so `guest-agent` -- itself
-  # PID 1, see below -- never has to `modprobe` anything before it can bind
-  # AF_VSOCK or mount the decrypted store. The stock nixpkgs kernel ships
-  # every one of these as a module (`=m`); overriding just the handful this
-  # guest needs to `=y` keeps everything else -- and the validated base config
-  # those modules' dependencies already sit in -- untouched. `dm-crypt` and
-  # its dependencies are the one exception: see the `BLK_DEV_DM` comment below
-  # for why those stay modules, loaded via `modprobe`.
+  # A from-scratch minimal config, not nixpkgs' general-purpose default with a
+  # handful of symbols flipped. `pkgs.linuxPackages.kernel` normally builds
+  # from `defconfig` plus `common-config.nix`'s distro-oriented settings
+  # (`enableCommonConfig`, on by default) -- thousands of drivers this guest
+  # never needs, and (via `autoModules`, also on by default) a correspondingly
+  # huge `/lib/modules` tree that used to get packed into the initrd wholesale
+  # below. `defconfig = "tinyconfig"` starts from close to `allnoconfig`
+  # instead, `enableCommonConfig = false` skips the distro config entirely,
+  # and `autoModules = false` means nothing becomes a module except what's
+  # named `module` below -- so `structuredExtraConfig` has to name everything
+  # this guest needs to boot at all, not just the delta from a sane default.
+  # `pkgs.linuxPackages.kernel`'s own `src`/`version` carry over unchanged
+  # (`.override` only touches the args listed here), so this still tracks
+  # whatever kernel nixpkgs pins, same as before.
+  #
+  # The `yes`/`module` split below is otherwise unchanged from before this
+  # rework: vsock/virtio/ext4 stay built in, so `guest-agent` -- itself PID 1,
+  # see below -- never has to `modprobe` anything before it can bind AF_VSOCK
+  # or mount the store; `dm-crypt` and its dependencies stay modules, loaded
+  # via `modprobe` (`guest-agent/src/main.rs::unlock_and_mount`). Only the
+  # base underneath that split has changed.
   kernel = pkgs.linuxPackages.kernel.override {
+    defconfig = "tinyconfig";
+    enableCommonConfig = false;
+    autoModules = false;
     structuredExtraConfig = with lib.kernel; {
+      # `tinyconfig`/`allnoconfig` can turn module support off entirely --
+      # has to be forced back on for the `dm-crypt` modules below to be
+      # buildable or loadable at all.
+      MODULES = yes;
+      # Core boot plumbing `tinyconfig` strips that a real (if minimal) guest
+      # still needs: the kernel has to be able to unpack this zstd-compressed
+      # initramfs (`nix/guest-vm.nix`'s `makeInitrdNG` uses `compressor =
+      # "zstd"`) and exec ELF binaries out of it (`guest-agent` as `/init`,
+      # then the `nix-daemon` it spawns).
+      BLK_DEV_INITRD = yes;
+      RD_ZSTD = yes;
+      BINFMT_ELF = yes;
+      BLOCK = yes;
+      # `tiny.config` (what `tinyconfig` layers on top of `allnoconfig`)
+      # disables `PRINTK` outright to save size -- without it the kernel is
+      # completely silent, not just quieter, which made an early boot failure
+      # indistinguishable from success until this was added.
+      PRINTK = yes;
+      EARLY_PRINTK = yes;
+      NET = yes; # VSOCKETS sits on the core networking stack, not just virtio.
+      # `AF_UNIX` itself -- so ubiquitous on a normal system it's easy to
+      # forget it's a Kconfig option at all. Missing it doesn't fail to bind
+      # vsock; it surfaces one layer up, in tokio's unrelated-looking
+      # self-pipe signal handling (`UnixStream::new` failing with
+      # `EAFNOSUPPORT`), found by booting past the previous fixes.
+      UNIX = yes;
+      # `nix-daemon` locks the store with advisory file locks
+      # (`flock`/`fcntl`); without this they fail outright with `ENOSYS`
+      # ("Function not implemented") rather than actually locking anything.
+      FILE_LOCKING = yes;
+      # `/dev`, `/proc`, `/sys` -- `guest-agent` mounts all three itself at
+      # startup (no udev, no `prepare_namespace()` on this pure-initramfs
+      # boot path -- see `guest-agent/src/main.rs::main`), but the drivers
+      # for them are `bool` Kconfig symbols, not modularizable either way, so
+      # they have to be builtin regardless of the `yes`/`module` split above.
+      DEVTMPFS = yes;
+      DEVTMPFS_MOUNT = yes;
+      PROC_FS = yes;
+      SYSFS = yes;
+      # `nix/guest-vm-test.nix`'s `console=ttyS0` legacy serial console --
+      # needs no guest driver beyond this to carry early boot messages plus
+      # `guest-agent`'s own `eprintln!` output.
+      TTY = yes;
+      SERIAL_8250 = yes;
+      SERIAL_8250_CONSOLE = yes;
+      # Bus enumeration has to exist before the virtio devices below can be
+      # found at all; kept builtin rather than risking a module-load-order
+      # problem for something every other symbol here depends on.
+      PCI = yes;
+      # Without a working clock, boot hangs after "tsc: Marking TSC unstable"
+      # (no usable clockevent device left to drive `calibrate_delay()`/
+      # jiffies at all -- found by booting and reading the console log).
+      # `ACPI = yes` was tried first since the stock default config always
+      # carries it (via `enableCommonConfig`) and it's the source of a
+      # legacy-PC's PM timer/HPET -- but enabling it here triple-faulted the
+      # guest immediately, before any console output at all, so it's pulling
+      # in something cloud-hypervisor's direct-kernel-boot path doesn't
+      # actually provide. The lighter, VM-native fix: the paravirtual
+      # "kvmclock" cloud-hypervisor (like any KVM-based VMM) exposes via
+      # CPUID, needing no ACPI/PIT/HPET hardware at all.
+      HYPERVISOR_GUEST = yes;
+      PARAVIRT = yes;
+      PARAVIRT_CLOCK = yes;
+      KVM_GUEST = yes;
+      # `tinyconfig`'s `EXPERT = yes` hides (and defaults off) a handful of
+      # syscall-class options a normal system always has on -- invisible on
+      # the stock default config, which never sets `EXPERT` at all. Found by
+      # booting past the fixes above: `guest-agent`'s tokio runtime failed to
+      # even start with `ENOSYS`, and glibc separately logged "The futex
+      # facility returned an unexpected error code" -- both symptoms of the
+      # underlying syscalls being compiled out, not merely unavailable at
+      # runtime.
+      FUTEX = yes; # glibc's pthread/mutex implementation requires this.
+      EPOLL = yes; # tokio's reactor is epoll-based.
+      EVENTFD = yes; # tokio uses eventfd for cross-thread wakeups.
+      SIGNALFD = yes;
+      TIMERFD = yes;
+      # The virtio-vsock PCI device's probe failed with `-ENOSPC` allocating
+      # interrupts (modern virtio-pci wants MSI-X, not legacy INTx).
+      PCI_MSI = yes;
+
+      # Menu/gate symbols that have to be enabled before the options they
+      # guard are even reachable -- without these, `structuredExtraConfig`
+      # below fails outright with "unused option" for every virtio, crypto,
+      # and device-mapper symbol, since the question is never asked at all.
+      VIRTIO_MENU = yes; # gates the whole virtio submenu (VIRTIO, VIRTIO_PCI, ...)
+      CRYPTO = yes; # gates the Cryptographic API menu (CRYPTO_AES, CRYPTO_XTS)
+      MD = yes; # "Multiple devices driver support (RAID and LVM)", gates BLK_DEV_DM
+
       VIRTIO = yes;
       VIRTIO_PCI = yes;
       VIRTIO_MMIO = yes;
@@ -33,44 +138,43 @@ let
       # touches the raw file host-side), so this was never enabled until
       # Step 4 needed the guest to actually open it.
       VIRTIO_BLK = yes;
-      # `/dev`, `/dev/vda`, and `/dev/mapper/*` need to exist without udev.
-      # `DEVTMPFS_MOUNT` alone does *not* get this guest a populated `/dev`:
-      # its auto-mount lives in `prepare_namespace()`, a boot path this pure-
-      # initramfs guest (its own `/init` execs directly) never takes --
-      # `guest-agent` mounts devtmpfs itself at startup instead (see
-      # `guest-agent/src/main.rs::main`). Kept here anyway since `DEVTMPFS`
-      # (the filesystem driver itself) is required either way.
-      DEVTMPFS = yes;
-      DEVTMPFS_MOUNT = yes;
       # Plain `dm-crypt` on the tenant's `store.img` (Component 3b of
       # PLAN.md's Phase 15 design): device-mapper core, the crypt target, and
       # the AES-XTS cipher `cryptsetup_open` (`guest-agent/src/main.rs`)
-      # requests. `BLK_DEV_DM`'s tristate ceiling is gated by `DAX` in
-      # Kconfig, so `DAX` is disabled here too -- not needed by this guest
-      # anyway, it's for persistent-memory-backed filesystems, not a virtio
-      # disk.
+      # requests. On the stock default config `BLK_DEV_DM`'s tristate ceiling
+      # was gated by `DAX`, forcing these to modules regardless of intent;
+      # `DAX` doesn't exist in this from-scratch config at all, but these stay
+      # modules on purpose now -- deferred loading is the deliberate default
+      # here, not a workaround.
       BLK_DEV_DM = module;
       DM_CRYPT = module;
       CRYPTO_AES = module;
       CRYPTO_XTS = module;
-      # The decrypted device is formatted/mounted ext4.
+      # The decrypted device is formatted ext4 and mounted as the writable
+      # *upper* layer of an overlayfs whose *lower* layer is `/nix/store` as
+      # the initrd itself baked it in -- see `guest-agent/src/main.rs`'s
+      # `unlock_and_mount`. Without this, mounting the tenant's (initially
+      # empty) filesystem directly at `/nix/store` shadows the shared
+      # libraries `makeInitrdNG` placed there for `nix-daemon` and friends to
+      # dynamically link against, so any `nix-daemon` spawned *after* the
+      # mount fails to exec at all -- found by booting past the earlier
+      # fixes and hitting exactly that.
       EXT4_FS = yes;
+      OVERLAY_FS = yes;
     };
-    # The override only touches a handful of symbols; letting `make
-    # oldconfig` silently resolve everything else it doesn't ask about (the
-    # same as every other custom-kernel recipe in nixpkgs) is fine here --
-    # nothing downstream depends on those defaults being anything other than
-    # the stock kernel's.
+    # Building from `tinyconfig` instead of the validated stock default means
+    # there is more room for an unanswered dependency to fall through to a
+    # Kconfig default that doesn't boot -- expect this list to grow via the
+    # same build-boot-read-the-panic-add-the-symbol loop Step 4's guest-side
+    # gaps were found by (see PLAN.md's Phase 15 status note).
     ignoreConfigErrors = true;
   };
 
   # `BLK_DEV_DM`/`DM_CRYPT`/`CRYPTO_AES`/`CRYPTO_XTS` above are modules, not
-  # builtins (`BLK_DEV_DM`'s tristate ceiling is capped by `DAX` in Kconfig --
-  # see the comment above -- and this guest has no way to influence that
-  # ceiling before it's evaluated). A module this guest never `modprobe`s is
-  # dead weight: `guest-agent`'s `cryptsetup_open` needs `dm-mod`/`dm-crypt`
-  # loaded, and the kernel's own crypto subsystem needs a working
-  # `/sbin/modprobe` on `$PATH` (the hardcoded default `CONFIG_MODPROBE_PATH`)
+  # builtins -- see the comment above for why. A module this guest never
+  # `modprobe`s is dead weight: `guest-agent`'s `cryptsetup_open` needs
+  # `dm-mod`/`dm-crypt` loaded, and the kernel's own crypto subsystem needs a
+  # working `/sbin/modprobe` on `$PATH` (the hardcoded default `CONFIG_MODPROBE_PATH`)
   # to auto-load `xts(aes)` the first time `dm-crypt` requests that transform
   # -- without it, `request_module()` calls the kernel makes internally have
   # nothing to exec and (empirically) hang rather than failing fast. `kernel
@@ -177,5 +281,5 @@ in
   # Deliberately not a `pkgs.testers.nixosTest` (see `nix/test.nix`): that
   # boots a full NixOS machine under QEMU, which is a different guest
   # entirely from the minimal, non-NixOS image built above.
-  test = pkgs.callPackage ./guest-vm-test.nix { inherit kernel initrd; };
+  test = pkgs.callPackage ./guest-vm-test.nix { inherit kernel initrd vm-test-lib; };
 }

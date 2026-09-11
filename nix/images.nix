@@ -12,6 +12,13 @@
   cloud-hypervisor,
   kubernix-server,
   kubernix-worker,
+  # Phase 15's per-tenant guest VM (`nix/guest-vm.nix`) — baked into this
+  # image unconditionally, not left to the chart to supply. Per-tenant VM
+  # isolation is the only mode this worker runs in (see the Env comment
+  # below); a kernel/initrd pair the image doesn't ship would make that a
+  # deployment-time footgun instead of something that just works.
+  guestVmKernel,
+  guestVmInitrd,
 }:
 
 {
@@ -35,17 +42,28 @@
     name = "kubernix-worker";
     tag = "latest";
     # No /tmp at all otherwise — dockerTools doesn't create one by default,
-    # and Nix needs real scratch space there for every build.
-    extraCommands = "mkdir -p tmp && chmod 1777 tmp";
+    # and Nix needs real scratch space there for every build. The
+    # `guest-vm/{bzImage,initrd}` symlinks give `KUBERNIX_VM_KERNEL`/
+    # `KUBERNIX_VM_INITRD` below a stable path, since the underlying
+    # `/nix/store/<hash>-...` path isn't something the chart should have to
+    # know at deploy time.
+    extraCommands = ''
+      mkdir -p tmp && chmod 1777 tmp
+      mkdir -p guest-vm
+      ln -s ${guestVmKernel}/bzImage guest-vm/bzImage
+      ln -s ${guestVmInitrd}/initrd guest-vm/initrd
+    '';
     contents = [
       kubernix-worker
       # Mirrors `nix/module.nix`'s `path = [ pkgs.lix pkgs.cloud-hypervisor ]`
       # for `systemd.services.kubernix-worker`: the worker shells out to
-      # `nix-store`/`nix` and, when Phase 15's per-tenant VM feature is
-      # enabled, `cloud-hypervisor` itself.
+      # `nix-store`/`nix`, and drives the per-tenant guest VM via
+      # `cloud-hypervisor` itself (see the Env comment below).
       lix
       cloud-hypervisor
       cacert
+      guestVmKernel
+      guestVmInitrd
     ];
     config = {
       Cmd = [ "${kubernix-worker}/bin/kubernix-worker" ];
@@ -63,6 +81,16 @@
         # derivations at all. Whatever runs this image just needs to mount
         # writable storage at /var/lib/kubernix-worker.
         "KUBERNIX_NIX_STORE=local?root=/var/lib/kubernix-worker/store"
+        # Per-tenant `cloud-hypervisor` VM isolation (PLAN.md Phase 15) is
+        # the only mode this worker runs jobs in — these two make
+        # `worker/src/vm.rs::VmConfig::from_env` construct a `VmPool`
+        # unconditionally, rather than being a deployment-time opt-in (see
+        # `nix/module.nix`'s `vmKernel`/`vmInitrd`, which stay optional for
+        # the NixOS module's own dev/test uses). `KUBERNIX_NIX_STORE` above
+        # remains what a job falls back to only if that specific job's VM
+        # fails to boot or connect — not a parallel supported mode.
+        "KUBERNIX_VM_KERNEL=/guest-vm/bzImage"
+        "KUBERNIX_VM_INITRD=/guest-vm/initrd"
         # The worker's own container is already namespaced by its
         # container runtime; nesting Nix's build sandbox inside that needs
         # unprivileged user namespaces, which most Kubernetes nodes don't
