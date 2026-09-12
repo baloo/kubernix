@@ -1,0 +1,25 @@
+[package]
+name = "kubernix-guest-init"
+version = "0.1.0"
+edition = "2024"
+
+# The outer initramfs' entire `/init` -- everything else the guest needs
+# (`guest-agent`, `nix-daemon`, ...) lives in `/root.img` instead, an EROFS
+# image loop-mounted and chrooted into by this binary before it execs the
+# real `/init` inside that chroot. See `nix/guest-vm.nix`'s module doc for
+# why: `pivot_root` (which a sandboxed Nix build does internally) refuses to
+# run from the kernel's anonymous initramfs root, because that root has no
+# parent mount (`mnt_has_parent()` in the kernel is false for it) -- and
+# nothing can give it one except a real `mount()` from something running as
+# init, once, before anything else happens. `chroot` into a freshly
+# loop-mounted filesystem is the cheapest way to do that: the new root is a
+# real mount, parented by the original one, and every process that inherits
+# the chroot (everything from here on) sees a root `pivot_root` is willing
+# to leave.
+#
+# Deliberately dependency-free beyond `libc`: this runs before `/dev`,
+# `/proc`, or any shared library outside its own static binary exists, so
+# there is nothing here for a heavier runtime (tokio, an allocator crate,
+# anything with its own dynamic dependencies) to usefully sit on top of.
+[dependencies]
+libc = "0.2"

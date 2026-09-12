@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "daemon-protocol",
     "guest-agent",
+    "guest-init",
     "server",
     "signing",
     "types",

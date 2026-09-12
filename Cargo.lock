@@ -2512,6 +2512,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kubernix-guest-init"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "kubernix-server"
 version = "0.1.0"
 dependencies = [

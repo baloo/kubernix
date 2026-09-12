@@ -7,9 +7,21 @@
 # its control vsock channel (`guest-agent/src/main.rs::handle_control`), not
 # as plaintext. Everything else -- `guest-agent`, `nix-daemon`, `cryptsetup`,
 # `mkfs.ext4`/`mount`, and their shared-library closures -- lives in the
-# initrd itself, which is also the guest's *entire* root filesystem; there is
-# still no separate disk image to boot the guest's own root from.
-{ pkgs, lib, kubernix-guest-agent, vm-test-lib }:
+# initrd itself; there is still no separate disk image to boot the guest's
+# own root from.
+#
+# The boot initramfs is two stages, not one, for a reason that only showed up
+# once sandboxed builds worked at all: a sandboxed build's own `pivot_root`
+# unconditionally fails when run from the kernel's anonymous initial root
+# (`mnt_has_parent()` is false for it -- see `kubernix-guest-init`'s own doc
+# comment for the full mechanism), and nothing can give that root a parent
+# except a real `mount()` from whatever runs as `/init`. So `/init` here is
+# `kubernix-guest-init`, a tiny trampoline that loop-mounts `rootImg` (an
+# EROFS image holding everything below) and `chroot`s into it before handing
+# off to the *real* `/init` (`guest-agent`) inside that mount -- which, being
+# a real mount with a real parent, is a root `pivot_root` is willing to leave
+# later on.
+{ pkgs, lib, kubernix-guest-agent, kubernix-guest-init, vm-test-lib }:
 
 let
   # A from-scratch minimal config, not nixpkgs' general-purpose default with a
@@ -119,6 +131,65 @@ let
       # interrupts (modern virtio-pci wants MSI-X, not legacy INTx).
       PCI_MSI = yes;
 
+      # Nix's own build sandbox (user/mount/pid/ipc/uts/net/cgroup
+      # namespaces) is the entire reason a build runs inside this VM rather
+      # than in the worker's own container — the worker can't nest namespaces
+      # under Kubernetes, so this guest is what actually provides Nix the
+      # isolation it wants. `tinyconfig`'s `EXPERT`/`!MULTIUSER` defaults turn
+      # every one of these off; `nix-daemon`'s
+      # `libexec/lix/check-namespace-support` probe and its real sandbox
+      # setup (`libstore/platform/linux.cc`, `libexec/launch-builder-linux.cc`)
+      # between them `clone`/`unshare` every namespace type below, so all of
+      # them have to actually work, not just the ones the probe happens to
+      # check.
+      MULTIUSER = yes; # NAMESPACES depends on this.
+      NAMESPACES = yes;
+      USER_NS = yes;
+      PID_NS = yes;
+      UTS_NS = yes;
+      NET_NS = yes; # depends on NET, already enabled above.
+      IPC_NS = yes;
+      SYSVIPC = yes; # IPC_NS depends on (SYSVIPC || POSIX_MQUEUE).
+      CGROUPS = yes; # launch-builder unshares CLONE_NEWCGROUP too.
+      # `local-derivation-goal.cc` opens the builder's controlling PTY
+      # master (`/dev/ptmx`) before entering the sandbox at all -- without
+      # Unix98 PTY support there is no `/dev/ptmx` node for devtmpfs to have
+      # created, so the open fails outright with plain ENOENT. This is also
+      # what allocates the paired slave via `devpts`, mounted at `/dev/pts`
+      # by `guest-agent` alongside `/proc`/`/sys` -- `devpts` used to be a
+      # separately toggled `DEVPTS_FS` symbol, folded into this one by this
+      # kernel version (strict `ignoreConfigErrors = false` below is what
+      # caught that it no longer exists at all).
+      UNIX98_PTYS = yes;
+      # The sandbox's own syscall filter (`local-derivation-goal.cc`,
+      # applied inside the builder after the namespace/chroot setup above
+      # all already succeeded) — without it, loading the BPF program fails
+      # outright with ENOSYS ("Function not implemented").
+      SECCOMP = yes;
+      SECCOMP_FILTER = yes;
+      # The sandboxed build's private network namespace still needs a real
+      # AF_INET to set up its loopback interface — `NET`/`NET_NS` alone only
+      # get the namespace itself, not the IP protocol family inside it.
+      INET = yes;
+      # `/tmp` is where `guest-agent` points Nix's own `build-dir` setting
+      # (see its `spawn_nix_daemon` doc comment) -- a real filesystem there,
+      # same as a normally-booted system already has, rather than more of
+      # the anonymous initramfs root a `pivot_root`-ing sandbox can't use.
+      # `SHMEM` is `TMPFS`'s actual dependency, normally defaulted `y` --
+      # except `tinyconfig`'s `EXPERT` turns that default into a real
+      # question this config would otherwise never answer.
+      SHMEM = yes;
+      TMPFS = yes;
+      # `kubernix-guest-init` (the outer initramfs' `/init`) loop-mounts an
+      # EROFS image before anything else runs -- both have to be *built in*,
+      # not modules: no `modprobe` (no `/sbin/modprobe`, no `/lib/modules`,
+      # nothing outside the trampoline's own static binary at all) exists yet
+      # at that point for a module to even be loadable from.
+      BLK_DEV = yes; # gates the whole "Block devices" menu, including LOOP.
+      BLK_DEV_LOOP = yes;
+      MISC_FILESYSTEMS = yes; # gates fs/Kconfig's `if MISC_FILESYSTEMS` block, which is where EROFS_FS actually lives.
+      EROFS_FS = yes;
+
       # Menu/gate symbols that have to be enabled before the options they
       # guard are even reachable -- without these, `structuredExtraConfig`
       # below fails outright with "unused option" for every virtio, crypto,
@@ -162,12 +233,18 @@ let
       EXT4_FS = yes;
       OVERLAY_FS = yes;
     };
-    # Building from `tinyconfig` instead of the validated stock default means
-    # there is more room for an unanswered dependency to fall through to a
-    # Kconfig default that doesn't boot -- expect this list to grow via the
-    # same build-boot-read-the-panic-add-the-symbol loop Step 4's guest-side
-    # gaps were found by (see PLAN.md's Phase 15 status note).
-    ignoreConfigErrors = true;
+    # `false`, not the `true` this carried through most of Step 4: nixpkgs'
+    # `generate-config.pl` already compares every answer above against what
+    # actually landed in the final `.config` -- `ignoreConfigErrors` only
+    # controls whether a mismatch (an unmet dependency silently falling back
+    # to `n`, most often because a menu/gate symbol upstream of it was never
+    # turned on) is a hard build failure or a `warn` buried in build output.
+    # `EROFS_FS` sitting behind `MISC_FILESYSTEMS`'s menu gate did exactly
+    # that -- accepted by the build, silently `n` in the actual kernel, and
+    # only surfaced as a boot-time "No such device" mounting it. `false`
+    # turns every future version of that same mistake into a build failure
+    # instead of another boot-panic-add-the-symbol round trip.
+    ignoreConfigErrors = false;
   };
 
   # `BLK_DEV_DM`/`DM_CRYPT`/`CRYPTO_AES`/`CRYPTO_XTS` above are modules, not
@@ -198,19 +275,36 @@ let
     nixbld:x:30000:nixbld1
   '';
 
+  # `nix-store -qR pkgs.lix`, computed at eval time: every store path
+  # `nix-daemon` might need at runtime, not just the ones its own dependency
+  # graph makes obvious — see the `contents` list below for why this exists.
+  lixClosurePaths = builtins.filter (p: p != "") (
+    lib.splitString "\n" (
+      lib.fileContents "${pkgs.closureInfo { rootPaths = [ pkgs.lix ]; }}/store-paths"
+    )
+  );
+
   # `makeInitrdNG`'s `source`/`target` contents list does not copy whole
   # closures -- it walks each source's *direct* ELF/symlink/directory
   # dependencies and includes exactly those (see
   # `pkgs/build-support/kernel/make-initrd-ng/README.md`), so every binary
   # below has its shared libraries pulled in automatically without this file
   # having to enumerate them.
-  initrd = pkgs.makeInitrdNG {
-    name = "kubernix-guest-vm-initrd";
-    compressor = "zstd";
+  #
+  # This builds the content that goes *inside* `rootImg` below, not the boot
+  # initramfs itself -- `compressor = "cat"` leaves it as a plain, uncompressed
+  # cpio archive, since it only ever exists to be immediately unpacked again
+  # into `rootImg`'s staging directory; compressing it here would just be
+  # wasted work undone one derivation later.
+  rootContentCpio = pkgs.makeInitrdNG {
+    name = "kubernix-guest-vm-root-content";
+    compressor = "cat";
     contents = [
       # `guest-agent` *is* the guest's init: no systemd, no udev, nothing
-      # else runs in this VM (PLAN.md Phase 15's explicit call-out). The
-      # kernel execs whatever `/init` resolves to as PID 1.
+      # else runs in this VM (PLAN.md Phase 15's explicit call-out) --
+      # `kubernix-guest-init` execs this exact path once it has chrooted into
+      # `rootImg`, the same way the kernel would exec `/init` directly if
+      # this weren't a two-stage boot.
       {
         source = "${kubernix-guest-agent}/bin/kubernix-guest-agent";
         target = "/init";
@@ -266,6 +360,69 @@ let
       {
         source = group;
         target = "/etc/group";
+      }
+    ]
+    # `nix-daemon`'s sandboxed build path execs a handful of its own
+    # `libexec/lix` helpers (`check-namespace-support`, `launch-builder`,
+    # ...) by their exact, compile-time-baked-in store path, and separately
+    # needs *its own* default sandbox-shell binary (`busybox`, for any
+    # derivation whose builder is `/bin/sh` — effectively all of nixpkgs)
+    # bind-mounted into the sandbox from that same fixed path. Naming these
+    # one at a time as they turned up (`check-namespace-support` today,
+    # something else next) is exactly the whack-a-mole this is deliberately
+    # not doing instead: `closureInfo` is the same query `nix-store -qR`
+    # answers, over `pkgs.lix` itself, so every store path `nix-daemon`
+    # could ever reference — reachable by dependency *or* found by scanning
+    # its own binary for embedded store-path references, which is how a
+    # baked-in default like the sandbox shell shows up here at all — lands
+    # in the image. No `target` on any of them: `makeInitrdNG` already
+    # places every `source` at its own real `/nix/store/...` path
+    # unconditionally, which is exactly the property being relied on —
+    # whatever path `nix-daemon` goes looking for is simply already there.
+    ++ map (path: { source = path; }) lixClosurePaths;
+  };
+
+  # `rootContentCpio` unpacked into a plain directory, then packed as an
+  # EROFS image instead of (another) cpio -- this is what `kubernix-guest
+  # -init` loop-mounts and `chroot`s into. Uncompressed for now: `mkfs.erofs`
+  # supports per-file compression (`-zlz4hc`), worth revisiting if image size
+  # becomes a real concern, but correctness came first.
+  rootImg = pkgs.runCommand "kubernix-guest-vm-root.img"
+    {
+      nativeBuildInputs = [ pkgs.erofs-utils pkgs.cpio ];
+    }
+    ''
+      mkdir root
+      (cd root && cpio -idm < ${rootContentCpio}/initrd)
+
+      # EROFS is read-only, so nothing that mounts onto it at runtime can
+      # `mkdir` its own mountpoint first the way it could on the old
+      # writable initramfs root -- every directory anything ever mounts
+      # onto directly has to already exist here. `guest-agent`'s own
+      # `create_dir_all` calls still run (harmlessly idempotent once these
+      # already exist) and still handle anything nested *under* one of
+      # these once it's live and writable (`/dev/pts` under the `devtmpfs`
+      # this mounts at `/dev`, for instance) -- only the top-level
+      # mountpoints themselves need to be listed here.
+      mkdir -p root/{dev,proc,sys,home,root,var,nix/var,mnt/store-raw,mnt/store-lower}
+
+      mkfs.erofs "$out" root
+    '';
+
+  # The actual boot initramfs: just the trampoline and the image it mounts —
+  # see this file's own module doc for why booting straight into
+  # `rootContentCpio` above isn't an option anymore.
+  initrd = pkgs.makeInitrdNG {
+    name = "kubernix-guest-vm-initrd";
+    compressor = "zstd";
+    contents = [
+      {
+        source = "${kubernix-guest-init}/bin/kubernix-guest-init";
+        target = "/init";
+      }
+      {
+        source = rootImg;
+        target = "/root.img";
       }
     ];
   };

@@ -158,7 +158,27 @@ async fn main() -> Result<()> {
     // systemd-free guest mounts these, but `cryptsetup`/`libdevmapper`
     // reads `/proc` (misc-device major/minor lookup, among other things)
     // even when `/dev/mapper/control` already exists.
-    for (fstype, target) in [("proc", "/proc"), ("sysfs", "/sys")] {
+    // `devpts`, not `devtmpfs` above, is what actually allocates a sandboxed
+    // build's controlling PTY slave once it opens `/dev/ptmx` -- without
+    // this mounted, that open fails outright (`local-derivation-goal.cc`
+    // does it before the build's own mount namespace even exists, so this
+    // has to be visible here, in the guest's root namespace).
+    //
+    // `/tmp` is where this points Nix's own `build-dir` setting (see
+    // `spawn_nix_daemon`'s doc comment), and `/nix/var` is Nix's state
+    // directory (its path/GC-roots database, temp roots, ...) -- `nix
+    // -daemon` `mkdir`s directly inside both itself, which the read-only
+    // EROFS root (`nix/guest-vm.nix`'s `rootImg`) can never allow no matter
+    // how the directory got there. Everything else in this list only needs
+    // an empty directory to mount *onto*, which `rootImg` ships pre-made
+    // for exactly that reason; these two need to be writable themselves.
+    for (fstype, target) in [
+        ("proc", "/proc"),
+        ("sysfs", "/sys"),
+        ("devpts", "/dev/pts"),
+        ("tmpfs", "/tmp"),
+        ("tmpfs", "/nix/var"),
+    ] {
         if let Err(err) = std::fs::create_dir_all(target) {
             eprintln!("guest-agent: creating {target} failed: {err}");
         }
@@ -636,6 +656,13 @@ where
 fn spawn_nix_daemon() -> Result<Child> {
     Command::new(NIX_DAEMON_BIN)
         .arg("--stdio")
+        // `build-dir`'s compiled-in default (`<nixStateDir>/b`) resolves
+        // somewhere this guest never created and has no reason to trust is
+        // on the `tmpfs` mounted at `/tmp` above — pinning it there
+        // directly is what actually makes the sandbox's `pivot_root`
+        // work, since that needs its chroot directory on a real mount,
+        // not wherever the default happened to land.
+        .env("NIX_CONFIG", "build-dir = /tmp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
