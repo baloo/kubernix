@@ -43,8 +43,6 @@ pub enum DaemonError {
     UnsupportedVersion(u64),
     #[error("daemon reported an unexpected message tag {0:#x}")]
     UnknownTag(u64),
-    #[error("build result carried unsupported realisations (count {0})")]
-    UnsupportedRealisations(u64),
     #[error("{0}")]
     Nar(#[from] NarError),
     /// `STDERR_ERROR`'s payload: the daemon's own error message.
@@ -227,15 +225,20 @@ where
         self.stream.read_wire_u64().await?; // startTime
         self.stream.read_wire_u64().await?; // stopTime
 
-        // `builtOutputs`, a map of realisations — always empty for the
-        // input-addressed derivations this worker builds today (same
-        // assumption `serve.rs` makes). A nonempty map means something this
-        // client was never built to speak `Realisation`'s own encoding for,
-        // so it fails loudly rather than desynchronising the stream on a
-        // guess.
+        // `builtOutputs`, a map of realisations. `serve.rs`'s equivalent
+        // read has the full story: Lix's `LocalDerivationGoal::registerOutputs`
+        // (`local-derivation-goal.cc`) populates one `Realisation` per output
+        // unconditionally — "it's fine to do in all cases", not gated behind
+        // the `ca-derivations` experimental feature the way it is upstream —
+        // so a real Lix daemon sends a nonempty map here even for the plain
+        // input-addressed derivations this worker builds. Draining each
+        // entry (a `DrvOutput` key, a JSON-encoded `Realisation` value, both
+        // plain wire strings — `common-protocol.cc`) keeps the stream in
+        // step; nothing here is otherwise acted on.
         let realisations = self.stream.read_wire_u64().await?;
-        if realisations != 0 {
-            return Err(DaemonError::UnsupportedRealisations(realisations));
+        for _ in 0..realisations {
+            self.stream.read_wire_str().await?; // DrvOutput
+            self.stream.read_wire_str().await?; // Realisation
         }
 
         Ok(BuildOutcome {
