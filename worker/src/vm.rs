@@ -266,7 +266,19 @@ impl VmLauncher for CloudHypervisorLauncher {
                 vsock_socket.display()
             ))
             .arg("--disk")
-            .arg(format!("path={}", store_img.display()))
+            // `image_type=raw` is not a formality — leaving it unspecified
+            // lets cloud-hypervisor's own format sniffing decide, and on a
+            // freshly `truncate`d sparse file that guessed wrong: `mkfs.ext4`
+            // reliably failed with a bare `Input/output error while writing
+            // out and closing file system`, on real cluster hardware, with
+            // no other symptom pointing at the cause. Every Nix-driven guest
+            // test (`nix/guest-vm-test.nix`, `nix/vm-encryption-test.nix`)
+            // already passed this explicitly, which is why they never caught
+            // it — only running against a real backing file, outside the
+            // Nix build sandbox, surfaced the gap. Isolated by bisecting a
+            // container-runtime probe against the exact production
+            // invocation, one flag at a time.
+            .arg(format!("path={},image_type=raw", store_img.display()))
             .arg("--console")
             .arg("off")
             .arg("--serial")
