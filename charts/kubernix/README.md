@@ -24,34 +24,39 @@ JetStream.
   before `plugin-barman-cloud`'s `Certificate`/`Issuer` can — see the
   Quickstart's staged install below.
 - **NATS**, with JetStream forced on — the job queue `kubernix-worker`/
-  `kubernix-sshd` require.
+  `kubernix-sshd` require. `nats.service.ports.monitor.enabled: true` also
+  exposes its monitoring HTTP API (port 8222) so `worker.autoscaling`'s KEDA
+  scaler can query queue depth.
+- **[KEDA](https://keda.sh/)**, bundled alongside the operators below under
+  its own `keda.enabled` condition — scales the worker Deployment
+  (`worker.autoscaling`) on `kubernix_jobs`' NATS JetStream queue depth.
 - **S3-compatible object storage** stays external (`s3.*` in `values.yaml`) —
   no MinIO subchart. Point it at a real bucket, or a MinIO you run yourself.
 
-### `certManager.enabled`/`cnpg.enabled`: bundled operators vs. cluster-shared ones
+### `certManager.enabled`/`cnpg.enabled`/`keda.enabled`: bundled operators vs. cluster-shared ones
 
-`Chart.yaml` lists `cert-manager`, `cloudnative-pg`, and `plugin-barman-cloud` as dependencies.
-All three install **cluster-scoped** CRDs + a controller — normally a once-per-cluster install, not
-something every application release should bring its own copy of.
+`Chart.yaml` lists `cert-manager`, `cloudnative-pg`, `plugin-barman-cloud`, and `keda` as
+dependencies. All install **cluster-scoped** CRDs + a controller — normally a once-per-cluster
+install, not something every application release should bring its own copy of.
 
-- **Single-tenant cluster, or trying this chart out**: leave both `certManager.enabled` and
-  `cnpg.enabled` at `true` (the defaults). `helm install`/`helm upgrade` (staged — see Quickstart)
-  brings up cert-manager, the CNPG operator, the plugin, and this release's `Cluster` together.
-- **Shared cluster that already runs these**: set `certManager.enabled: false` and/or
-  `cnpg.enabled: false` for whichever of them the cluster already has. With both false, this chart
-  only creates its own `Cluster`/`ObjectStore`/`ScheduledBackup` resources
-  (`templates/postgres-*.yaml`, still gated by `postgres.cluster.enabled` — see Quickstart) and the
-  `db-role-passwords-job` hook that provisions `kubernix_app`/`kubernix_gc`'s passwords — it expects
-  cert-manager, the operator, and the plugin to already be running cluster-wide.
+- **Single-tenant cluster, or trying this chart out**: leave `certManager.enabled`, `cnpg.enabled`
+  and `keda.enabled` at `true` (the defaults). `helm install`/`helm upgrade` (staged — see
+  Quickstart) brings up cert-manager, the CNPG operator, the plugin, KEDA, and this release's
+  `Cluster` together.
+- **Shared cluster that already runs these**: set `certManager.enabled: false`, `cnpg.enabled:
+  false` and/or `keda.enabled: false` for whichever of them the cluster already has. With
+  `certManager`/`cnpg` both false, this chart only creates its own
+  `Cluster`/`ObjectStore`/`ScheduledBackup` resources (`templates/postgres-*.yaml`, still gated by
+  `postgres.cluster.enabled` — see Quickstart) and the `db-role-passwords-job` hook that provisions
+  `kubernix_app`/`kubernix_gc`'s passwords — it expects cert-manager, the operator, and the plugin
+  to already be running cluster-wide. With `keda` false, it expects KEDA's CRDs/controller to
+  already be registered before `worker.autoscaling.enabled` is turned on.
 
 ## Known v1 limitations
 
 - `kubernix-sshd` runs as a single replica (`sshd.replicas` isn't
   configurable): its generated SSH host key and any in-flight session live on
   one pod. See `PLAN.md` Phase 13.
-- No KEDA autoscaling on NATS queue depth for the worker pool yet
-  (`worker.autoscaling.enabled` is a stub for that follow-up) — scale
-  `worker.replicas` manually in the meantime.
 - Phase 15's per-tenant `cloud-hypervisor` VM isolation is the only mode the
   worker runs jobs in (`worker.vm.*` sizes each tenant's VM); this needs a
   `devices.kubevirt.io/kvm`-style device-plugin DaemonSet already running on
@@ -92,3 +97,19 @@ helm upgrade kubernix charts/kubernix -n kubernix
 On a cluster that already has cert-manager and/or CNPG/plugin-barman-cloud running
 (`certManager.enabled: false`/`cnpg.enabled: false`) or already has their CRDs registered from a
 previous install, skip straight past the corresponding pass(es).
+
+### Enabling worker autoscaling
+
+`worker.autoscaling.enabled` defaults to `false` for the same CRD-ordering reason as
+`postgres.cluster.enabled` above: KEDA's `ScaledObject` kind can't land in the same `helm install`
+that first registers KEDA's own CRDs. Once the passes above have brought KEDA up (or it's already
+running cluster-wide with `keda.enabled: false`):
+
+```console
+helm upgrade kubernix charts/kubernix -n kubernix --set worker.autoscaling.enabled=true
+```
+
+This creates a `ScaledObject` that scales the worker Deployment on `kubernix_jobs`' durable
+per-system consumer (`worker/src/main.rs`) — including down to `minReplicaCount: 0` when idle. That
+works because the consumer is *durable*: its pending-message count stays queryable via NATS'
+monitoring API with no worker pod running, which is what lets KEDA scale back up from zero.

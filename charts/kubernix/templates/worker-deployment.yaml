@@ -5,7 +5,12 @@ metadata:
   labels:
     {{- include "kubernix.labels" . | nindent 4 }}
 spec:
+  # Omitted (not set to 0/left implicit) once KEDA owns scaling: an absent
+  # field isn't patched to a value on `helm upgrade`, so it can't fight the
+  # HPA KEDA's ScaledObject creates for this Deployment's replica count.
+  {{- if not .Values.worker.autoscaling.enabled }}
   replicas: {{ .Values.worker.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "kubernix.selectorLabels" (dict "context" $ "component" "worker") | nindent 6 }}

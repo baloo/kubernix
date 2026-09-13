@@ -40,3 +40,14 @@ dependencies:
     version: "2.14.6"
     repository: https://nats-io.github.io/k8s/helm/charts/
     condition: nats.enabled
+  # The KEDA operator (cluster-scoped CRDs + controller) — same once-per-
+  # cluster caveat as cloudnative-pg/cert-manager above. Its CRDs live under
+  # its own `templates/crds/`, not Helm's install-once `crds/` directory, so
+  # a `ScaledObject` can't land in the same `helm install` that first
+  # registers them — `worker.autoscaling.enabled` (default `false`) is what
+  # forces the staged install, the same role `postgres.cluster.enabled` plays
+  # for cnpg. See the README.
+  - name: keda
+    version: "2.20.2"
+    repository: https://kedacore.github.io/charts
+    condition: keda.enabled

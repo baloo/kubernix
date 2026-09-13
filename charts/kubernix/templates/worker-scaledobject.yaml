@@ -1,0 +1,30 @@
+{{- if .Values.worker.autoscaling.enabled }}
+# Scales the worker Deployment on kubernix_jobs' NATS JetStream queue depth.
+# Requires the `keda` dependency's CRDs already registered on the cluster —
+# see values.yaml's comment on worker.autoscaling and the README's Quickstart
+# for the staged-install this forces (same shape as postgres.cluster.enabled).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ printf "%s-worker" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ printf "%s-worker" (include "kubernix.fullname" .) }}
+  minReplicaCount: {{ .Values.worker.autoscaling.minReplicaCount }}
+  maxReplicaCount: {{ .Values.worker.autoscaling.maxReplicaCount }}
+  pollingInterval: {{ .Values.worker.autoscaling.pollingInterval }}
+  cooldownPeriod: {{ .Values.worker.autoscaling.cooldownPeriod }}
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        account: "$G"
+        natsServerMonitoringEndpoint: {{ printf "%s-nats:8222" (include "kubernix.fullname" .) | quote }}
+        stream: kubernix_jobs
+        # Must match worker/src/main.rs's durable consumer name exactly:
+        # `format!("worker-{}", system.replace('-', "_"))`.
+        consumer: {{ printf "worker-%s" (.Values.worker.system | replace "-" "_") | quote }}
+        lagThreshold: {{ .Values.worker.autoscaling.lagThreshold | quote }}
+        activationLagThreshold: {{ .Values.worker.autoscaling.activationLagThreshold | quote }}
+{{- end }}

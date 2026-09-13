@@ -78,6 +78,14 @@ nats:
   config:
     jetstream:
       enabled: true
+  # The NATS process already exposes its monitoring HTTP API
+  # (config.monitor, port 8222) by default, but the subchart's own Service
+  # doesn't forward it unless asked — needed so KEDA's nats-jetstream scaler
+  # (worker.autoscaling) can query queue depth from outside the pod.
+  service:
+    ports:
+      monitor:
+        enabled: true
 
 # Own condition, not folded into cnpg.enabled — see Chart.yaml's comment on
 # the cert-manager dependency for why installing this one stage earlier
@@ -86,6 +94,12 @@ certManager:
   enabled: true
 
 cnpg:
+  enabled: true
+
+# The KEDA operator (cluster-scoped CRDs + controller), bundled the same way
+# cert-manager/cnpg are — see the README's note on bundled-vs-cluster-shared
+# operators before disabling this on a cluster that already runs one.
+keda:
   enabled: true
 
 # Values passed through to the cert-manager subchart itself. It doesn't
@@ -173,10 +187,34 @@ worker:
     memoryMb: 768
     storeImgMb: 8192
     kvmResourceName: devices.kubevirt.io/kvm
-  # KEDA scaling on NATS queue depth (PLAN.md Phase 13) isn't wired up here
-  # either; this stub is left for that follow-up.
+  # KEDA scaling (PLAN.md Phase 13 / Phase 15 Step 7) on kubernix_jobs'
+  # per-system durable consumer (worker/src/main.rs, `worker-<system>` with
+  # dashes replaced by underscores — must track that naming exactly). Left
+  # disabled by default: enabling it needs the `keda` dependency's CRDs
+  # already registered on the cluster first (see the README's Quickstart) —
+  # a `helm install`/`helm upgrade` with this at its default `false`, then a
+  # second `helm upgrade --set worker.autoscaling.enabled=true`.
+  #
+  # minReplicaCount: 0 relies on the consumer being *durable* — its pending-
+  # message count stays queryable via NATS' monitoring API even with no
+  # worker pod running, which is what makes scaling back up from zero
+  # possible at all.
   autoscaling:
     enabled: false
+    minReplicaCount: 0
+    maxReplicaCount: 10
+    # KEDA scaler metadata is string-typed, hence the quotes. lagThreshold
+    # targets ~5 pending jobs per active replica; activationLagThreshold is
+    # KEDA's separate 0→1 threshold (lagThreshold alone only governs scaling
+    # among already-active replicas). KEDA's nats-jetstream scaler activates
+    # on lag > activationLagThreshold (strictly greater than, not >=) — found
+    # live: "1" here meant a single queued job never activated the scaler at
+    # all, since num_pending == 1 is not > 1. "0" activates on any pending
+    # message, which is what a single one-off build needs.
+    lagThreshold: "5"
+    activationLagThreshold: "0"
+    pollingInterval: 15
+    cooldownPeriod: 300
   resources: {}
   nodeSelector: {}
   tolerations: []
