@@ -94,7 +94,7 @@ sshd:
   # there is no per-deployment auth setting here any more.
   service:
     type: LoadBalancer
-    port: 2222
+    port: 22
   resources: {}
   nodeSelector: {}
   tolerations: []

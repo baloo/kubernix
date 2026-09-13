@@ -4,3 +4,7 @@ target/
 plugin/build/
 
 result*
+
+# Deployment-specific Helm overrides (endpoints, secret names) that
+# shouldn't land in this public repo's tracked chart defaults.
+charts/kubernix/values.local.yaml
