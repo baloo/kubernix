@@ -288,7 +288,11 @@ where
     /// `Op::NarFromPath` (`remote-store.cc:726-750`): the reply is a raw,
     /// self-delimiting NAR with no length of its own — see [`crate::nar`] for
     /// why that needs a structural walk rather than a byte copy.
-    pub async fn nar_from_path<W>(&mut self, store_path: &str, sink: &mut W) -> Result<(), DaemonError>
+    pub async fn nar_from_path<W>(
+        &mut self,
+        store_path: &str,
+        sink: &mut W,
+    ) -> Result<(), DaemonError>
     where
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -377,7 +381,10 @@ impl<W: tokio::io::AsyncWrite + Unpin> RawWrite for W {
 /// Activity start/stop/result frames are read and discarded rather than acted
 /// on — this client has no live progress display — but every field still has
 /// to be consumed in order, or the next read desynchronises.
-async fn drain_stderr<S>(stream: &mut S, mut log: Option<&mut Vec<String>>) -> Result<(), DaemonError>
+async fn drain_stderr<S>(
+    stream: &mut S,
+    mut log: Option<&mut Vec<String>>,
+) -> Result<(), DaemonError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -665,7 +672,12 @@ mod tests {
             written: Vec::new(),
         };
         let mut conn = DaemonConnection::open(stream).await.unwrap();
-        assert!(conn.query_path_info("/nix/store/xxx-foo").await.unwrap().is_none());
+        assert!(
+            conn.query_path_info("/nix/store/xxx-foo")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -780,6 +792,9 @@ mod tests {
             u64::from_le_bytes(chunk_len_bytes.try_into().unwrap()),
             nar.len() as u64
         );
-        assert_eq!(&written[chunk_start + 8..chunk_start + 8 + nar.len()], &nar[..]);
+        assert_eq!(
+            &written[chunk_start + 8..chunk_start + 8 + nar.len()],
+            &nar[..]
+        );
     }
 }

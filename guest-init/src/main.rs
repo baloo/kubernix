@@ -147,7 +147,11 @@ fn main() {
     unsafe { libc::close(ctl_fd) };
 
     let loop_path = format!("/dev/loop{loop_num}");
-    mknod(&loop_path, libc::S_IFBLK | 0o600, makedev(7, loop_num as u32));
+    mknod(
+        &loop_path,
+        libc::S_IFBLK | 0o600,
+        makedev(7, loop_num as u32),
+    );
 
     let backing_fd = open("/root.img", libc::O_RDONLY);
     let loop_fd = open(&loop_path, libc::O_RDONLY);
@@ -157,8 +161,13 @@ fn main() {
     let mut config: LoopConfig = unsafe { std::mem::zeroed() };
     config.fd = backing_fd as u32;
     config.info.lo_flags = LO_FLAGS_READ_ONLY;
-    if unsafe { libc::ioctl(loop_fd, LOOP_CONFIGURE as _, &mut config as *mut _ as *mut c_void) }
-        != 0
+    if unsafe {
+        libc::ioctl(
+            loop_fd,
+            LOOP_CONFIGURE as _,
+            &mut config as *mut _ as *mut c_void,
+        )
+    } != 0
     {
         die("LOOP_CONFIGURE");
     }

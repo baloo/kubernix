@@ -146,6 +146,13 @@ nix-test-vm-build:
 nix-test-vm-encryption:
     nix-build nix -A vm-encryption-test
 
+# Phase 15 Step 5: boot the guest against a real `passt` vhost-user backend
+# (the same `--net vhost_user=...,vhost_mode=client` wiring
+# `worker/src/vm.rs` drives in production) and confirm guest-agent brings up
+# its network interface. Needs /dev/kvm, same as nix-test-guest-vm.
+nix-test-vm-network:
+    nix-build nix -A vm-network-test
+
 # Remove build artifacts.
 clean:
     cargo clean

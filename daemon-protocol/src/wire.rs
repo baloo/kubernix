@@ -114,7 +114,10 @@ mod tests {
         assert_eq!(cursor.read_wire_u64().await.unwrap(), 0x1122_3344_5566_7788);
         assert!(cursor.read_wire_bool().await.unwrap());
         assert_eq!(cursor.read_wire_str().await.unwrap(), "hello");
-        assert_eq!(cursor.read_wire_strings().await.unwrap(), vec!["a", "bc", ""]);
+        assert_eq!(
+            cursor.read_wire_strings().await.unwrap(),
+            vec!["a", "bc", ""]
+        );
     }
 
     #[tokio::test]

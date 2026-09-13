@@ -34,6 +34,12 @@ writeText "kubernix-vm-test-lib.sh" ''
   # this derivation's own stdout as it happens -- visible live in
   # `nix-build`'s output -- while `tee` still splits it into <console-log>
   # for callers that grep/cat it afterward.
+  # `shared=on` on `--memory` below is required for vhost-user net (Phase 15
+  # Step 5's `vm-network-test.nix`, which appends a `--net vhost_user=...`
+  # extra arg): the backend maps the guest's memory directly, needing a
+  # shared mapping cloud-hypervisor's private-by-default memory doesn't
+  # provide. Harmless for every other caller of this helper -- none of them
+  # care whether the mapping is shared or private.
   vm_boot() {
     local kernel="$1" initrd="$2" vsock_socket="$3" console_log="$4"
     shift 4
@@ -42,7 +48,7 @@ writeText "kubernix-vm-test-lib.sh" ''
       --initramfs "$initrd" \
       --cmdline "console=ttyS0 reboot=t panic=1" \
       --cpus boot=1 \
-      --memory size=768M \
+      --memory size=768M,shared=on \
       --vsock cid=3,socket="$vsock_socket" \
       --console off \
       --serial tty \

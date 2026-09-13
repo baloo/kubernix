@@ -10,6 +10,7 @@
   tzdata,
   lix,
   cloud-hypervisor,
+  passt,
   kubernix-server,
   kubernix-worker,
   # Phase 15's per-tenant guest VM (`nix/guest-vm.nix`) — baked into this
@@ -55,12 +56,18 @@
     '';
     contents = [
       kubernix-worker
-      # Mirrors `nix/module.nix`'s `path = [ pkgs.lix pkgs.cloud-hypervisor ]`
-      # for `systemd.services.kubernix-worker`: the worker shells out to
-      # `nix-store`/`nix`, and drives the per-tenant guest VM via
-      # `cloud-hypervisor` itself (see the Env comment below).
+      # Mirrors `nix/module.nix`'s
+      # `path = [ pkgs.lix pkgs.cloud-hypervisor pkgs.passt ]` for
+      # `systemd.services.kubernix-worker`: the worker shells out to
+      # `nix-store`/`nix`, drives the per-tenant guest VM via
+      # `cloud-hypervisor` itself (see the Env comment below), and (Phase 15
+      # Step 5) gives it network egress via `passt` as its vhost-user
+      # backend — unlike `nix/module.nix`'s `vmKernel`-gated `optionalAttrs`,
+      # VM isolation is unconditional in this image (see that comment below
+      # too), so `passt` is unconditional here as well, not behind a flag.
       lix
       cloud-hypervisor
+      passt
       cacert
       guestVmKernel
       guestVmInitrd

@@ -417,8 +417,11 @@ in {
         after = [ "network.target" "nats.service" ];
         # The worker shells out to `nix-store` and `nix store dump-path`, and,
         # when Phase 15's per-tenant VM lifecycle is enabled below, to
-        # `cloud-hypervisor` itself.
-        path = [ pkgs.lix pkgs.cloud-hypervisor ];
+        # `cloud-hypervisor` itself, plus (Step 5) `passt` as its network
+        # backend — both resolved via bare name on this `$PATH`, same as
+        # `KUBERNIX_VM_CH_BIN`'s default of `"cloud-hypervisor"` needs no
+        # explicit env var once the binary is on `path`.
+        path = [ pkgs.lix pkgs.cloud-hypervisor pkgs.passt ];
 
         environment = {
           NATS_URL = cfg_worker.natsUrl;
@@ -443,8 +446,11 @@ in {
         } // optionalAttrs (cfg_worker.vmKernel != null) {
           # cloud-hypervisor needs /dev/kvm; no non-KVM fallback exists.
           # Provisional, dev/test-only posture — cgroup device rules vs.
-          # `privileged: true`, and the `NET_ADMIN` Step 5's networking will
-          # need, are Step 7's job (Kubernetes manifests), not this module's.
+          # `privileged: true` are Step 7's job (Kubernetes manifests), not
+          # this module's. Networking (Step 5) needs no such addition here:
+          # `passt` runs as an ordinary unprivileged process needing no
+          # `NET_ADMIN`-equivalent capability at all — see PLAN.md's Phase 15
+          # Component 4 for why that was the point of choosing it.
           DeviceAllow = [ "/dev/kvm rw" ];
           SupplementaryGroups = [ "kvm" ];
         };

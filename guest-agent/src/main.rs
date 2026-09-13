@@ -12,6 +12,12 @@
 //!   — streams this process's `tracing` output to whoever connects. See the
 //!   "Logging" section below for why it's a separate channel.
 //!
+//! Also brings up its one virtio-net interface at startup (Phase 15 Step 5,
+//! [`configure_network`]) with a fixed, static address agreed by convention
+//! with the `passt` process `worker/src/vm.rs` spawns alongside this VM — see
+//! that function's doc comment for why this is static configuration and not
+//! a DHCP client.
+//!
 //! Deliberately dumb on the daemon port: unlike `worker/src/serve.rs`'s
 //! `ServeConnection`, which has to parse the `nix-store --serve` wire
 //! protocol because the frontend it talks to speaks that protocol,
@@ -48,7 +54,9 @@ use std::net::Shutdown;
 use std::process::Stdio;
 
 use eyre::{Context, Result, eyre};
-use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
+};
 use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
@@ -137,6 +145,22 @@ const MODPROBE_BIN: &str = "/sbin/modprobe";
 const CRYPTSETUP_BIN: &str = "/bin/cryptsetup";
 const MKFS_EXT4_BIN: &str = "/bin/mkfs.ext4";
 const MOUNT_BIN: &str = "/bin/mount";
+const IP_BIN: &str = "/bin/ip";
+
+/// The guest's virtio-net interface, as `VIRTIO_NET`'s driver names the
+/// first (and only) network device this guest ever sees.
+const NET_IFACE: &str = "eth0";
+
+/// Phase 15 Step 5's network link is a fixed, point-to-point address plan
+/// shared by convention with `worker/src/vm.rs`'s `passt` invocation (its
+/// `-a`/`-n`/`-g` flags), the same way `NIX_DAEMON_PORT`/`CONTROL_PORT` are
+/// shared with it above -- there is exactly one guest and one `passt`
+/// process on the other end of this link, so there is nothing to negotiate a
+/// dynamic address for, and no DHCP client needs to exist in this guest at
+/// all. `passt` itself is the gateway (it NATs everything the guest sends at
+/// this address out to the real network).
+const GUEST_ADDR: &str = "10.42.100.2/24";
+const GUEST_GATEWAY: &str = "10.42.100.1";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -187,6 +211,17 @@ async fn main() -> Result<()> {
         }
     }
     log_dev_contents();
+
+    // Phase 15 Step 5: bring up the guest's side of the `passt` link so
+    // `nix-daemon` can reach substituters directly. Best-effort like the
+    // mount loop above -- a VM booted without networking wired up (e.g. the
+    // Step 1-4 tests, which never pass `--net` at all) should still boot and
+    // serve builds against already-fetched inputs, just without substitution.
+    if let Err(err) = configure_network().await {
+        eprintln!("guest-agent: network configuration failed: {err}");
+    } else {
+        eprintln!("guest-agent: network configured: {NET_IFACE} {GUEST_ADDR} via {GUEST_GATEWAY}");
+    }
 
     // `tokio_vsock` (and anything else with its own tracing instrumentation)
     // gets turned down to `warn` by default so this stream stays focused on
@@ -510,6 +545,26 @@ async fn mount_store() -> Result<()> {
     )
     .await
     .wrap_err("mounting the overlay")
+}
+
+/// Static point-to-point bring-up of `NET_IFACE` against the `passt` link on
+/// the other end -- see `GUEST_ADDR`/`GUEST_GATEWAY`'s doc comment for why
+/// this is static configuration rather than a DHCP client. Three `ip`
+/// invocations, same shape as every other guest-side setup step
+/// (`unlock_and_mount` shells out to `cryptsetup`/`mkfs.ext4`/`mount` the
+/// same way): bring the link up, assign the fixed address, then point the
+/// default route at `passt` itself.
+async fn configure_network() -> Result<()> {
+    run(IP_BIN, &["link", "set", NET_IFACE, "up"])
+        .await
+        .wrap_err_with(|| format!("bringing up {NET_IFACE}"))?;
+    run(IP_BIN, &["addr", "add", GUEST_ADDR, "dev", NET_IFACE])
+        .await
+        .wrap_err_with(|| format!("assigning {GUEST_ADDR} to {NET_IFACE}"))?;
+    run(IP_BIN, &["route", "add", "default", "via", GUEST_GATEWAY])
+        .await
+        .wrap_err_with(|| format!("adding a default route via {GUEST_GATEWAY}"))?;
+    Ok(())
 }
 
 async fn run(bin: &str, args: &[&str]) -> Result<()> {

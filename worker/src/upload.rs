@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_compression::tokio::write::ZstdEncoder;
 use digest_io_async::{HashReader, HashWriter};
 use eyre::{Context as _, bail};
+use futures_util::StreamExt as _;
+use http_body::Frame;
+use http_body_util::StreamBody;
 use sha2::{Digest, Sha256, digest::Output};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -19,6 +22,57 @@ use tokio_util::io::InspectWriter;
 use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId};
 
 use crate::kubernix_capnp;
+
+/// A streaming request body that reports its exact length via `size_hint`.
+///
+/// `reqwest::Body::wrap_stream` has no way to know how many bytes a stream
+/// will produce, so hyper falls back to `Transfer-Encoding: chunked` even
+/// when a `Content-Length` header is set by hand alongside it — and a
+/// pre-signed S3 PUT is signed for a fixed-length request, so a chunked one
+/// is rejected outright with `HTTP 400`. This wraps the same stream in a
+/// body that *does* report its length (already known here, from spooling to
+/// a file first), which is what makes hyper use `Content-Length` framing.
+/// Found against a real S3-compatible endpoint — the permissive local mock
+/// `nix/test.nix` uses never exercised the difference, so Phase 5b's
+/// streaming rewrite looked complete without it.
+struct SizedBody<B> {
+    inner: B,
+    len: u64,
+}
+
+impl<B> http_body::Body for SizedBody<B>
+where
+    B: http_body::Body + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.len)
+    }
+}
+
+/// Build a `reqwest::Body` for a file of known length, spooled to disk —
+/// see [`SizedBody`]'s doc comment for why the length has to be declared
+/// through the body itself, not just the `Content-Length` header.
+pub(crate) fn sized_file_body(file: tokio::fs::File, len: u64) -> reqwest::Body {
+    let stream = tokio_util::io::ReaderStream::new(file).map(|chunk| chunk.map(Frame::data));
+    reqwest::Body::wrap(SizedBody {
+        inner: StreamBody::new(stream),
+        len,
+    })
+}
 
 /// Metadata the frontend needs to build a narinfo, which it cannot recompute
 /// because it never sees the build.
@@ -263,9 +317,10 @@ impl<'a> NixStore<'a> {
 
         // Streamed from disk with the length declared, so the request is one
         // the pre-signed URL will accept.
-        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(
+        let body = sized_file_body(
             tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?),
-        ));
+            file_size,
+        );
         let response = http
             .put(url)
             .header("content-type", "application/x-nix-nar-zstd")

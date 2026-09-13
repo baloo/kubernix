@@ -57,6 +57,20 @@ const NIX_DAEMON_PORT: u32 = 620;
 /// daemon-protocol traffic is sent to `NIX_DAEMON_PORT`.
 const CONTROL_PORT: u32 = 621;
 
+/// Phase 15 Step 5's fixed point-to-point address plan for the `passt` link,
+/// shared by convention with `guest-agent/src/main.rs`'s `configure_network`
+/// (`GUEST_ADDR`/`GUEST_GATEWAY` there) — duplicated for the same reason
+/// `NIX_DAEMON_PORT`/`CONTROL_PORT` are: the guest and the worker never build
+/// as one binary. There is exactly one guest and one `passt` process per VM,
+/// so a fixed address needs no allocation scheme.
+const NET_GUEST_ADDR: &str = "10.42.100.2";
+const NET_PREFIX: &str = "24";
+/// `passt` itself answers as this address — it's the `-g` gateway `passt`
+/// hands the guest, the address `passt` occupies on the link, *and* (`-D` in
+/// `passt_args`) where `passt` answers DNS queries the guest sends, since a
+/// statically-configured guest has no other way to learn a DNS address.
+const NET_GATEWAY: &str = "10.42.100.1";
+
 /// A tenant's plain-`dm-crypt` key: 256-bit, CSPRNG-generated, held only in
 /// this process's memory (see `VmPool::keys`). Never `Debug`/`Display` —
 /// accidentally logging one would defeat the entire point.
@@ -77,6 +91,11 @@ pub struct VmConfig {
     pub initrd: PathBuf,
     /// Resolved via `$PATH`, same convention as `KUBERNIX_NIX_BUILDER`.
     pub cloud_hypervisor: PathBuf,
+    /// Phase 15 Step 5: the userspace-NAT sibling process `CloudHypervisorLauncher::boot`
+    /// spawns before `cloud_hypervisor`, so its vhost-user socket exists by
+    /// the time `cloud-hypervisor` tries to dial it. Resolved via `$PATH`,
+    /// same convention as `cloud_hypervisor` above.
+    pub passt: PathBuf,
     pub vcpus: u32,
     pub memory_mb: u32,
     /// Logical size of a freshly created `store.img`. The file is sparse
@@ -115,12 +134,14 @@ impl VmConfig {
             .unwrap_or_else(|_| "/var/lib/kubernix-worker".to_string());
         let cloud_hypervisor =
             std::env::var("KUBERNIX_VM_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
+        let passt = std::env::var("KUBERNIX_VM_PASST_BIN").unwrap_or_else(|_| "passt".to_string());
 
         Ok(Some(VmConfig {
             state_dir: PathBuf::from(state_dir),
             kernel: PathBuf::from(kernel),
             initrd: PathBuf::from(initrd),
             cloud_hypervisor: PathBuf::from(cloud_hypervisor),
+            passt: PathBuf::from(passt),
             vcpus: parse_env_or("KUBERNIX_VM_VCPUS", 1)?,
             memory_mb: parse_env_or("KUBERNIX_VM_MEMORY_MB", 768)?,
             store_img_size_mb: parse_env_or("KUBERNIX_VM_STORE_IMG_MB", 8192)?,
@@ -202,6 +223,12 @@ impl VmHandle {
 #[allow(dead_code)]
 pub struct LaunchedVm {
     child: Child,
+    /// Phase 15 Step 5's `passt` sibling process, if this VM was booted with
+    /// networking wired up (`CloudHypervisorLauncher` always sets this;
+    /// `FakeLauncher` in tests does not, since none of the reuse/evict
+    /// assertions those tests make care about it). Torn down alongside
+    /// `child` in `stop()` — there is no independent lifecycle for it.
+    passt_child: Option<Child>,
     vsock_socket: PathBuf,
     console_log: PathBuf,
 }
@@ -232,6 +259,51 @@ pub trait VmLauncher: Send + Sync {
     async fn push_key(&self, vsock_socket: &Path, key: &StoreKey, fresh: bool) -> eyre::Result<()>;
 }
 
+/// The `passt` command line for the vhost-user backend at `net_socket` —
+/// pulled out as a pure function so the exact CLI syntax (flagged as
+/// unverified in PLAN.md's Phase 15 Step 5 until checked against this
+/// repo's pinned `passt`/`cloud-hypervisor` versions) is covered by a plain
+/// unit test rather than only ever exercised inside a real `/dev/kvm` boot.
+///
+/// `--dns` pins the address `passt` answers DNS queries on to the same fixed
+/// `NET_GATEWAY` the guest already routes through, rather than `passt`'s own
+/// default of "whatever the *host's* `/etc/resolv.conf` currently says" —
+/// that default varies per host/node and a statically-configured guest (see
+/// `guest-agent`'s `configure_network`/`resolv.conf`) has no way to learn it
+/// at boot. `passt` still forwards the actual query to the real resolver
+/// itself; only the address the guest sends queries *to* is fixed.
+fn passt_args(net_socket: &Path) -> Vec<String> {
+    vec![
+        "--foreground".to_string(),
+        "--vhost-user".to_string(),
+        "--socket".to_string(),
+        net_socket.display().to_string(),
+        "--address".to_string(),
+        NET_GUEST_ADDR.to_string(),
+        "--netmask".to_string(),
+        NET_PREFIX.to_string(),
+        "--gateway".to_string(),
+        NET_GATEWAY.to_string(),
+        "--dns".to_string(),
+        NET_GATEWAY.to_string(),
+    ]
+}
+
+/// The `cloud-hypervisor --net` value for connecting to `passt`'s
+/// vhost-user socket at `net_socket` as a client — `passt` is the listener
+/// (see `passt_args` above), so `vhost_mode=client` here, not `server`.
+/// `num_queues=2`, not `1`: cloud-hypervisor counts rx and tx as separate
+/// queues and rejects anything lower with `VnetQueueLowerThan2` — found by
+/// actually booting this against real `/dev/kvm`, not by reading the
+/// `--net` help text, which just calls it "`num_queues=<number_of_queues>`"
+/// with no hint that 1 is invalid.
+fn net_arg(net_socket: &Path) -> String {
+    format!(
+        "vhost_user=true,socket={},num_queues=2,vhost_mode=client",
+        net_socket.display()
+    )
+}
+
 /// The real launcher: spawns `cloud-hypervisor` as a subprocess, replicating
 /// `nix/guest-vm-test.nix`'s invocation plus a `--disk` for the tenant's
 /// store image.
@@ -248,7 +320,40 @@ impl VmLauncher for CloudHypervisorLauncher {
         vsock_socket: &Path,
         console_log: &Path,
     ) -> eyre::Result<LaunchedVm> {
-        let mut child = Command::new(&self.config.cloud_hypervisor)
+        // Phase 15 Step 5: `passt` first, so its vhost-user socket exists by
+        // the time cloud-hypervisor tries to dial it as a client
+        // (`vhost_mode=client` below) — the reverse order would race.
+        // `net.sock` lives next to `store.img` (same tenant directory,
+        // derived from it) rather than getting its own config knob: it's
+        // process-local scratch state, not anything that needs to survive
+        // past this VM's lifetime the way `store.img` does.
+        let net_socket = store_img
+            .parent()
+            .expect("store_img always has a tenants/<tenant>/ parent")
+            .join("net.sock");
+        let _ = tokio::fs::remove_file(&net_socket).await;
+        let passt_child = Command::new(&self.config.passt)
+            .args(passt_args(&net_socket))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .wrap_err_with(|| {
+                format!(
+                    "spawning {} for tenant {tenant}",
+                    self.config.passt.display()
+                )
+            })?;
+        if !wait_for_socket(&net_socket, self.config.boot_timeout).await {
+            return Err(eyre!(
+                "timed out after {:?} waiting for passt's vhost-user socket at {} (tenant {tenant})",
+                self.config.boot_timeout,
+                net_socket.display(),
+            ));
+        }
+
+        let mut child = match Command::new(&self.config.cloud_hypervisor)
             .arg("--kernel")
             .arg(&self.config.kernel)
             .arg("--initramfs")
@@ -258,13 +363,19 @@ impl VmLauncher for CloudHypervisorLauncher {
             .arg("--cpus")
             .arg(format!("boot={}", self.config.vcpus))
             .arg("--memory")
-            .arg(format!("size={}M", self.config.memory_mb))
+            // `shared=on` is required for vhost-user net: the backend
+            // (`passt`) maps the guest's memory directly, which needs a
+            // shared memory mapping cloud-hypervisor's default (anonymous,
+            // process-private) memory doesn't provide.
+            .arg(format!("size={}M,shared=on", self.config.memory_mb))
             .arg("--vsock")
             .arg(format!(
                 "cid={},socket={}",
                 self.config.cid,
                 vsock_socket.display()
             ))
+            .arg("--net")
+            .arg(net_arg(&net_socket))
             .arg("--disk")
             // `image_type=raw` is not a formality — leaving it unspecified
             // lets cloud-hypervisor's own format sniffing decide, and on a
@@ -290,12 +401,19 @@ impl VmLauncher for CloudHypervisorLauncher {
             // this keeps a worker crash from orphaning a VM process too.
             .kill_on_drop(true)
             .spawn()
-            .wrap_err_with(|| {
-                format!(
-                    "spawning {} for tenant {tenant}",
-                    self.config.cloud_hypervisor.display()
-                )
-            })?;
+        {
+            Ok(child) => child,
+            Err(e) => {
+                let mut passt_child = passt_child;
+                let _ = passt_child.kill().await;
+                return Err(e).wrap_err_with(|| {
+                    format!(
+                        "spawning {} for tenant {tenant}",
+                        self.config.cloud_hypervisor.display()
+                    )
+                });
+            }
+        };
 
         match tokio::time::timeout(
             self.config.boot_timeout,
@@ -305,11 +423,14 @@ impl VmLauncher for CloudHypervisorLauncher {
         {
             Ok(()) => Ok(LaunchedVm {
                 child,
+                passt_child: Some(passt_child),
                 vsock_socket: vsock_socket.to_path_buf(),
                 console_log: console_log.to_path_buf(),
             }),
             Err(_elapsed) => {
                 let _ = child.kill().await;
+                let mut passt_child = passt_child;
+                let _ = passt_child.kill().await;
                 let tail = console_log_tail(console_log).await;
                 Err(eyre!(
                     "timed out after {:?} waiting for guest-agent on {} (tenant {tenant}); console log:\n{tail}",
@@ -321,7 +442,11 @@ impl VmLauncher for CloudHypervisorLauncher {
     }
 
     async fn stop(&self, vm: LaunchedVm) {
-        let LaunchedVm { mut child, .. } = vm;
+        let LaunchedVm {
+            mut child,
+            passt_child,
+            ..
+        } = vm;
         // `guest-agent` has no ACPI/graceful-shutdown handler (it is PID 1
         // with nothing else running in the guest), so there is no signal
         // worth sending before a kill — this is always effectively a timed
@@ -334,6 +459,18 @@ impl VmLauncher for CloudHypervisorLauncher {
         match child.wait().await {
             Ok(status) => tracing::info!(?status, "VM process reaped"),
             Err(e) => tracing::warn!(error = %e, "waiting for VM process failed"),
+        }
+        // `passt` has no client left to serve once cloud-hypervisor above is
+        // gone — kill it after, not before, so there's never a moment where
+        // cloud-hypervisor is still running against a dead net backend.
+        if let Some(mut passt_child) = passt_child {
+            if let Err(e) = passt_child.kill().await {
+                tracing::warn!(error = %e, "killing passt process failed");
+            }
+            match passt_child.wait().await {
+                Ok(status) => tracing::info!(?status, "passt process reaped"),
+                Err(e) => tracing::warn!(error = %e, "waiting for passt process failed"),
+            }
         }
     }
 
@@ -381,6 +518,24 @@ impl VmLauncher for CloudHypervisorLauncher {
         }
         Ok(())
     }
+}
+
+/// Poll for `path` to exist, up to `timeout` — used to wait for `passt`'s
+/// vhost-user socket to appear before pointing `cloud-hypervisor` at it as a
+/// client. Unlike `wait_for_vsock_ready`, existence is the whole check: there
+/// is no handshake to speak here, `cloud-hypervisor` itself is the vhost-user
+/// client that negotiates with `passt`.
+async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 /// Poll `vsock_socket` until `guest-agent` accepts the inetd-style handshake
@@ -674,6 +829,11 @@ mod tests {
                 .expect("spawning `sleep` for a test fake");
             Ok(LaunchedVm {
                 child,
+                // `FakeLauncher` doesn't spawn a real `passt` — the reuse/
+                // evict decision this fake exists to test doesn't touch
+                // networking at all (see `CloudHypervisorLauncher::stop`'s
+                // own handling of `None` here).
+                passt_child: None,
                 vsock_socket: vsock_socket.to_path_buf(),
                 console_log: console_log.to_path_buf(),
             })
@@ -703,12 +863,43 @@ mod tests {
             kernel: PathBuf::new(),
             initrd: PathBuf::new(),
             cloud_hypervisor: PathBuf::new(),
+            passt: PathBuf::new(),
             vcpus: 1,
             memory_mb: 256,
             store_img_size_mb: 1,
             boot_timeout: Duration::from_secs(1),
             cid: 3,
         }
+    }
+
+    #[test]
+    fn passt_args_wire_up_the_fixed_address_plan() {
+        let args = passt_args(Path::new("/var/lib/kubernix-worker/tenants/acme/net.sock"));
+        assert_eq!(
+            args,
+            vec![
+                "--foreground",
+                "--vhost-user",
+                "--socket",
+                "/var/lib/kubernix-worker/tenants/acme/net.sock",
+                "--address",
+                NET_GUEST_ADDR,
+                "--netmask",
+                NET_PREFIX,
+                "--gateway",
+                NET_GATEWAY,
+                "--dns",
+                NET_GATEWAY,
+            ]
+        );
+    }
+
+    #[test]
+    fn net_arg_connects_as_a_vhost_user_client() {
+        assert_eq!(
+            net_arg(Path::new("/var/lib/kubernix-worker/tenants/acme/net.sock")),
+            "vhost_user=true,socket=/var/lib/kubernix-worker/tenants/acme/net.sock,num_queues=2,vhost_mode=client"
+        );
     }
 
     #[test]

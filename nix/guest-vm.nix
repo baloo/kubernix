@@ -209,6 +209,15 @@ let
       # touches the raw file host-side), so this was never enabled until
       # Step 4 needed the guest to actually open it.
       VIRTIO_BLK = yes;
+      # Phase 15 Step 5: the `passt`-backed link `worker/src/vm.rs` attaches
+      # via `--net vhost_user=...`. `guest-agent`'s `configure_network`
+      # brings this up with a fixed static address -- see its doc comment --
+      # so no DHCP client is needed here either. `NETDEVICES` gates the whole
+      # "Network device drivers" menu `VIRTIO_NET` lives in -- without it the
+      # question is never asked at all ("unused option: VIRTIO_NET"), same
+      # shape as `VIRTIO_MENU`/`CRYPTO`/`MD` above gating their own menus.
+      NETDEVICES = yes;
+      VIRTIO_NET = yes;
       # Plain `dm-crypt` on the tenant's `store.img` (Component 3b of
       # PLAN.md's Phase 15 design): device-mapper core, the crypt target, and
       # the AES-XTS cipher `cryptsetup_open` (`guest-agent/src/main.rs`)
@@ -275,6 +284,16 @@ let
     nixbld:x:30000:nixbld1
   '';
 
+  # Phase 15 Step 5: a static resolver pointed at `passt`'s own address —
+  # `worker/src/vm.rs`'s `passt_args` pins `passt --dns` to the same fixed
+  # `NET_GATEWAY` value, since a statically-configured guest (no DHCP client,
+  # see `guest-agent`'s `configure_network`) has no other way to learn a
+  # resolver address. Baked in at build time, not written at runtime, for the
+  # same reason `passwd`/`group` above are: the value never changes.
+  resolvConf = pkgs.writeText "resolv.conf" ''
+    nameserver 10.42.100.1
+  '';
+
   # `nix-store -qR pkgs.lix`, computed at eval time: every store path
   # `nix-daemon` might need at runtime, not just the ones its own dependency
   # graph makes obvious — see the `contents` list below for why this exists.
@@ -332,6 +351,12 @@ let
         source = "${pkgs.util-linux}/bin/mount";
         target = "/bin/mount";
       }
+      # Phase 15 Step 5's `configure_network` shells out to this rather than
+      # the guest carrying a DHCP client -- see that function's doc comment.
+      {
+        source = "${pkgs.iproute2}/bin/ip";
+        target = "/bin/ip";
+      }
       # `kmod`'s `modprobe` (a symlink to the same multi-call `kmod` binary,
       # kept alongside it at the same relative path it has in the package so
       # that symlink still resolves) at the kernel's hardcoded
@@ -360,6 +385,10 @@ let
       {
         source = group;
         target = "/etc/group";
+      }
+      {
+        source = resolvConf;
+        target = "/etc/resolv.conf";
       }
     ]
     # `nix-daemon`'s sandboxed build path execs a handful of its own

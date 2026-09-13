@@ -20,8 +20,8 @@ let
   kubernix-plugin = pkgs.callPackage ./plugin.nix { };
   kubernix-guest-agent = pkgs.callPackage ./guest-agent.nix { inherit workspaceSource outputHashes; };
   kubernix-guest-init = pkgs.pkgsStatic.callPackage ./guest-init.nix { inherit workspaceSource outputHashes; };
-  # Shared shell helpers the four guest-VM boot tests below all `source` --
-  # see `vm-test-lib.nix`'s own header for why.
+  # Shared shell helpers the guest-VM boot tests below all `source` -- see
+  # `vm-test-lib.nix`'s own header for why.
   vm-test-lib = pkgs.callPackage ./vm-test-lib.nix { };
   guest-vm = pkgs.callPackage ./guest-vm.nix {
     inherit kubernix-guest-agent kubernix-guest-init vm-test-lib;
@@ -35,6 +35,10 @@ let
     inherit kubernix-worker vm-test-lib;
   };
   vm-encryption-test = pkgs.callPackage ./vm-encryption-test.nix {
+    inherit (guest-vm) kernel initrd;
+    inherit vm-test-lib;
+  };
+  vm-network-test = pkgs.callPackage ./vm-network-test.nix {
     inherit (guest-vm) kernel initrd;
     inherit vm-test-lib;
   };
@@ -59,7 +63,7 @@ in {
   kubernix-guest-vm-kernel = guest-vm.kernel;
   kubernix-guest-vm-initrd = guest-vm.initrd;
   guest-vm-test = guest-vm.test;
-  inherit vm-lifecycle-test vm-build-test vm-encryption-test;
+  inherit vm-lifecycle-test vm-build-test vm-encryption-test vm-network-test;
   test = import ./test.nix {
     inherit pkgs kubernix-server kubernix-worker kubernix-plugin;
   };

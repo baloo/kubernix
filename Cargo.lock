@@ -2594,6 +2594,8 @@ dependencies = [
  "digest-io-async",
  "eyre",
  "futures-util",
+ "http-body 1.1.0",
+ "http-body-util",
  "kubernix-daemon-protocol",
  "kubernix-types",
  "rand 0.10.2",

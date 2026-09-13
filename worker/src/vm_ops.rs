@@ -123,9 +123,10 @@ where
     let (nar_hash, nar_size, file_hash, file_size) =
         hash_result.wrap_err_with(|| format!("hashing/compressing {store_path}"))?;
 
-    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(
+    let body = crate::upload::sized_file_body(
         tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?),
-    ));
+        file_size,
+    );
     let response = http
         .put(url)
         .header("content-type", "application/x-nix-nar-zstd")
