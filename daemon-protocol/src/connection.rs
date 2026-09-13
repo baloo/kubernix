@@ -61,8 +61,8 @@ pub struct BuildOutcome {
     pub status: u64,
     pub error_msg: String,
     /// `STDERR_NEXT` lines emitted while this build ran, in order — the
-    /// build log, collected rather than streamed live; see
-    /// [`DaemonConnection::build_derivation`]'s doc comment.
+    /// build log, for archival. The caller also gets each line live, as it's
+    /// read, via `build_derivation`'s `on_line` channel.
     pub log: Vec<String>,
 }
 
@@ -158,7 +158,7 @@ where
         stream.read_wire_str().await?; // daemonNixVersion
         stream.read_wire_u64().await?; // optional<TrustedFlag>: 0/1/2
 
-        drain_stderr(&mut stream, None).await?;
+        drain_stderr(&mut stream, None, None).await?;
 
         let mut conn = Self {
             stream,
@@ -186,7 +186,7 @@ where
         self.stream.write_wire_u64(1).await?; // buildCores
         self.stream.write_wire_bool(true).await?; // useSubstitutes
         self.stream.write_wire_u64(0).await?; // no setting overrides
-        drain_stderr(&mut self.stream, None).await
+        drain_stderr(&mut self.stream, None, None).await
     }
 
     /// `Op::BuildDerivation` (`remote-store.cc:541-552`). `drv` is passed
@@ -199,6 +199,7 @@ where
         &mut self,
         drv_path: &str,
         drv: &[u8],
+        on_line: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<BuildOutcome, DaemonError> {
         const OP_BUILD_DERIVATION: u64 = 36;
         self.stream.write_wire_u64(OP_BUILD_DERIVATION).await?;
@@ -206,17 +207,19 @@ where
         self.stream.write_all_raw(drv).await?;
         self.stream.write_wire_u64(0).await?; // BuildMode::Normal
 
-        // Unlike every other op here, the caller wants this command's
-        // `STDERR_NEXT` lines, not just to have them drained — they're the
-        // build log, the entire reason `worker/src/serve.rs`'s
-        // `--log-format raw-with-logs` exists. Collected here rather than
-        // streamed line-by-line to the caller as they arrive: this client
-        // has no async callback plumbing, so the log surfaces only once the
-        // build finishes, not live — a real gap against the subprocess
-        // path's `pump_log`, worth closing if it matters in practice, but
-        // this command still succeeds/fails identically either way.
+        // Unlike every other op here, the caller wants this command's build
+        // log, not just to have it drained — the entire reason
+        // `worker/src/serve.rs`'s `--log-format raw-with-logs` exists for the
+        // subprocess path. It travels as `STDERR_RESULT`/`resBuildLogLine`
+        // frames, not `STDERR_NEXT` — see `drain_stderr`'s doc comment; a
+        // first attempt at this looked for it on `STDERR_NEXT` and silently
+        // got nothing, ever, regardless of verbosity settings. Still
+        // collected into `log` for archival (the object uploaded alongside
+        // the build's outputs), but also sent line-by-line to `on_line` as
+        // each one is read, so a caller can relay it live the same way the
+        // subprocess path's `pump_log` does.
         let mut log = Vec::new();
-        drain_stderr(&mut self.stream, Some(&mut log)).await?;
+        drain_stderr(&mut self.stream, Some(&mut log), on_line).await?;
 
         let status = self.stream.read_wire_u64().await?;
         let error_msg = self.stream.read_wire_str().await?;
@@ -258,7 +261,7 @@ where
         const OP_QUERY_PATH_INFO: u64 = 26;
         self.stream.write_wire_u64(OP_QUERY_PATH_INFO).await?;
         self.stream.write_wire_str(store_path).await?;
-        drain_stderr(&mut self.stream, None).await?;
+        drain_stderr(&mut self.stream, None, None).await?;
 
         if !self.stream.read_wire_bool().await? {
             return Ok(None);
@@ -299,7 +302,7 @@ where
         const OP_NAR_FROM_PATH: u64 = 38;
         self.stream.write_wire_u64(OP_NAR_FROM_PATH).await?;
         self.stream.write_wire_str(store_path).await?;
-        drain_stderr(&mut self.stream, None).await?;
+        drain_stderr(&mut self.stream, None, None).await?;
 
         nar::copy_nar(&mut self.stream, sink).await?;
         Ok(())
@@ -357,7 +360,7 @@ where
         }
         self.stream.write_wire_u64(0).await?; // terminating zero-length chunk
 
-        drain_stderr(&mut self.stream, None).await
+        drain_stderr(&mut self.stream, None, None).await
     }
 }
 
@@ -378,12 +381,21 @@ impl<W: tokio::io::AsyncWrite + Unpin> RawWrite for W {
 /// Drain `STDERR_*` frames until `STDERR_LAST`, exactly the loop every real
 /// client runs after every command (`RemoteStore::Connection::processStderr`,
 /// `remote-store.cc:780-844`) before reading that command's own typed reply.
-/// Activity start/stop/result frames are read and discarded rather than acted
-/// on — this client has no live progress display — but every field still has
-/// to be consumed in order, or the next read desynchronises.
+/// Activity start/stop frames, and every `STDERR_RESULT` except
+/// `resBuildLogLine`, are read and discarded rather than acted on — this
+/// client has no live progress display — but every field still has to be
+/// consumed in order, or the next read desynchronises.
+///
+/// `on_line`, when given, is sent each build-log line as it is read — a
+/// `STDERR_RESULT`/`resBuildLogLine` frame, *not* `STDERR_NEXT` (which only
+/// ever carries the daemon's own messages; see the `STDERR_RESULT` arm below)
+/// — in addition to `log` collecting it. The seam that lets a caller relay a
+/// build's log live instead of only after it collects the whole thing (see
+/// [`DaemonConnection::build_derivation`]'s doc comment).
 async fn drain_stderr<S>(
     stream: &mut S,
     mut log: Option<&mut Vec<String>>,
+    on_line: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<(), DaemonError>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -393,6 +405,12 @@ where
             STDERR_NEXT => {
                 let line = stream.read_wire_str().await?;
                 tracing::debug!(target: "kubernix_daemon_protocol::remote_log", "{}", line.trim_end());
+                if let Some(tx) = on_line {
+                    // A dropped receiver just means nobody is listening live
+                    // (e.g. every other `drain_stderr` call site passes
+                    // `None` instead) — not a reason to fail the build.
+                    let _ = tx.send(line.clone());
+                }
                 if let Some(log) = log.as_deref_mut() {
                     log.push(line);
                 }
@@ -402,7 +420,7 @@ where
                 stream.read_wire_u64().await?; // verbosity
                 stream.read_wire_u64().await?; // activity type
                 stream.read_wire_str().await?; // description
-                drain_fields(stream).await?;
+                read_fields(stream).await?;
                 stream.read_wire_u64().await?; // parent id
             }
             STDERR_STOP_ACTIVITY => {
@@ -410,8 +428,31 @@ where
             }
             STDERR_RESULT => {
                 stream.read_wire_u64().await?; // activity id
-                stream.read_wire_u64().await?; // result type
-                drain_fields(stream).await?;
+                let result_type = stream.read_wire_u64().await?;
+                let fields = read_fields(stream).await?;
+                // `resBuildLogLine` (`logging.hh`'s `ResultType`, 101): the
+                // builder's own raw stdout/stderr, one line per result — this
+                // is where a real build's log actually travels on this
+                // protocol (`LocalDerivationGoal`'s `flushLine`, via
+                // `act.result(resBuildLogLine, line)`), *not* `STDERR_NEXT`,
+                // which only ever carries the daemon's own messages. Found
+                // by noticing the daemon's real build log never arrived at
+                // all despite `on_line` being wired up correctly — the
+                // frames were STDERR_RESULT, silently drained until now.
+                // `resultImpl` (`daemon.cc`) isn't gated by `getVerbosity()`
+                // the way plain `log()` calls are, so this arrives
+                // regardless of `set_options`'s verbosity setting.
+                if result_type == RESULT_BUILD_LOG_LINE
+                    && let Some(Field::Str(line)) = fields.into_iter().next()
+                {
+                    tracing::debug!(target: "kubernix_daemon_protocol::remote_log", "{}", line.trim_end());
+                    if let Some(tx) = on_line {
+                        let _ = tx.send(line.clone());
+                    }
+                    if let Some(log) = log.as_deref_mut() {
+                        log.push(line);
+                    }
+                }
             }
             STDERR_LAST => return Ok(()),
             STDERR_ERROR => return Err(read_remote_error(stream).await?),
@@ -420,24 +461,34 @@ where
     }
 }
 
-/// `Logger::Fields` (`libutil/logging.hh`): a count, then that many
-/// `(type, value)` pairs — `tInt = 0` reads a `u64`, `tString = 1` a string.
-async fn drain_fields<S>(stream: &mut S) -> Result<(), DaemonError>
+/// `ResultType::resBuildLogLine` (`libutil/logging.hh`).
+const RESULT_BUILD_LOG_LINE: u64 = 101;
+
+/// One `Logger::Field` (`libutil/logging.hh`): `tInt = 0` or `tString = 1`.
+enum Field {
+    // Never inspected — no result type this client cares about carries an
+    // int field — but still parsed out so the stream stays in sync with
+    // whatever field shape the daemon actually sent.
+    #[allow(dead_code)]
+    Int(u64),
+    Str(String),
+}
+
+/// `Logger::Fields` (`libutil/logging.hh`, `daemon.cc`'s `operator<<`): a
+/// count, then that many `(type, value)` pairs.
+async fn read_fields<S>(stream: &mut S) -> Result<Vec<Field>, DaemonError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let count = stream.read_wire_u64().await?;
+    let mut fields = Vec::with_capacity(count as usize);
     for _ in 0..count {
         match stream.read_wire_u64().await? {
-            0 => {
-                stream.read_wire_u64().await?;
-            }
-            _ => {
-                stream.read_wire_str().await?;
-            }
+            0 => fields.push(Field::Int(stream.read_wire_u64().await?)),
+            _ => fields.push(Field::Str(stream.read_wire_str().await?)),
         }
     }
-    Ok(())
+    Ok(fields)
 }
 
 /// `readError` (`libutil/serialise.cc:345-367`): a fixed "Error" type tag, a
@@ -627,10 +678,60 @@ mod tests {
         };
         let mut conn = DaemonConnection::open(stream).await.unwrap();
         let outcome = conn
-            .build_derivation("/nix/store/xxx-foo.drv", b"raw drv bytes")
+            .build_derivation("/nix/store/xxx-foo.drv", b"raw drv bytes", None)
             .await
             .unwrap();
         assert!(outcome.succeeded());
+    }
+
+    /// Regression: `on_line` used to not exist at all, so a build's log only
+    /// reached the caller once `build_derivation` returned — see that
+    /// method's doc comment. Every `STDERR_NEXT` line must arrive on the
+    /// channel as it's read, not just end up in `BuildOutcome::log`.
+    #[tokio::test]
+    async fn build_derivation_sends_each_log_line_live() {
+        // The real wire shape (`LocalDerivationGoal`'s `flushLine`): each
+        // line is a `STDERR_RESULT` frame of type `resBuildLogLine` (101)
+        // carrying one string field, tied to a build activity — not a plain
+        // `STDERR_NEXT`, which this test used to (wrongly) assume.
+        let mut reply = Vec::new();
+        for line in ["building...\n", "done\n"] {
+            reply.write_u64_sync(STDERR_RESULT);
+            reply.write_u64_sync(1); // activity id
+            reply.write_u64_sync(RESULT_BUILD_LOG_LINE);
+            reply.write_u64_sync(1); // one field
+            reply.write_u64_sync(1); // tString
+            reply.write_str_sync(line);
+        }
+        reply.write_u64_sync(STDERR_LAST);
+        reply.write_u64_sync(STATUS_BUILT);
+        reply.write_str_sync(""); // error_msg
+        reply.write_u64_sync(0); // timesBuilt
+        reply.write_bool_sync(false); // isNonDeterministic
+        reply.write_u64_sync(0); // startTime
+        reply.write_u64_sync(0); // stopTime
+        reply.write_u64_sync(0); // builtOutputs: empty
+
+        let stream = FakeStream {
+            to_read: std::io::Cursor::new(greeting_with(&reply)),
+            written: Vec::new(),
+        };
+        let mut conn = DaemonConnection::open(stream).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = conn
+            .build_derivation("/nix/store/xxx-foo.drv", b"drv", Some(&tx))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut lines = Vec::new();
+        while let Some(line) = rx.recv().await {
+            lines.push(line);
+        }
+        assert_eq!(lines, vec!["building...\n", "done\n"]);
+        // Both channels see the same lines — one isn't a substitute for the
+        // other, `on_line` is in addition to the archived `log`.
+        assert_eq!(outcome.log, lines);
     }
 
     #[tokio::test]
@@ -650,7 +751,7 @@ mod tests {
         };
         let mut conn = DaemonConnection::open(stream).await.unwrap();
         let err = conn
-            .build_derivation("/nix/store/xxx-foo.drv", b"drv")
+            .build_derivation("/nix/store/xxx-foo.drv", b"drv", None)
             .await
             .unwrap_err();
         match err {

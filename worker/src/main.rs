@@ -528,24 +528,36 @@ impl Job {
         let log_subject = format!("kubernix.logs.{}", self.job_id);
 
         // Phase 15 Step 3: over the tenant VM's daemon connection when one is
-        // available, `nix-store --serve` otherwise. The VM path's log is not
-        // streamed live — see `DaemonConnection::build_derivation`'s doc
-        // comment — so it publishes every collected line only once the build
-        // has already finished, unlike the subprocess path's `pump_log`.
+        // available, `nix-store --serve` otherwise. The log has to be relayed
+        // *while* the build runs here too, the same reason the subprocess
+        // path below drains its pipe concurrently rather than after —
+        // `on_line` is `DaemonConnection::build_derivation`'s seam for that,
+        // sending each line to `pump_channel` as it's read off the wire.
         if let Some(conn) = vm {
-            let result =
-                vm_ops::build_derivation(conn, &self.derivation_path.to_full(store_dir), &self.drv)
-                    .await;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let pump = tokio::spawn(pump_channel(client.clone(), log_subject.clone(), rx));
+
+            let result = vm_ops::build_derivation(
+                conn,
+                &self.derivation_path.to_full(store_dir),
+                &self.drv,
+                Some(&tx),
+            )
+            .await;
+            // Closes the channel, which is what ends `pump_channel`'s loop —
+            // done before awaiting it, same ordering the subprocess path
+            // below uses for its own pipe.
+            drop(tx);
+            let (archive, tail) = pump.await.unwrap_or_default();
+            let _ = client.flush().await;
 
             return match result {
                 Ok(outcome) => {
-                    let (archive, tail) =
-                        publish_collected_log(client, &log_subject, &outcome.log).await;
-                    let _ = client.flush().await;
-
                     let outcome = if outcome.succeeded() {
                         Outcome::Completed(outputs)
                     } else {
+                        // The client already saw the log live; the tail is
+                        // what makes the failure message useful on its own.
                         let mut message = outcome.describe();
                         if !tail.is_empty() {
                             message.push('\n');
@@ -624,27 +636,27 @@ impl Job {
     }
 }
 
-/// Publish a build's already-collected log lines (the VM path's shape — see
-/// `DaemonConnection::build_derivation`) one at a time, the same way
-/// [`pump_log`] does for a live stream. Returns the same `(archive, tail)`
-/// shape so both paths converge on identical failure-message construction.
-async fn publish_collected_log(
-    client: &async_nats::Client,
-    subject: &str,
-    lines: &[String],
+/// The VM path's counterpart to [`pump_log`]: relays
+/// `DaemonConnection::build_derivation`'s `on_line` channel to
+/// `kubernix.logs.<job_id>` as each line arrives, instead of a subprocess's
+/// stderr pipe. Same `(archive, tail)` shape, so both paths converge on
+/// identical failure-message construction.
+async fn pump_channel(
+    client: async_nats::Client,
+    subject: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> (Vec<u8>, Vec<String>) {
     let mut archive = Vec::new();
     let mut tail: Vec<String> = Vec::new();
-    for line in lines {
-        let _ = client
-            .publish(subject.to_string(), line.clone().into())
-            .await;
+
+    while let Some(line) = rx.recv().await {
+        let _ = client.publish(subject.clone(), line.clone().into()).await;
         archive.extend_from_slice(line.as_bytes());
         archive.push(b'\n');
         if tail.len() == 20 {
             tail.remove(0);
         }
-        tail.push(line.clone());
+        tail.push(line);
     }
     (archive, tail)
 }

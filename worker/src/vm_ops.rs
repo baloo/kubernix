@@ -34,15 +34,20 @@ fn full_or_none(path: &StorePath, store_dir: &str) -> Option<String> {
 /// Build a derivation over the VM's `nix-daemon` connection. Same contract as
 /// `serve::ServeConnection::build_derivation`: `drv` travels byte for byte,
 /// for the reason both modules' doc comments give.
+///
+/// `on_line`, forwarded straight to `DaemonConnection::build_derivation`, is
+/// what lets the caller relay the log live instead of only once this
+/// returns — see that method's doc comment.
 pub async fn build_derivation<S>(
     conn: &mut DaemonConnection<S>,
     drv_path_full: &str,
     drv: &[u8],
+    on_line: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> eyre::Result<kubernix_daemon_protocol::BuildOutcome>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    conn.build_derivation(drv_path_full, drv)
+    conn.build_derivation(drv_path_full, drv, on_line)
         .await
         .wrap_err("building the derivation over the VM's daemon connection")
 }

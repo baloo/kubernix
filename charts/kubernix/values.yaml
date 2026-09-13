@@ -11,14 +11,23 @@ image:
   # kubernix-rotate-capability-secret all ship from this one image
   # (nix/images.nix: kubernix-server-image) — only the container `command:`
   # differs between their Deployments.
+  #
+  # `pullPolicy: Always` is load-bearing with a mutable `tag: latest`, not
+  # cosmetic: `IfNotPresent` means a node that already has *any* image cached
+  # under that name:tag never even asks the registry whether it changed, so
+  # `just image-push`/`helm upgrade`/`kubectl rollout restart` silently keep
+  # running the old code — found by chasing a deployed fix that measurably
+  # wasn't taking effect. Pin an immutable tag (a content hash, a git sha) and
+  # switch back to `IfNotPresent` if avoiding the extra pull latency ever
+  # matters more than this footgun.
   server:
     repository: kubernix-server
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   worker:
     repository: kubernix-worker
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
 
 # The object store every service reads/writes NARs, logs and (via the CNPG
 # backup plugin below, under a distinct prefix) database backups to. Stays
