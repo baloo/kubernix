@@ -14,6 +14,7 @@ pub mod kubernix_capnp {
 
 mod nar_export;
 mod serve;
+mod uid;
 mod upload;
 mod vm;
 mod vm_ops;
@@ -126,6 +127,21 @@ impl Job {
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
+
+    // Phase 15 Step 8: independent of (and a backstop for) per-tenant uid
+    // separation below — this alone blocks `ptrace`/`/proc/<pid>/mem` on
+    // this process from anything without `CAP_SYS_PTRACE`, regardless of
+    // whether the caller's uid happens to match ours. Without it, a same-uid
+    // `ptrace` needs no capability at all, and this process holds every
+    // currently-live tenant's at-rest encryption key in `VmPool::keys` —
+    // exactly what a compromised `cloud-hypervisor`/`passt` child would be
+    // going after. Not fatal if it fails (e.g. already non-dumpable, or a
+    // sandboxed test environment that restricts `prctl`): log and continue
+    // rather than refuse to start a worker over a hardening step.
+    if let Err(e) = nix::sys::prctl::set_dumpable(false) {
+        tracing::warn!(error = %e, "prctl(PR_SET_DUMPABLE, 0) failed; continuing anyway");
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -216,7 +232,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         vm::wipe_orphaned_store_images(&config.state_dir)
             .await
             .wrap_err("wiping orphaned tenant store images")?;
-        Some(vm::VmPool::new(config))
+        Some(vm::VmPool::new(config).wrap_err("setting up the per-tenant uid allocator")?)
     } else {
         tracing::info!(
             "KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD not set; per-tenant VM lifecycle disabled"

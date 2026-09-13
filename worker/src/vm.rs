@@ -30,6 +30,20 @@
 //! [`VmPool::ensure_vm_for`] — the actual thing these steps need to prove —
 //! is unit-testable without `/dev/kvm`. [`CloudHypervisorLauncher`] is the
 //! real implementation; tests supply a fake.
+//!
+//! Step 8: every tenant's `cloud-hypervisor`/`passt` pair runs under its own
+//! uid ([`crate::uid::UidAllocator`]), dropped to in a `pre_exec` hook
+//! before either binary is `execve`d. `store.img` is created only after
+//! that drop, so it is naturally owned by the tenant's uid with no
+//! `chown(2)` call and no `CAP_CHOWN` on the worker. See `prepare_tenant_dir`
+//! for the directory permission layout that still lets the worker `unlink()`
+//! a subuid-owned image, and `main.rs`'s `prctl(PR_SET_DUMPABLE)` call for
+//! the uid-independent half of the threat model this closes.
+//!
+//! **`console.log`/`vsock.sock` and `DAC_OVERRIDE`.** See the doc comment
+//! above [`drop_privileges`] for why the worker's own container needs that
+//! capability back — and for a dead end tried first, worth reading before
+//! attempting a cleverer scoped alternative a second time.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,9 +52,12 @@ use std::time::Duration;
 
 use eyre::{Context as _, eyre};
 use kubernix_types::TenantId;
+use nix::unistd::{Gid, Uid};
 use rand::Rng as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+
+use crate::uid::UidAllocator;
 
 /// `guest-agent`'s fixed vsock port (`guest-agent/src/main.rs::NIX_DAEMON_PORT`).
 /// Duplicated here rather than shared through a common crate: the guest and
@@ -233,17 +250,35 @@ pub struct LaunchedVm {
     console_log: PathBuf,
 }
 
+/// The dropped-privilege identity (Step 8) a tenant's `cloud-hypervisor`/
+/// `passt` pair boots under — [`UidAllocator::allocate`]'s output, bundled
+/// so [`VmLauncher::boot`] doesn't carry `uid`/`gid` as two separate
+/// arguments on top of everything else it already takes.
+#[derive(Clone, Copy)]
+pub struct VmIdentity {
+    pub uid: Uid,
+    pub gid: Gid,
+}
+
 /// Spawns and tears down the actual VM process. A trait so
 /// [`VmPool::ensure_vm_for`]'s reuse/evict decision — the thing Step 2 is
 /// actually about — is testable against a fake, without `/dev/kvm`.
 #[async_trait::async_trait]
 pub trait VmLauncher: Send + Sync {
+    /// `identity` (Step 8) is what `cloud-hypervisor`/`passt` drop to before
+    /// `execve`, and — for `cloud-hypervisor` specifically — the owner
+    /// `store.img` is created under when `fresh` is true. `fresh` replaces
+    /// the old "create it and tell me if that's new" contract: the caller
+    /// only checks existence now, since creation has to happen after the
+    /// privilege drop to avoid a `chown(2)`.
     async fn boot(
         &self,
         tenant: &TenantId,
         store_img: &Path,
         vsock_socket: &Path,
         console_log: &Path,
+        identity: VmIdentity,
+        fresh: bool,
     ) -> eyre::Result<LaunchedVm>;
 
     /// Takes ownership: the caller has already decided this VM is going
@@ -304,6 +339,117 @@ fn net_arg(net_socket: &Path) -> String {
     )
 }
 
+/// A `pre_exec` closure (Step 8) that drops from the worker's own
+/// privilege to `(uid, gid)` — `setgroups([])` first (so `CAP_SETGID` is
+/// still held when it's called; an empty list is correct here, not just
+/// convenient — these nodes' `/dev/kvm` is `0666` with no owning group to
+/// retain, so there is nothing to keep), then `setgid`, then `setuid` last,
+/// since once `setuid` succeeds none of the earlier calls are possible
+/// anymore.
+///
+/// Async-signal-safety caveat, stated rather than glossed over: `nix`'s
+/// `setgroups`/`setgid`/`setuid` are thin wrappers straight over the libc
+/// calls of the same name, which is the part that matters between `fork`
+/// and `execve` — but this closure is `FnMut` boxed by `std::process`, and
+/// the crate's own `pre_exec` docs call out that not every Rust operation
+/// is safe there (allocation, locks). Nothing here allocates at all in the
+/// child (the empty `groups` slice is `'static`), so this stays inside the
+/// same accepted trade-off every "drop privileges before exec"
+/// implementation makes — not a new risk introduced by this step.
+///
+/// **Why the worker's own container needs `DAC_OVERRIDE` back.**
+/// `cloud-hypervisor` creates `console.log` (`--serial file=...`) and
+/// `vsock.sock` (`--vsock socket=...`) *after* this drop, so they end up
+/// owned by the tenant's own `(uid, gid)`, mode `0600`/`0700`. That's fine
+/// for the tenant's *own* processes, but the worker itself then can't open
+/// either file to `wait_for_vsock_ready` or attach a console-log tail to a
+/// boot-failure error: it runs as uid 0, but its own container
+/// `securityContext` drops `DAC_OVERRIDE` along with every other capability
+/// except `SETUID`/`SETGID` (see PLAN.md Phase 13's status note on the
+/// resulting `timed out waiting for guest-agent` boot failures — the guest
+/// was booting fine the whole time; the worker just couldn't see it).
+/// `charts/kubernix/templates/worker-deployment.yaml` grants `DAC_OVERRIDE`
+/// back to close this.
+///
+/// **A group-based scheme was tried first and reverted, worth reading before
+/// attempting a cleverer scoped alternative a second time.** The idea: give
+/// every tenant's `cloud-hypervisor`/`passt` a shared, fixed gid (instead of
+/// today's per-tenant one) with `umask(0o070)` clearing the *group* bits on
+/// creation — relying on the Unix rule that a gid match is judged on group
+/// bits alone, never falling through to "other" even when group denies and
+/// other would allow. That correctly blocks a different tenant's process
+/// (gid matches, group bits are `0`, denied) while letting the worker in
+/// (no uid or gid match, falls to "other," which stays open) — all without
+/// any new capability. It worked exactly as designed for `passt`'s
+/// `net.sock`. It did **not** work for `cloud-hypervisor`'s own
+/// `console.log`/`vsock.sock`: verified live against the real cluster that
+/// `cloud-hypervisor` resets its own umask (`0o077`) early in its own
+/// startup, unconditionally overriding whatever the parent set before
+/// `execve` — the two files this actually needed to fix came out byte-for-
+/// byte identical to before the change. Confirmed a second time by the side
+/// effect it had instead: `net.sock`'s original mode was `0755` (an ambient
+/// `022`-ish umask, not `077`), and forcing `umask(0o070)` left its "other"
+/// bits completely untouched — widening them from `r-x` to `rwx` (gaining
+/// *write*, i.e. connect access) relative to before, a real if narrow
+/// regression on a file that never needed touching. Nothing this process
+/// does before `execve` survives `cloud-hypervisor` overwriting it again on
+/// its own — `DAC_OVERRIDE` is the mechanism that actually works, at the
+/// cost of being a blanket capability rather than a scoped one.
+fn drop_privileges(
+    uid: Uid,
+    gid: Gid,
+) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    move || {
+        nix::unistd::setgroups(&[]).map_err(std::io::Error::from)?;
+        nix::unistd::setgid(gid).map_err(std::io::Error::from)?;
+        nix::unistd::setuid(uid).map_err(std::io::Error::from)?;
+        Ok(())
+    }
+}
+
+/// [`drop_privileges`] plus, when `fresh`, creating `store_img` as a sparse
+/// file of `size_mb` — *after* the drop, so the file is naturally owned by
+/// `(uid, gid)`. `create_new` doubles as a safety check: `ensure_vm_for`
+/// already verified the path didn't exist before deciding `fresh`, and this
+/// makes an unexpected pre-existing file (e.g. a bug in that check) a loud
+/// spawn failure rather than a silent truncation of someone's store.
+///
+/// Kept separate from [`drop_privileges`] rather than folding a `Path` into
+/// every caller: `passt` never touches `store.img` at all, so its `pre_exec`
+/// only ever needs the plain privilege drop.
+fn drop_privileges_and_maybe_create_store_img(
+    uid: Uid,
+    gid: Gid,
+    store_img: PathBuf,
+    fresh: bool,
+    size_mb: u64,
+) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    move || {
+        nix::unistd::setgroups(&[]).map_err(std::io::Error::from)?;
+        nix::unistd::setgid(gid).map_err(std::io::Error::from)?;
+        nix::unistd::setuid(uid).map_err(std::io::Error::from)?;
+        if fresh {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // `.mode(0o600)` sets the permission bits `open(2)` requests
+            // directly — without it, `O_CREAT`'s actual bits are
+            // `0o666 & !umask`, whichever umask this process happens to be
+            // running under, not the `0600` the design calls for. Since the
+            // file's owning uid/gid are already this tenant's (we're past
+            // the `setuid`/`setgid` above), a wider-than-intended mode here
+            // would mean "other" — every other tenant's dropped-privilege
+            // process — could open this tenant's ciphertext directly,
+            // rather than that being gated on already knowing the path.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&store_img)?;
+            file.set_len(size_mb * 1024 * 1024)?;
+        }
+        Ok(())
+    }
+}
+
 /// The real launcher: spawns `cloud-hypervisor` as a subprocess, replicating
 /// `nix/guest-vm-test.nix`'s invocation plus a `--disk` for the tenant's
 /// store image.
@@ -319,7 +465,10 @@ impl VmLauncher for CloudHypervisorLauncher {
         store_img: &Path,
         vsock_socket: &Path,
         console_log: &Path,
+        identity: VmIdentity,
+        fresh: bool,
     ) -> eyre::Result<LaunchedVm> {
+        let VmIdentity { uid, gid } = identity;
         // Phase 15 Step 5: `passt` first, so its vhost-user socket exists by
         // the time cloud-hypervisor tries to dial it as a client
         // (`vhost_mode=client` below) — the reverse order would race.
@@ -332,28 +481,52 @@ impl VmLauncher for CloudHypervisorLauncher {
             .expect("store_img always has a tenants/<tenant>/ parent")
             .join("net.sock");
         let _ = tokio::fs::remove_file(&net_socket).await;
-        let passt_child = Command::new(&self.config.passt)
+        // Captured to a file, not `Stdio::null()`: a `passt` that fails
+        // silently after the Step 8 privilege drop (wrong CLI arg, a
+        // permission it turns out to need, anything) previously vanished
+        // into an opaque 30s "timed out waiting for the socket" with no way
+        // to tell why. Opened by the worker (uid 0) before `fork`, so the
+        // fd is already valid and inherited regardless of what uid the
+        // child drops to — no directory-write requirement of its own.
+        let passt_log = store_img
+            .parent()
+            .expect("store_img always has a tenants/<tenant>/ parent")
+            .join("passt.log");
+        let passt_stdout = std::fs::File::create(&passt_log)
+            .wrap_err_with(|| format!("creating {}", passt_log.display()))?;
+        let passt_stderr = passt_stdout
+            .try_clone()
+            .wrap_err("cloning the passt log file handle")?;
+        let mut passt_command = Command::new(&self.config.passt);
+        passt_command
             .args(passt_args(&net_socket))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .wrap_err_with(|| {
-                format!(
-                    "spawning {} for tenant {tenant}",
-                    self.config.passt.display()
-                )
-            })?;
+            .stdout(Stdio::from(passt_stdout))
+            .stderr(Stdio::from(passt_stderr))
+            .kill_on_drop(true);
+        // SAFETY: the closure only calls `nix`'s thin libc wrappers around
+        // `setgroups`/`setgid`/`setuid` — see `drop_privileges`'s doc for
+        // the async-signal-safety trade-off this accepts.
+        unsafe {
+            passt_command.pre_exec(drop_privileges(uid, gid));
+        }
+        let passt_child = passt_command.spawn().wrap_err_with(|| {
+            format!(
+                "spawning {} for tenant {tenant}",
+                self.config.passt.display()
+            )
+        })?;
         if !wait_for_socket(&net_socket, self.config.boot_timeout).await {
+            let tail = console_log_tail(&passt_log).await;
             return Err(eyre!(
-                "timed out after {:?} waiting for passt's vhost-user socket at {} (tenant {tenant})",
+                "timed out after {:?} waiting for passt's vhost-user socket at {} (tenant {tenant}); passt log:\n{tail}",
                 self.config.boot_timeout,
                 net_socket.display(),
             ));
         }
 
-        let mut child = match Command::new(&self.config.cloud_hypervisor)
+        let mut ch_command = Command::new(&self.config.cloud_hypervisor);
+        ch_command
             .arg("--kernel")
             .arg(&self.config.kernel)
             .arg("--initramfs")
@@ -394,14 +567,45 @@ impl VmLauncher for CloudHypervisorLauncher {
             .arg("off")
             .arg("--serial")
             .arg(format!("file={}", console_log.display()))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+        // Captured, not `Stdio::null()` — same reasoning as `passt_log`
+        // above: `console_log` is the *guest's* serial output, captured by
+        // cloud-hypervisor itself once it's far enough along to boot a
+        // kernel; if cloud-hypervisor's own process fails before that (bad
+        // arg, can't open `/dev/kvm` as the dropped uid, can't open
+        // `store_img`), `console_log` stays empty and there was previously
+        // nothing else to look at.
+        let ch_log = store_img
+            .parent()
+            .expect("store_img always has a tenants/<tenant>/ parent")
+            .join("cloud-hypervisor.log");
+        let ch_stdout = std::fs::File::create(&ch_log)
+            .wrap_err_with(|| format!("creating {}", ch_log.display()))?;
+        let ch_stderr = ch_stdout
+            .try_clone()
+            .wrap_err("cloning the cloud-hypervisor log file handle")?;
+        ch_command
+            .stdout(Stdio::from(ch_stdout))
+            .stderr(Stdio::from(ch_stderr))
             // Belt-and-braces: the real teardown path is `stop()` below, but
             // this keeps a worker crash from orphaning a VM process too.
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        // SAFETY: see `drop_privileges`'s doc. The `fresh` branch additionally
+        // does a plain `open(O_CREAT|O_EXCL)`/`ftruncate` — no allocation
+        // beyond the already-built `store_img` path, captured before `fork`.
+        // Creating it here, after the drop, is what lets `store.img` end up
+        // owned by (uid, gid) with no `chown(2)` call at all: see the module
+        // doc and PLAN.md Phase 15 Step 8.
+        unsafe {
+            ch_command.pre_exec(drop_privileges_and_maybe_create_store_img(
+                uid,
+                gid,
+                store_img.to_path_buf(),
+                fresh,
+                self.config.store_img_size_mb,
+            ));
+        }
+        let mut child = match ch_command.spawn() {
             Ok(child) => child,
             Err(e) => {
                 let mut passt_child = passt_child;
@@ -421,19 +625,40 @@ impl VmLauncher for CloudHypervisorLauncher {
         )
         .await
         {
-            Ok(()) => Ok(LaunchedVm {
+            Ok(Ok(())) => Ok(LaunchedVm {
                 child,
                 passt_child: Some(passt_child),
                 vsock_socket: vsock_socket.to_path_buf(),
                 console_log: console_log.to_path_buf(),
             }),
+            // A hard failure (see `wait_for_vsock_ready`'s doc) — reported
+            // immediately rather than waiting out the rest of the timeout,
+            // since retrying it can never succeed. Still attaches both logs:
+            // a permission error reaching `vsock_socket` very often means
+            // the same permission error would hit `console_log` too (as it
+            // did for the Step 8 regression this distinction was added
+            // for), and seeing *that* explicitly in the error — rather than
+            // a blank line indistinguishable from "guest wrote nothing" — is
+            // most of what makes this fast to diagnose.
+            Ok(Err(hard_err)) => {
+                let _ = child.kill().await;
+                let mut passt_child = passt_child;
+                let _ = passt_child.kill().await;
+                let console_tail = console_log_tail(console_log).await;
+                let ch_tail = console_log_tail(&ch_log).await;
+                Err(hard_err.wrap_err(format!(
+                    "guest-agent handshake on {} failed (tenant {tenant}); console log:\n{console_tail}\ncloud-hypervisor log:\n{ch_tail}",
+                    vsock_socket.display(),
+                )))
+            }
             Err(_elapsed) => {
                 let _ = child.kill().await;
                 let mut passt_child = passt_child;
                 let _ = passt_child.kill().await;
-                let tail = console_log_tail(console_log).await;
+                let console_tail = console_log_tail(console_log).await;
+                let ch_tail = console_log_tail(&ch_log).await;
                 Err(eyre!(
-                    "timed out after {:?} waiting for guest-agent on {} (tenant {tenant}); console log:\n{tail}",
+                    "timed out after {:?} waiting for guest-agent on {} (tenant {tenant}); console log:\n{console_tail}\ncloud-hypervisor log:\n{ch_tail}",
                     self.config.boot_timeout,
                     vsock_socket.display(),
                 ))
@@ -538,42 +763,103 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
     .is_ok()
 }
 
+/// One attempt at [`handshake_once`] came back — either it's not ready yet
+/// (keep polling) or something's actually wrong (stop immediately, rather
+/// than burning the rest of `boot_timeout` retrying a condition that will
+/// never clear on its own). Named rather than a bare `Result` so the two
+/// "give up" cases at the call site — hard failure vs. genuine timeout —
+/// stay visually distinct.
+enum HandshakeAttempt {
+    Ready,
+    NotYet,
+    HardError(std::io::Error),
+}
+
 /// Poll `vsock_socket` until `guest-agent` accepts the inetd-style handshake
 /// cloud-hypervisor's vsock device expects (`CONNECT <port>\n` -> `OK...`) —
 /// the same protocol `nix/guest-vm-test.nix` drives with `socat`. No overall
-/// deadline of its own; the caller wraps this in `tokio::time::timeout`.
-async fn wait_for_vsock_ready(vsock_socket: &Path, port: u32) {
+/// deadline of its own; the caller wraps this in `tokio::time::timeout` for
+/// the "guest is just slow to boot" case. This function's own `Err` return
+/// is for the other case: a condition retrying can never fix, surfaced
+/// immediately instead of silently eating the whole timeout window first.
+///
+/// This distinction is exactly what closed the Phase 15 Step 8 permission
+/// regression (PLAN.md Phase 13's status note): before it existed, an
+/// `EACCES` connecting to a `vsock.sock` the worker didn't have access to
+/// looked identical to "cloud-hypervisor hasn't finished booting yet," so
+/// every affected build burned the full 30s timeout and reported a boot
+/// failure with an empty, equally-permission-blocked console log — even
+/// though the guest had booted successfully in well under a second.
+async fn wait_for_vsock_ready(vsock_socket: &Path, port: u32) -> eyre::Result<()> {
     loop {
-        if handshake_once(vsock_socket, port).await {
-            return;
+        match handshake_once(vsock_socket, port).await {
+            HandshakeAttempt::Ready => return Ok(()),
+            HandshakeAttempt::NotYet => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            HandshakeAttempt::HardError(e) => {
+                return Err(e).wrap_err_with(|| {
+                    format!(
+                        "connecting to {} for the guest-agent handshake",
+                        vsock_socket.display()
+                    )
+                });
+            }
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
-async fn handshake_once(vsock_socket: &Path, port: u32) -> bool {
-    let Ok(mut stream) = tokio::net::UnixStream::connect(vsock_socket).await else {
-        // Socket not created yet, or cloud-hypervisor not accepting yet.
-        return false;
+/// `NotFound`/`ConnectionRefused` are the ordinary "cloud-hypervisor hasn't
+/// created/bound the socket yet" states early in a boot — worth retrying.
+/// Anything else (`PermissionDenied` chief among them — see
+/// `wait_for_vsock_ready`'s doc) is a condition that will never clear by
+/// itself; surface it instead of retrying blindly. Pulled out as a pure
+/// function so this specific classification — the actual fix, distinct from
+/// everything else `handshake_once` does — is unit-testable without a real
+/// socket.
+fn is_transient_connect_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+async fn handshake_once(vsock_socket: &Path, port: u32) -> HandshakeAttempt {
+    let mut stream = match tokio::net::UnixStream::connect(vsock_socket).await {
+        Ok(stream) => stream,
+        Err(e) if is_transient_connect_error(e.kind()) => return HandshakeAttempt::NotYet,
+        Err(e) => return HandshakeAttempt::HardError(e),
     };
+    // Past the `connect()` permission check: a failure writing to or reading
+    // from an already-accepted connection is a timing race (guest-agent
+    // accepted but isn't ready to speak yet), not a permission problem, so
+    // these stay in the "keep retrying" bucket.
     if stream
         .write_all(format!("CONNECT {port}\n").as_bytes())
         .await
         .is_err()
     {
-        return false;
+        return HandshakeAttempt::NotYet;
     }
     let mut buf = [0u8; 32];
     let Ok(n) = stream.read(&mut buf).await else {
-        return false;
+        return HandshakeAttempt::NotYet;
     };
-    buf[..n].starts_with(b"OK")
+    if buf[..n].starts_with(b"OK") {
+        HandshakeAttempt::Ready
+    } else {
+        HandshakeAttempt::NotYet
+    }
 }
 
 /// The last few lines of a VM's serial console log, for attaching to a boot
 /// failure — the single most useful debugging string when cloud-hypervisor or
-/// the guest kernel misbehaves. Never fails: a missing/unreadable log just
-/// means an empty tail, not another error on top of the one being reported.
+/// the guest kernel misbehaves. Never *fails* (always returns some `String`,
+/// there is no `Result` for a caller to unwrap) — but unlike an earlier
+/// version of this function, a read failure is not silently folded into "the
+/// log is empty": the two are distinguishable in the returned text, because
+/// they mean very different things to whoever reads the resulting error
+/// (guest wrote nothing vs. the worker couldn't get at what it wrote).
 async fn console_log_tail(path: &Path) -> String {
     match tokio::fs::read_to_string(path).await {
         Ok(contents) => {
@@ -581,7 +867,7 @@ async fn console_log_tail(path: &Path) -> String {
             lines.reverse();
             lines.join("\n")
         }
-        Err(_) => String::new(),
+        Err(e) => format!("(could not read {}: {e})", path.display()),
     }
 }
 
@@ -596,10 +882,82 @@ fn store_img_path(config: &VmConfig, tenant: &TenantId) -> PathBuf {
         .join("store.img")
 }
 
-/// Create `path` as a sparse file of `size_mb` if it doesn't already exist.
-/// A no-op — not a truncate — if it does: reuse is the entire point. Returns
-/// whether it was just created, which is exactly what tells the caller
-/// whether to push a `FRESH` (mkfs) or `REUSE` (mount as-is) key handshake.
+/// Create (idempotently) and enforce the Step 8 permission layout for a
+/// tenant's directory:
+///
+/// - `tenants/` itself: **`0701`** (owner `rwx`, other `--x`) — corrected
+///   from an initially-planned `0700`. Reaching `tenants/<T>/net.sock`
+///   needs search (`x`) permission on *every* ancestor directory the path
+///   crosses, not just the immediate parent — `0700` blocked the tenant's
+///   own dropped-privilege `passt`/`cloud-hypervisor` from ever getting
+///   past this directory at all, regardless of how permissive
+///   `tenants/<T>/` itself was. Found by deploying: fixing `tenants/<T>/`
+///   below (from `0711` to `1703`) alone didn't fix `passt`'s
+///   `Failed to bind UNIX domain socket: Permission denied` — this
+///   ancestor was still in the way. Still no `r`, so `tenants/` itself
+///   can't be *listed* — a subdirectory has to already be known by exact
+///   name to be reached, which every legitimate caller already does (the
+///   worker passes the tenant's own directory path directly).
+/// - `tenants/<tenant>/`: `1703` (sticky + owner `rwx` + other `-wx`, no
+///   group), owned by the worker's own uid. Corrected from an earlier `0711`
+///   (execute-only for "other") that looked right but wasn't: `passt` and
+///   `cloud-hypervisor` run as the tenant's *dropped* uid — "other" relative
+///   to this directory's owner (the worker, uid 0) — and they don't just
+///   *open* an existing `store.img`/`vsock.sock`/`net.sock`, they *create*
+///   those files themselves (post-privilege-drop, precisely so no `chown`
+///   is needed — see `drop_privileges_and_maybe_create_store_img`). Creating
+///   a directory entry needs directory *write*, not just search — found by
+///   deploying this and watching `passt` never create its socket at all,
+///   `EACCES` swallowed into a bare 30s timeout with no denial logged
+///   anywhere obvious. Still no `r`: no listing, so a path has to already be
+///   known, not discoverable. The sticky bit is what keeps this from being
+///   the naive "just make it world-writable" mistake: it restricts
+///   unlink/rename inside the directory to the *file's own owner* (or the
+///   directory's owner), even though the directory itself now grants write
+///   more broadly — the same mechanism `/tmp` uses, and for the same
+///   reason: a broadly-writable directory without it would let any other
+///   uid that already knows this tenant's exact path delete or rename its
+///   `store.img`. The worker — which owns the directory itself — can still
+///   always evict `store.img` regardless of which subuid ends up owning it,
+///   since directory-owner is one of the sticky bit's permitted deleters.
+///
+/// Both permissions are re-applied on every call, not just on first
+/// creation, so a manual change on disk between worker runs can't quietly
+/// widen access.
+async fn prepare_tenant_dir(state_dir: &Path, tenant: &TenantId) -> eyre::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tenants_dir = state_dir.join("tenants");
+    tokio::fs::create_dir_all(&tenants_dir)
+        .await
+        .wrap_err_with(|| format!("creating {}", tenants_dir.display()))?;
+    tokio::fs::set_permissions(&tenants_dir, std::fs::Permissions::from_mode(0o701))
+        .await
+        .wrap_err_with(|| format!("chmod 0701 {}", tenants_dir.display()))?;
+
+    // `TenantId::from_wire` already restricts this to `[a-z0-9-]` — no `/`,
+    // no `..` — so joining it directly cannot escape `tenants_dir`. That
+    // invariant is load-bearing here, not just convenient.
+    let tenant_dir = tenants_dir.join(tenant.as_str());
+    tokio::fs::create_dir_all(&tenant_dir)
+        .await
+        .wrap_err_with(|| format!("creating {}", tenant_dir.display()))?;
+    tokio::fs::set_permissions(&tenant_dir, std::fs::Permissions::from_mode(0o1703))
+        .await
+        .wrap_err_with(|| format!("chmod 1703 {}", tenant_dir.display()))?;
+
+    Ok(tenant_dir)
+}
+
+/// Create `path` as a sparse file of `size_mb` if it doesn't already exist,
+/// owned by the caller's own uid. Used only by the test fake now (Step 8
+/// moved the real launcher's creation into a `pre_exec` hook, after the
+/// privilege drop, so the image is owned by the tenant's uid instead — see
+/// `drop_privileges_and_maybe_create_store_img`) — kept as a real,
+/// independently useful helper rather than inlined into the fake, so its own
+/// sparseness/idempotency behavior stays covered by a direct test. A no-op —
+/// not a truncate — if the file exists: reuse is the entire point. Returns
+/// whether it was just created.
 async fn create_store_img_if_absent(path: &Path, size_mb: u64) -> eyre::Result<bool> {
     if tokio::fs::metadata(path).await.is_ok() {
         return Ok(false);
@@ -676,19 +1034,24 @@ pub struct VmPool<L: VmLauncher = CloudHypervisorLauncher> {
     /// image on disk only decrypts with the key it was written with. Never
     /// persisted; see the module doc and [`wipe_orphaned_store_images`].
     keys: HashMap<TenantId, StoreKey>,
+    /// Step 8: each tenant's uid/gid for `cloud-hypervisor`/`passt`. Same
+    /// lifetime as `keys` — see [`UidAllocator`]'s doc for why that's the
+    /// right lifetime rather than something persisted.
+    uids: UidAllocator,
 }
 
 impl VmPool<CloudHypervisorLauncher> {
-    pub fn new(config: VmConfig) -> Self {
+    pub fn new(config: VmConfig) -> eyre::Result<Self> {
         let launcher = CloudHypervisorLauncher {
             config: config.clone(),
         };
-        VmPool {
+        Ok(VmPool {
             config,
             launcher,
             warm: None,
             keys: HashMap::new(),
-        }
+            uids: UidAllocator::new()?,
+        })
     }
 }
 
@@ -700,6 +1063,13 @@ impl<L: VmLauncher> VmPool<L> {
             launcher,
             warm: None,
             keys: HashMap::new(),
+            // Not `UidAllocator::new()`: this fake exists to test the
+            // warm-VM reuse/evict decision, not namespace-bound handling,
+            // and reading the real `/proc/self/uid_map` here made these
+            // tests fail specifically inside the Nix build sandbox (a
+            // single-uid user namespace) — see `UidAllocator::for_test`'s
+            // doc.
+            uids: UidAllocator::for_test(100_000),
         }
     }
 
@@ -724,21 +1094,35 @@ impl<L: VmLauncher> VmPool<L> {
             self.evict().await;
         }
 
-        let fresh = create_store_img_if_absent(&store_img, self.config.store_img_size_mb).await?;
+        // Step 8: (re-)enforce the tenant directory's permission layout
+        // before anything else touches it. `fresh` is now an existence
+        // check only — creation moves into the launcher, after the
+        // privilege drop, so `store.img` ends up owned by the tenant's uid
+        // with no `chown(2)` (see `drop_privileges_and_maybe_create_store_img`).
+        let tenant_dir = prepare_tenant_dir(&self.config.state_dir, tenant).await?;
+        debug_assert_eq!(tenant_dir.join("store.img"), store_img);
+        let fresh = tokio::fs::metadata(&store_img).await.is_err();
 
-        let tenant_dir = store_img
-            .parent()
-            .expect("store_img always has a tenants/<tenant>/ parent");
         let vsock_socket = tenant_dir.join("vsock.sock");
         let console_log = tenant_dir.join("console.log");
         // A stale socket file from a previous, uncleanly-terminated VM would
         // otherwise make the readiness poll below dial a dead socket.
         let _ = tokio::fs::remove_file(&vsock_socket).await;
 
-        tracing::info!(%tenant, store_img = %store_img.display(), "booting VM");
+        let (uid, gid) = self.uids.allocate(tenant)?;
+        let identity = VmIdentity { uid, gid };
+
+        tracing::info!(%tenant, store_img = %store_img.display(), uid = uid.as_raw(), "booting VM");
         let vm = self
             .launcher
-            .boot(tenant, &store_img, &vsock_socket, &console_log)
+            .boot(
+                tenant,
+                &store_img,
+                &vsock_socket,
+                &console_log,
+                identity,
+                fresh,
+            )
             .await?;
         tracing::info!(%tenant, "VM ready");
 
@@ -812,11 +1196,22 @@ mod tests {
         async fn boot(
             &self,
             _tenant: &TenantId,
-            _store_img: &Path,
+            store_img: &Path,
             vsock_socket: &Path,
             console_log: &Path,
+            _identity: VmIdentity,
+            fresh: bool,
         ) -> eyre::Result<LaunchedVm> {
             self.boots.fetch_add(1, Ordering::SeqCst);
+            if fresh {
+                // Mirrors what the real launcher's `pre_exec` hook does
+                // after dropping privilege (materializing the file), so the
+                // fresh/reuse bookkeeping these tests assert on stays honest
+                // across repeated `ensure_vm_for` calls — this fake doesn't
+                // exercise the privilege-drop machinery itself, that's not
+                // what the reuse/evict decision under test is about.
+                create_store_img_if_absent(store_img, 1).await?;
+            }
             // A real, long-lived child process so `try_wait`-based liveness
             // checks in `ensure_vm_for` exercise the same code path as the
             // real launcher, without a second "fake liveness" mechanism.
@@ -1045,5 +1440,19 @@ mod tests {
             1,
             "reusing a still-warm VM must not push the key again"
         );
+    }
+
+    /// The actual fix for the Step 8 permission regression (PLAN.md Phase
+    /// 13's status note): a connect error that will never clear on its own
+    /// (`PermissionDenied` chief among them) must not be classified the same
+    /// as "socket not up yet," or it silently burns the full boot timeout
+    /// instead of failing fast with a diagnosable error.
+    #[test]
+    fn permission_denied_is_not_a_transient_connect_error() {
+        use std::io::ErrorKind;
+        assert!(is_transient_connect_error(ErrorKind::NotFound));
+        assert!(is_transient_connect_error(ErrorKind::ConnectionRefused));
+        assert!(!is_transient_connect_error(ErrorKind::PermissionDenied));
+        assert!(!is_transient_connect_error(ErrorKind::Other));
     }
 }

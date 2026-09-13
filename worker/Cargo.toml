@@ -18,6 +18,12 @@ futures-util.workspace = true
 http-body = "1"
 http-body-util = "0.1"
 kubernix-types.workspace = true
+# Phase 15 Step 8: per-tenant uid separation for `cloud-hypervisor`/`passt`
+# (setuid/setgid/setgroups in a `pre_exec` hook, `prctl(PR_SET_DUMPABLE)` on
+# the worker itself, resolving the `kvm` group by name). Already pulled in
+# transitively (pinned at 0.31.3 in Cargo.lock) so this adds no new crate to
+# fetch, only a direct dependency edge and the two feature flags it needs.
+nix = { version = "0.31", features = ["process", "user"] }
 rand.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "stream"] }
 sha2.workspace = true

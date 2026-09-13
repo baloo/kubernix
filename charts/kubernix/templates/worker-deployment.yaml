@@ -14,15 +14,63 @@ spec:
       labels:
         {{- include "kubernix.selectorLabels" (dict "context" $ "component" "worker") | nindent 8 }}
     spec:
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
+      # Phase 15 Step 8: the worker's own process runs as root (uid 0) —
+      # not `runAsNonRoot`/`runAsUser: 1000` as earlier tried — because a
+      # non-root container can't actually use an added `CAP_SETUID`/
+      # `CAP_SETGID`. Found by deploying: the kernel automatically clears a
+      # process's *effective*/*permitted* capability sets on any 0→nonzero
+      # uid transition (`capabilities(7)`), and that is exactly what
+      # dropping into `runAsUser: 1000` is — confirmed on the deployed pod,
+      # `CapBnd` carried the two added capabilities but `CapEff`/`CapPrm`
+      # were both zero. Kubernetes exposes no field for the securebit
+      # (`SECURE_NOROOT`) that would suppress that clearing, so "non-root
+      # container, capability added back" isn't achievable here — the
+      # container-level `capabilities.drop: [ALL]` below still constrains
+      # what this uid-0 process can actually do to just `SETUID`/`SETGID`,
+      # which is the actual point: it's not full root in practice, only in
+      # name. Each tenant's `cloud-hypervisor`/`passt` still ends up with a
+      # genuinely unprivileged, capability-stripped uid of its own — that
+      # same kernel clearing rule does it for free the moment
+      # `drop_privileges`'s `setuid(derived_uid)` call succeeds.
+      securityContext: {}
       {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: worker
           image: "{{ .Values.image.worker.repository }}:{{ .Values.image.worker.tag }}"
           imagePullPolicy: {{ .Values.image.worker.pullPolicy }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            capabilities:
+              drop: ["ALL"]
+              # SETUID/SETGID: the Step 8 privilege drop into a per-tenant
+              # uid/gid before exec'ing `cloud-hypervisor`/`passt`.
+              #
+              # DAC_OVERRIDE: `cloud-hypervisor` creates `console.log`
+              # (`--serial file=...`) and `vsock.sock` (`--vsock socket=...`)
+              # *after* that drop, so they end up owned by the tenant's own
+              # uid, mode 0600/0700 — unreachable to this uid-0-but-
+              # capability-stripped worker process itself, which needs to
+              # dial `vsock.sock` (`wait_for_vsock_ready`) and read
+              # `console.log` (attached to a boot-failure error) regardless
+              # of which tenant they belong to. A narrower, capability-free
+              # fix (a shared gid + `umask` clearing just the group bits) was
+              # tried first and reverted: verified live against this cluster
+              # that `cloud-hypervisor` resets its own umask early in its own
+              # startup, unconditionally overriding whatever this process
+              # sets beforehand — nothing survives `execve` into it. See
+              # `worker/src/vm.rs`'s doc comment above `drop_privileges` for
+              # the full account, including the narrower alternative's own
+              # side effect (widening `net.sock`'s permissions) found while
+              # diagnosing why it didn't work. This capability only widens
+              # what the worker process itself can reach — it does not touch
+              # what one tenant's dropped-uid `cloud-hypervisor`/`passt` can
+              # reach of another's, which stays governed by uid alone as
+              # Step 8 designed it, and the worker already holds every live
+              # tenant's at-rest encryption key in memory regardless
+              # (`VmPool::keys`), so it crosses no boundary that wasn't
+              # already crossed by that design.
+              add: ["SETUID", "SETGID", "DAC_OVERRIDE"]
           # No DB/S3 credentials, by design — the worker only ever talks to
           # NATS and to pre-signed S3 URLs it's handed over NATS.
           #

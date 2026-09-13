@@ -164,7 +164,10 @@ worker:
   # `devices.kubevirt.io/kvm`-style extended resource a device-plugin
   # DaemonSet on the cluster registers as allocatable — requesting it is
   # what actually grants /dev/kvm access to the container, with no
-  # `privileged: true` and no node-specific `kvm` group GID to guess at.
+  # `privileged: true` and no node-specific `kvm` group GID to guess at:
+  # `/dev/kvm` is 0666 on these nodes (no udev rule narrowing it to a
+  # group), so plain DAC already permits any uid to open it once the
+  # extended resource above has granted the device to the pod's cgroup.
   vm:
     vcpus: 1
     memoryMb: 768
