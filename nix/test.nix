@@ -191,11 +191,39 @@ pkgs.testers.nixosTest {
     machine.wait_for_open_port(2222)
     machine.wait_for_open_port(3000)
 
-    # An ssh key for the client. The frontend accepts any key here, but Lix
-    # still runs a real ssh, so one has to exist.
+    # An ssh key for the client. `AuthPolicy::RequireKey` is the frontend's
+    # default now (Phase 16), so the key has to be bound to a tenant in
+    # `tenant_auth_bindings` before any connection using it is accepted --
+    # unlike the old `AcceptAll` default, an unbound key gets rejected
+    # outright rather than attributed an unverified tenant.
     # Single-quoted on the Python side so the empty passphrase can be written
     # with double quotes -- a pair of single quotes would end this Nix string.
     machine.succeed('mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519')
+
+    # Fingerprint in the same `SHA256:<base64>` form `PublicKey::fingerprint`
+    # produces server-side (`server/src/ssh.rs`) -- the second field of
+    # `ssh-keygen -l`'s default output.
+    fingerprint = machine.succeed(
+        "ssh-keygen -lf /root/.ssh/id_ed25519.pub | awk '{print $2}'"
+    ).strip()
+
+    # Provisioned by hand here, the way an operator would over a privileged
+    # connection (PLAN.md Phase 16): a `tenants` row, then a binding from this
+    # key's fingerprint to it. `postgres` is a superuser and bypasses
+    # row-level security, same as every other `psql` call in this test that
+    # isn't the row-level-security check itself.
+    tenant_id = "user-testclient-0000000000000000"
+    machine.succeed(
+        "psql -U postgres -h 127.0.0.1 kubernix -c "
+        "\"INSERT INTO tenants (id, identity, verified) VALUES "
+        f"('{tenant_id}', 'key:{fingerprint}', true) ON CONFLICT (id) DO NOTHING\""
+    )
+    machine.succeed(
+        "psql -U postgres -h 127.0.0.1 kubernix -c "
+        "\"INSERT INTO tenant_auth_bindings (key_type, key_id, tenant) "
+        f"VALUES ('ssh', '{fingerprint}', '{tenant_id}') "
+        "ON CONFLICT (key_type, key_id) DO NOTHING\""
+    )
 
 
     with subtest("a two-derivation graph builds on the worker and comes back"):
@@ -228,13 +256,15 @@ pkgs.testers.nixosTest {
 
 
     # Every later step is scoped to this tenant. Reading it from the database
-    # also asserts the frontend recorded who the client was.
+    # also asserts the frontend attributed the connection to the tenant the
+    # binding above named -- not a username-derived id, which is what
+    # `AcceptAll` would have produced instead.
     tenant = machine.succeed(
         "psql -U postgres -h 127.0.0.1 kubernix -tAc "
         "\"SELECT id FROM tenants LIMIT 1\""
     ).strip()
     print(f"tenant {tenant}")
-    assert tenant.startswith("user-root-"), f"unexpected tenant: {tenant}"
+    assert tenant == tenant_id, f"unexpected tenant: {tenant}"
 
 
     with subtest("the built path is signed and the key is published"):
