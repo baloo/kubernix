@@ -442,6 +442,66 @@ pkgs.testers.nixosTest {
         assert "built after rotation" in content, f"unexpected output: {content}"
 
 
+    # `auth_publickey` shares the same 16-connection pool as kubernix-gc and
+    # kubernix-rotate-capability-secret, both polling every couple of seconds,
+    # so its `tenant_auth_bindings` lookup can occasionally lose the race for
+    # a pool connection and get fail-closed rejected (`ssh.rs` logs "tenant
+    # binding lookup failed") under this VM's contention, purely as a client
+    # of the same pool, unrelated to shell/exec handling. Retrying the
+    # connection rides out that flake instead of conflating it with an actual
+    # hang -- a real hang would still fail every attempt via the timeout.
+    #
+    # Placed here, after every subtest whose own timing matters (the
+    # "signed and published"/row-level-security checks above run right after
+    # the first build on purpose, inside kubernix-gc's tight 60s cutoff -- see
+    # that subtest's own comment) and before the final GC subtest, which has
+    # to stay last: these open fresh connections and touch no shared state,
+    # so where they land only has to avoid disturbing those two constraints.
+    def ssh_no_check(command_suffix=""):
+        # 45s per attempt: comfortably past sqlx's own ~30s pool-acquire wait,
+        # so a pool-contention rejection has time to actually happen (and be
+        # retried below) instead of this wrapper's own timeout cutting the
+        # attempt off first and misreporting contention as a hang.
+        for _ in range(3):
+            # `</dev/null`: `machine.execute`'s backdoor shell never gives its
+            # commands an EOF'd stdin. A `shell`-request `ssh` (no remote
+            # command) forwards local stdin over the channel and, without
+            # this, waited on that open-ended stdin indefinitely even after
+            # the server sent its own channel close -- a client-side hang
+            # this test's own timeout could not have caught either, since
+            # nothing server-side was actually stuck.
+            # `2>&1`: `machine.execute` only captures stdout (see its own
+            # docstring) -- the unsupported-command message is deliberately
+            # sent as stderr (`exec_request`'s `extended_data` call), so
+            # without this it would never show up in `output` at all.
+            status, output = machine.execute(
+                f"timeout 45 ssh {ssh_opts} -p 2222 root@127.0.0.1{command_suffix} </dev/null 2>&1"
+            )
+            if status != 255:  # 255: ssh itself failed, e.g. auth rejected
+                return status, output
+        return status, output
+
+    with subtest("a plain shell request gets a message and a clean hangup, not a hang"):
+        # A client that asks for an interactive shell instead of exec'ing
+        # `<remote-program> --stdio` used to just hang forever -- russh's
+        # default `shell_request` silently succeeds and never sends anything
+        # back. `SshHandler::shell_request` (server/src/ssh.rs) now replies
+        # and closes the channel, so this must return promptly rather than
+        # timing out.
+        status, output = ssh_no_check()
+        assert status != 124, f"shell request hung instead of closing:\n{output}"
+        assert "use the lix plugin instead" in output, f"unexpected output: {output}"
+
+    with subtest("an unsupported exec command is rejected with an explicit message"):
+        # Not `--stdio`, so `is_stdio_request` rejects it. The message should
+        # spell out what is actually expected instead of just echoing the
+        # command back -- see `exec_request` in server/src/ssh.rs.
+        status, output = ssh_no_check(" 'bash -c true'")
+        assert status != 124, f"exec of an unsupported command hung:\n{output}"
+        assert "unsupported command" in output, f"unexpected output: {output}"
+        assert "--stdio" in output, f"message did not name the expected command:\n{output}"
+
+
     with subtest("garbage collection removes an aged, unreferenced path"):
         # Last of all, deliberately: this consumes the path built in the very
         # first subtest, which every subtest above depends on still existing.

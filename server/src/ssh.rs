@@ -160,6 +160,52 @@ impl Handler for SshHandler {
         }
     }
 
+    /// A client that asks for an interactive shell (rather than `exec`ing
+    /// `<remote-program> --stdio`) is not using the Lix transport at all —
+    /// most likely someone poking at the endpoint with a plain `ssh`. Left
+    /// unhandled, russh's default `shell_request` silently succeeds and then
+    /// never sends anything, so the client just hangs forever. Tell them
+    /// what this is for and hang up instead.
+    async fn shell_request(
+        &mut self,
+        channel_id: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let handle = session.handle();
+        let name = self
+            .tenant
+            .as_ref()
+            .map(|t| t.id.to_string())
+            .or_else(|| self.user.clone())
+            .unwrap_or_else(|| "there".to_string());
+
+        session.channel_success(channel_id)?;
+
+        // `Handle` methods enqueue onto the same session task that is
+        // synchronously running this very handler, so awaiting them here
+        // directly would wait on a queue nothing can drain until this
+        // function returns — a self-deadlock. Send the goodbye message from
+        // a spawned task instead, the way `exec_request`'s success path
+        // already has to for unrelated reasons (see the comment there).
+        tokio::spawn(async move {
+            let _ = handle
+                .data(
+                    channel_id,
+                    format!(
+                        "hey {name}, you've successfully authenticated, but kubernix has no \
+                         shell to give you — use the lix plugin instead.\n"
+                    )
+                    .into_bytes(),
+                )
+                .await;
+            let _ = handle.eof(channel_id).await;
+            let _ = handle.exit_status_request(channel_id, 1).await;
+            let _ = handle.close(channel_id).await;
+        });
+        self.channels.remove(&channel_id);
+        Ok(())
+    }
+
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
@@ -184,16 +230,38 @@ impl Handler for SshHandler {
         // reliably `nix-daemon`. Match on the `--stdio` flag instead.
         if !is_stdio_request(&command) {
             tracing::warn!(%command, "rejecting unsupported command");
-            session.channel_failure(channel_id)?;
-            let _ = handle
-                .extended_data(
-                    channel_id,
-                    1,
-                    format!("kubernix: unsupported command: {command}\n").into_bytes(),
-                )
-                .await;
-            let _ = handle.exit_status_request(channel_id, 127).await;
-            let _ = handle.close(channel_id).await;
+
+            // `channel_failure` here would tell the client the *request*
+            // itself was refused, and OpenSSH tears the session down right
+            // then without ever reading the extended-data message below --
+            // confirmed against a real `ssh` client, which prints nothing
+            // but "exec request failed on channel 0" and exits. Accepting
+            // instead (as if the command ran) is what lets the message and
+            // exit status actually reach the client, the same way
+            // `shell_request` already has to.
+            session.channel_success(channel_id)?;
+
+            // Same self-deadlock hazard as `shell_request`: `Handle` calls
+            // are drained by this very session task, so they must not be
+            // awaited inline from within the handler that task is currently
+            // running. Spawn instead.
+            tokio::spawn(async move {
+                let _ = handle
+                    .extended_data(
+                        channel_id,
+                        1,
+                        format!(
+                            "kubernix: unsupported command: {command}\n\
+                             kubernix only serves the Lix daemon protocol; expected an exec of \
+                             `<remote-program> --stdio` (e.g. `nix-daemon --stdio`), optionally \
+                             followed by `--store <uri>`.\n"
+                        )
+                        .into_bytes(),
+                    )
+                    .await;
+                let _ = handle.exit_status_request(channel_id, 127).await;
+                let _ = handle.close(channel_id).await;
+            });
             self.channels.remove(&channel_id);
             return Ok(());
         }
