@@ -13,12 +13,49 @@
 //!   the daemon protocol has no way to say "I could not tell" about most of
 //!   them. Writes propagate their error, since a lost write is not something to
 //!   paper over.
+//!
+//! ## Why every operation goes through an actor
+//!
+//! Each SSH connection the frontend serves gets its own dedicated OS thread
+//! with a single-threaded Tokio runtime (`server/src/ssh.rs`'s `exec_request`
+//! — capnp-rpc capabilities are `!Send`, PLAN.md Phase 4). If that thread also
+//! awaits `sqlx` calls directly, the number of OS threads independently
+//! trying to poll a pool-acquire timeout grows with the number of concurrent
+//! connections, unbounded. Under load a thread can go unscheduled long enough
+//! that its own `acquire_timeout` future never gets polled at all, turning a
+//! bounded ~30s wait into an apparently-unbounded hang — observed in
+//! practice (PLAN.md Phase 8 and Phase 16's status notes).
+//!
+//! The fix: no caller — not a connection's dedicated thread, not the main
+//! runtime's `auth_publickey` task — ever awaits `self.pool` directly.
+//! Instead every [`PathStore`]/[`CapabilitySecretStore`]/[`TenantAuthStore`]
+//! method sends a [`DbRequest`] over an `mpsc` channel and awaits a `oneshot`
+//! reply. The channel is served by [`spawn_db_actor`], a small, fixed number
+//! of worker threads ([`db_actor_threads`]) on their own dedicated runtime,
+//! independent of how many SSH connections exist. That bounds the count of
+//! threads that ever need to stay promptly scheduled to poll a database
+//! timeout, decoupling it from connection count entirely. Real concurrency is
+//! unaffected: the actor spawns each request as its own task rather than
+//! serializing them, so the `PgPool`'s own `max_connections` remains the only
+//! throughput limit, exactly as before.
+//!
+//! No cross-request transactions are needed (nothing in this codebase
+//! composes more than one `Store` call into one atomic unit — see
+//! `record_outputs` in `daemon_rpc.rs`, whose "all-or-nothing" is an
+//! application-level check-before-any-write, not a DB transaction spanning
+//! several operations), and no ordering guarantee beyond what already
+//! exists: a single caller's own calls are already ordered by the fact that
+//! it awaits each reply before issuing the next, and concurrent writes from
+//! different callers were never ordered relative to each other — Postgres's
+//! own `ON CONFLICT`/MVCC semantics resolve those the same way with or
+//! without the actor in between.
 
 use std::sync::Arc;
 
 use sha2::{Sha256, digest::Output};
 use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::jobs::JobOutcome;
 use crate::store::{
@@ -31,10 +68,25 @@ use uuid::Uuid;
 
 use crate::tenant::{KeyType, Tenant, TenantId};
 
+/// Worker threads on the dedicated runtime [`DbRequest`]s are served from.
+///
+/// Fixed and small, deliberately independent of how many SSH connections are
+/// open: that decoupling is the whole point of the actor (see the module doc
+/// comment). `num_cpus` rather than a hardcoded constant, since it is the
+/// same "keep pace with the box's actual scheduling capacity" reasoning that
+/// picked worker-thread counts everywhere else in this codebase.
+fn db_actor_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
 pub struct PostgresStore {
     // `pub(crate)` rather than private: `crate::gc` runs its own statements
     // (advisory lock, drain/mark/sweep) directly against the pool, which is
-    // GC-specific enough that it does not belong on the `Store` trait.
+    // GC-specific enough that it does not belong on the `Store` trait. This
+    // bypasses the actor below entirely — `kubernix-gc`/`kubernix-rotate-
+    // capability-secret` are their own processes with their own pool, never
+    // sharing the SSH frontend's per-connection thread pile-up, so there is
+    // nothing for the actor to fix for them.
     pub(crate) pool: PgPool,
     /// In-process cache over `capability_secrets`, so minting/verifying a
     /// token is not a database round trip on every request. Global rather
@@ -46,6 +98,10 @@ pub struct PostgresStore {
     /// `store::MemoryStore` already does for its own locks, which this
     /// matches rather than mixing lock strategies for no functional reason.
     capability_secrets: std::sync::Mutex<CapabilitySecretCache>,
+    /// Every [`Store`](crate::store::Store)-trait operation is dispatched
+    /// here rather than run inline — see [`DbRequest`] and the module doc
+    /// comment for why.
+    db_tx: mpsc::UnboundedSender<DbRequest>,
 }
 
 /// Positive cache for capability secrets. Safe to hold stale for a while:
@@ -161,10 +217,14 @@ impl PostgresStore {
             .await?;
 
         tracing::info!("database ready");
-        Ok(Arc::new(Self {
+        let (db_tx, db_rx) = mpsc::unbounded_channel();
+        let store = Arc::new(Self {
             pool,
             capability_secrets: std::sync::Mutex::new(CapabilitySecretCache::default()),
-        }))
+            db_tx,
+        });
+        spawn_db_actor(Arc::clone(&store), db_rx);
+        Ok(store)
     }
 
     /// Begin a transaction with `app.current_tenant` set to `tenant` for its
@@ -346,9 +406,14 @@ impl PostgresStore {
     }
 }
 
-#[async_trait::async_trait]
-impl PathStore for PostgresStore {
-    async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool {
+/// The database work behind every [`Store`](crate::store::Store) operation.
+///
+/// Named `_db` throughout to keep them unambiguously distinct from the
+/// dispatching trait methods below, which share a base name but send a
+/// [`DbRequest`] instead of touching `self.pool` directly — see the module
+/// doc comment.
+impl PostgresStore {
+    async fn is_valid_path_db(&self, tenant: &TenantId, path: &StorePath) -> bool {
         let Ok(mut tx) = self.tenant_scoped(tenant).await else {
             tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
             return false;
@@ -365,7 +430,7 @@ impl PathStore for PostgresStore {
             .is_some()
     }
 
-    async fn query_valid_paths(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath> {
+    async fn query_valid_paths_db(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath> {
         let Ok(mut tx) = self.tenant_scoped(tenant).await else {
             tracing::error!(%tenant, "could not open a tenant-scoped transaction");
             return Vec::new();
@@ -385,7 +450,7 @@ impl PathStore for PostgresStore {
         rows.into_iter().map(StorePath::new).collect()
     }
 
-    async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<StorePath> {
+    async fn query_all_valid_paths_db(&self, tenant: &TenantId) -> Vec<StorePath> {
         let Ok(mut tx) = self.tenant_scoped(tenant).await else {
             tracing::error!(%tenant, "could not open a tenant-scoped transaction");
             return Vec::new();
@@ -402,7 +467,7 @@ impl PathStore for PostgresStore {
         rows.into_iter().map(StorePath::new).collect()
     }
 
-    async fn query_path_info(&self, tenant: &TenantId, path: &StorePath) -> Option<PathInfo> {
+    async fn query_path_info_db(&self, tenant: &TenantId, path: &StorePath) -> Option<PathInfo> {
         let Ok(mut tx) = self.tenant_scoped(tenant).await else {
             tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
             return None;
@@ -419,7 +484,7 @@ impl PathStore for PostgresStore {
             .map(|row| Self::row_to_info(&row))
     }
 
-    async fn query_path_from_hash_part(
+    async fn query_path_from_hash_part_db(
         &self,
         tenant: &TenantId,
         hash_part: &str,
@@ -442,7 +507,7 @@ impl PathStore for PostgresStore {
         .map(StorePath::new)
     }
 
-    async fn query_referrers(&self, tenant: &TenantId, path: &StorePath) -> Vec<StorePath> {
+    async fn query_referrers_db(&self, tenant: &TenantId, path: &StorePath) -> Vec<StorePath> {
         let Ok(mut tx) = self.tenant_scoped(tenant).await else {
             tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
             return Vec::new();
@@ -462,7 +527,7 @@ impl PathStore for PostgresStore {
         rows.into_iter().map(StorePath::new).collect()
     }
 
-    async fn record_path(
+    async fn record_path_db(
         &self,
         tenant: &TenantId,
         info: PathInfo,
@@ -479,7 +544,7 @@ impl PathStore for PostgresStore {
         self.upsert_path(tenant, &info, &object, tier).await
     }
 
-    async fn output_object(&self, tenant: &TenantId, path: &StorePath) -> Option<RemoteObject> {
+    async fn output_object_db(&self, tenant: &TenantId, path: &StorePath) -> Option<RemoteObject> {
         let mut tx = self
             .tenant_scoped(tenant)
             .await
@@ -507,7 +572,7 @@ impl PathStore for PostgresStore {
         })
     }
 
-    async fn object_known(&self, key: &ObjectKey) -> bool {
+    async fn object_known_db(&self, key: &ObjectKey) -> bool {
         sqlx::query("SELECT 1 FROM objects WHERE key = $1")
             .bind(key.as_str())
             .fetch_optional(&self.pool)
@@ -519,7 +584,7 @@ impl PathStore for PostgresStore {
             .is_some()
     }
 
-    async fn find_verified_by_hash_part(
+    async fn find_verified_by_hash_part_db(
         &self,
         hash_part: &str,
     ) -> Option<(PathInfo, RemoteObject)> {
@@ -562,7 +627,7 @@ impl PathStore for PostgresStore {
         Some((Self::row_to_info(&row), object))
     }
 
-    async fn add_signatures(
+    async fn add_signatures_db(
         &self,
         tenant: &TenantId,
         path: &StorePath,
@@ -590,8 +655,8 @@ impl PathStore for PostgresStore {
         Ok(())
     }
 
-    async fn query_missing(&self, tenant: &TenantId, targets: &[StorePath]) -> MissingPaths {
-        let present = self.query_valid_paths(tenant, targets).await;
+    async fn query_missing_db(&self, tenant: &TenantId, targets: &[StorePath]) -> MissingPaths {
+        let present = self.query_valid_paths_db(tenant, targets).await;
         let mut missing = MissingPaths::default();
         for target in targets {
             if !present.contains(target) {
@@ -602,7 +667,7 @@ impl PathStore for PostgresStore {
         missing
     }
 
-    async fn register_tenant(&self, tenant: &Tenant) -> Result<()> {
+    async fn register_tenant_db(&self, tenant: &Tenant) -> Result<()> {
         self.ensure_tenant(tenant).await
     }
 
@@ -613,7 +678,7 @@ impl PathStore for PostgresStore {
     /// tenant converge on whichever landed first. Losing that race silently and
     /// signing with a key nobody else has would produce signatures no client
     /// could verify.
-    async fn signer(&self, tenant: &TenantId) -> Option<Arc<dyn Signer>> {
+    async fn signer_db(&self, tenant: &TenantId) -> Option<Arc<dyn Signer>> {
         self.ensure_tenant_id(tenant).await.ok()?;
 
         let name = key_name_for(tenant);
@@ -658,7 +723,7 @@ impl PathStore for PostgresStore {
         }
     }
 
-    async fn tier(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier> {
+    async fn tier_db(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier> {
         let Ok(mut tx) = self.tenant_scoped(tenant).await else {
             tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
             return None;
@@ -689,7 +754,7 @@ impl PathStore for PostgresStore {
     /// recently used than it was, which is a stricter retention outcome, not
     /// an unsafe one, so a failure here is logged rather than propagated to
     /// callers that only wanted to read a path.
-    async fn record_access(&self, tenant: &TenantId, path: &StorePath) {
+    async fn record_access_db(&self, tenant: &TenantId, path: &StorePath) {
         let mut tx = match self.tenant_scoped(tenant).await {
             Ok(tx) => tx,
             Err(e) => {
@@ -712,9 +777,9 @@ impl PathStore for PostgresStore {
     }
 
     /// Insert one `jobs` row for a terminal outcome. Best-effort, like
-    /// [`Self::record_access`] — see the trait doc comment for why this is
+    /// [`Self::record_access_db`] — see the trait doc comment for why this is
     /// insert-only rather than insert-then-update.
-    async fn record_job_outcome(
+    async fn record_job_outcome_db(
         &self,
         tenant: &TenantId,
         job_id: Uuid,
@@ -774,11 +839,8 @@ impl PathStore for PostgresStore {
             tracing::warn!(error = %e, %tenant, %job_id, "recording job outcome failed");
         }
     }
-}
 
-#[async_trait::async_trait]
-impl CapabilitySecretStore for PostgresStore {
-    async fn current_capability_secret(&self) -> (u64, [u8; 32]) {
+    async fn current_capability_secret_db(&self) -> (u64, [u8; 32]) {
         {
             let cache = self.capability_secrets.lock().unwrap();
             if let Some((fetched_at, kid, secret)) = cache.current
@@ -846,7 +908,7 @@ impl CapabilitySecretStore for PostgresStore {
         (kid, secret)
     }
 
-    async fn capability_secret(&self, kid: u64) -> Option<[u8; 32]> {
+    async fn capability_secret_db(&self, kid: u64) -> Option<[u8; 32]> {
         {
             let cache = self.capability_secrets.lock().unwrap();
             if let Some(secret) = cache.by_kid.get(&kid) {
@@ -873,11 +935,8 @@ impl CapabilitySecretStore for PostgresStore {
         cache.by_kid.insert(kid, secret);
         Some(secret)
     }
-}
 
-#[async_trait::async_trait]
-impl TenantAuthStore for PostgresStore {
-    async fn find_tenant_by_binding(
+    async fn find_tenant_by_binding_db(
         &self,
         key_type: KeyType,
         key_id: &str,
@@ -911,6 +970,549 @@ impl TenantAuthStore for PostgresStore {
                 Ok(None)
             }
         }
+    }
+
+    /// Send one [`DbRequest`] to the actor and await its answer.
+    ///
+    /// `None` means the actor could not be reached at all (its channel is
+    /// closed — the actor thread panicked or never started) or it dropped
+    /// the reply without answering (should not happen: every [`DbRequest`]
+    /// variant is handled and always sends a reply). Both are treated as "no
+    /// answer" by callers, the same way a query that failed for any other
+    /// reason already was before the actor existed.
+    async fn call<T: Send + 'static>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<T>) -> DbRequest,
+    ) -> Option<T> {
+        let (reply, rx) = oneshot::channel();
+        if self.db_tx.send(build(reply)).is_err() {
+            tracing::error!("db request actor is not running");
+            return None;
+        }
+        match rx.await {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::error!("db request actor dropped the reply without answering");
+                None
+            }
+        }
+    }
+}
+
+/// One formalized database operation, sent from a `Store`-trait method to the
+/// actor [`spawn_db_actor`] runs. See the module doc comment for why every
+/// operation goes through this instead of touching `self.pool` directly.
+enum DbRequest {
+    IsValidPath {
+        tenant: TenantId,
+        path: StorePath,
+        reply: oneshot::Sender<bool>,
+    },
+    QueryValidPaths {
+        tenant: TenantId,
+        paths: Vec<StorePath>,
+        reply: oneshot::Sender<Vec<StorePath>>,
+    },
+    QueryAllValidPaths {
+        tenant: TenantId,
+        reply: oneshot::Sender<Vec<StorePath>>,
+    },
+    QueryPathInfo {
+        tenant: TenantId,
+        path: StorePath,
+        reply: oneshot::Sender<Option<PathInfo>>,
+    },
+    QueryPathFromHashPart {
+        tenant: TenantId,
+        hash_part: String,
+        reply: oneshot::Sender<Option<StorePath>>,
+    },
+    QueryReferrers {
+        tenant: TenantId,
+        path: StorePath,
+        reply: oneshot::Sender<Vec<StorePath>>,
+    },
+    RecordPath {
+        tenant: TenantId,
+        info: PathInfo,
+        object: RemoteObject,
+        tier: Tier,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    OutputObject {
+        tenant: TenantId,
+        path: StorePath,
+        reply: oneshot::Sender<Option<RemoteObject>>,
+    },
+    ObjectKnown {
+        key: ObjectKey,
+        reply: oneshot::Sender<bool>,
+    },
+    FindVerifiedByHashPart {
+        hash_part: String,
+        reply: oneshot::Sender<Option<(PathInfo, RemoteObject)>>,
+    },
+    AddSignatures {
+        tenant: TenantId,
+        path: StorePath,
+        sigs: Vec<String>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    QueryMissing {
+        tenant: TenantId,
+        targets: Vec<StorePath>,
+        reply: oneshot::Sender<MissingPaths>,
+    },
+    RegisterTenant {
+        tenant: Tenant,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Signer {
+        tenant: TenantId,
+        reply: oneshot::Sender<Option<Arc<dyn Signer>>>,
+    },
+    Tier {
+        tenant: TenantId,
+        path: StorePath,
+        reply: oneshot::Sender<Option<Tier>>,
+    },
+    RecordAccess {
+        tenant: TenantId,
+        path: StorePath,
+        reply: oneshot::Sender<()>,
+    },
+    RecordJobOutcome {
+        tenant: TenantId,
+        job_id: Uuid,
+        derivation_path: StorePath,
+        system: String,
+        outcome: JobOutcome,
+        reply: oneshot::Sender<()>,
+    },
+    CurrentCapabilitySecret {
+        reply: oneshot::Sender<(u64, [u8; 32])>,
+    },
+    CapabilitySecret {
+        kid: u64,
+        reply: oneshot::Sender<Option<[u8; 32]>>,
+    },
+    FindTenantByBinding {
+        key_type: KeyType,
+        key_id: String,
+        reply: oneshot::Sender<Result<Option<TenantId>>>,
+    },
+}
+
+impl DbRequest {
+    /// Run this request's database work and answer its `reply`. A dropped
+    /// `reply` (the caller gave up waiting) is not logged — an ordinary race,
+    /// not a failure of this request.
+    async fn dispatch(self, store: &PostgresStore) {
+        match self {
+            DbRequest::IsValidPath {
+                tenant,
+                path,
+                reply,
+            } => {
+                let _ = reply.send(store.is_valid_path_db(&tenant, &path).await);
+            }
+            DbRequest::QueryValidPaths {
+                tenant,
+                paths,
+                reply,
+            } => {
+                let _ = reply.send(store.query_valid_paths_db(&tenant, &paths).await);
+            }
+            DbRequest::QueryAllValidPaths { tenant, reply } => {
+                let _ = reply.send(store.query_all_valid_paths_db(&tenant).await);
+            }
+            DbRequest::QueryPathInfo {
+                tenant,
+                path,
+                reply,
+            } => {
+                let _ = reply.send(store.query_path_info_db(&tenant, &path).await);
+            }
+            DbRequest::QueryPathFromHashPart {
+                tenant,
+                hash_part,
+                reply,
+            } => {
+                let _ = reply.send(
+                    store
+                        .query_path_from_hash_part_db(&tenant, &hash_part)
+                        .await,
+                );
+            }
+            DbRequest::QueryReferrers {
+                tenant,
+                path,
+                reply,
+            } => {
+                let _ = reply.send(store.query_referrers_db(&tenant, &path).await);
+            }
+            DbRequest::RecordPath {
+                tenant,
+                info,
+                object,
+                tier,
+                reply,
+            } => {
+                let _ = reply.send(store.record_path_db(&tenant, info, object, tier).await);
+            }
+            DbRequest::OutputObject {
+                tenant,
+                path,
+                reply,
+            } => {
+                let _ = reply.send(store.output_object_db(&tenant, &path).await);
+            }
+            DbRequest::ObjectKnown { key, reply } => {
+                let _ = reply.send(store.object_known_db(&key).await);
+            }
+            DbRequest::FindVerifiedByHashPart { hash_part, reply } => {
+                let _ = reply.send(store.find_verified_by_hash_part_db(&hash_part).await);
+            }
+            DbRequest::AddSignatures {
+                tenant,
+                path,
+                sigs,
+                reply,
+            } => {
+                let _ = reply.send(store.add_signatures_db(&tenant, &path, sigs).await);
+            }
+            DbRequest::QueryMissing {
+                tenant,
+                targets,
+                reply,
+            } => {
+                let _ = reply.send(store.query_missing_db(&tenant, &targets).await);
+            }
+            DbRequest::RegisterTenant { tenant, reply } => {
+                let _ = reply.send(store.register_tenant_db(&tenant).await);
+            }
+            DbRequest::Signer { tenant, reply } => {
+                let _ = reply.send(store.signer_db(&tenant).await);
+            }
+            DbRequest::Tier {
+                tenant,
+                path,
+                reply,
+            } => {
+                let _ = reply.send(store.tier_db(&tenant, &path).await);
+            }
+            DbRequest::RecordAccess {
+                tenant,
+                path,
+                reply,
+            } => {
+                store.record_access_db(&tenant, &path).await;
+                let _ = reply.send(());
+            }
+            DbRequest::RecordJobOutcome {
+                tenant,
+                job_id,
+                derivation_path,
+                system,
+                outcome,
+                reply,
+            } => {
+                store
+                    .record_job_outcome_db(&tenant, job_id, &derivation_path, &system, &outcome)
+                    .await;
+                let _ = reply.send(());
+            }
+            DbRequest::CurrentCapabilitySecret { reply } => {
+                let _ = reply.send(store.current_capability_secret_db().await);
+            }
+            DbRequest::CapabilitySecret { kid, reply } => {
+                let _ = reply.send(store.capability_secret_db(kid).await);
+            }
+            DbRequest::FindTenantByBinding {
+                key_type,
+                key_id,
+                reply,
+            } => {
+                let _ = reply.send(store.find_tenant_by_binding_db(key_type, &key_id).await);
+            }
+        }
+    }
+}
+
+/// Spawn the dedicated runtime [`DbRequest`]s are served from — see the
+/// module doc comment for why this exists.
+///
+/// Each request is spawned as its own task rather than processed one at a
+/// time: real concurrency stays bounded by the `PgPool`'s own
+/// `max_connections`, exactly as it was before this actor existed. What
+/// changes is only which threads have to stay promptly scheduled to poll a
+/// database timeout — a small, fixed number, independent of how many SSH
+/// connections are open.
+fn spawn_db_actor(store: Arc<PostgresStore>, mut rx: mpsc::UnboundedReceiver<DbRequest>) {
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(db_actor_threads())
+            .thread_name("kubernix-db-actor")
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build the database actor runtime");
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            while let Some(req) = rx.recv().await {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move { req.dispatch(&store).await });
+            }
+        });
+    });
+}
+
+#[async_trait::async_trait]
+impl PathStore for PostgresStore {
+    async fn is_valid_path(&self, tenant: &TenantId, path: &StorePath) -> bool {
+        let (tenant, path) = (tenant.clone(), path.clone());
+        self.call(|reply| DbRequest::IsValidPath {
+            tenant,
+            path,
+            reply,
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn query_valid_paths(&self, tenant: &TenantId, paths: &[StorePath]) -> Vec<StorePath> {
+        let (tenant, paths) = (tenant.clone(), paths.to_vec());
+        self.call(|reply| DbRequest::QueryValidPaths {
+            tenant,
+            paths,
+            reply,
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn query_all_valid_paths(&self, tenant: &TenantId) -> Vec<StorePath> {
+        let tenant = tenant.clone();
+        self.call(|reply| DbRequest::QueryAllValidPaths { tenant, reply })
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn query_path_info(&self, tenant: &TenantId, path: &StorePath) -> Option<PathInfo> {
+        let (tenant, path) = (tenant.clone(), path.clone());
+        self.call(|reply| DbRequest::QueryPathInfo {
+            tenant,
+            path,
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    async fn query_path_from_hash_part(
+        &self,
+        tenant: &TenantId,
+        hash_part: &str,
+    ) -> Option<StorePath> {
+        let (tenant, hash_part) = (tenant.clone(), hash_part.to_string());
+        self.call(|reply| DbRequest::QueryPathFromHashPart {
+            tenant,
+            hash_part,
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    async fn query_referrers(&self, tenant: &TenantId, path: &StorePath) -> Vec<StorePath> {
+        let (tenant, path) = (tenant.clone(), path.clone());
+        self.call(|reply| DbRequest::QueryReferrers {
+            tenant,
+            path,
+            reply,
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn record_path(
+        &self,
+        tenant: &TenantId,
+        info: PathInfo,
+        object: RemoteObject,
+        tier: Tier,
+    ) -> Result<()> {
+        let tenant = tenant.clone();
+        self.call(|reply| DbRequest::RecordPath {
+            tenant,
+            info,
+            object,
+            tier,
+            reply,
+        })
+        .await
+        .unwrap_or_else(|| Err(StoreError::Other("db request actor unavailable".into())))
+    }
+
+    async fn output_object(&self, tenant: &TenantId, path: &StorePath) -> Option<RemoteObject> {
+        let (tenant, path) = (tenant.clone(), path.clone());
+        self.call(|reply| DbRequest::OutputObject {
+            tenant,
+            path,
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    async fn object_known(&self, key: &ObjectKey) -> bool {
+        let key = key.clone();
+        self.call(|reply| DbRequest::ObjectKnown { key, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn find_verified_by_hash_part(
+        &self,
+        hash_part: &str,
+    ) -> Option<(PathInfo, RemoteObject)> {
+        let hash_part = hash_part.to_string();
+        self.call(|reply| DbRequest::FindVerifiedByHashPart { hash_part, reply })
+            .await
+            .flatten()
+    }
+
+    async fn add_signatures(
+        &self,
+        tenant: &TenantId,
+        path: &StorePath,
+        sigs: Vec<String>,
+    ) -> Result<()> {
+        let (tenant, path) = (tenant.clone(), path.clone());
+        self.call(|reply| DbRequest::AddSignatures {
+            tenant,
+            path,
+            sigs,
+            reply,
+        })
+        .await
+        .unwrap_or_else(|| Err(StoreError::Other("db request actor unavailable".into())))
+    }
+
+    async fn query_missing(&self, tenant: &TenantId, targets: &[StorePath]) -> MissingPaths {
+        let (tenant, targets) = (tenant.clone(), targets.to_vec());
+        self.call(|reply| DbRequest::QueryMissing {
+            tenant,
+            targets,
+            reply,
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn register_tenant(&self, tenant: &Tenant) -> Result<()> {
+        let tenant = tenant.clone();
+        self.call(|reply| DbRequest::RegisterTenant { tenant, reply })
+            .await
+            .unwrap_or_else(|| Err(StoreError::Other("db request actor unavailable".into())))
+    }
+
+    async fn signer(&self, tenant: &TenantId) -> Option<Arc<dyn Signer>> {
+        let tenant = tenant.clone();
+        self.call(|reply| DbRequest::Signer { tenant, reply })
+            .await
+            .flatten()
+    }
+
+    async fn tier(&self, tenant: &TenantId, path: &StorePath) -> Option<Tier> {
+        let (tenant, path) = (tenant.clone(), path.clone());
+        self.call(|reply| DbRequest::Tier {
+            tenant,
+            path,
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    async fn record_access(&self, tenant: &TenantId, path: &StorePath) {
+        let (tenant, path) = (tenant.clone(), path.clone());
+        self.call(|reply| DbRequest::RecordAccess {
+            tenant,
+            path,
+            reply,
+        })
+        .await;
+    }
+
+    async fn record_job_outcome(
+        &self,
+        tenant: &TenantId,
+        job_id: Uuid,
+        derivation_path: &StorePath,
+        system: &str,
+        outcome: &JobOutcome,
+    ) {
+        let (tenant, derivation_path, system, outcome) = (
+            tenant.clone(),
+            derivation_path.clone(),
+            system.to_string(),
+            outcome.clone(),
+        );
+        self.call(|reply| DbRequest::RecordJobOutcome {
+            tenant,
+            job_id,
+            derivation_path,
+            system,
+            outcome,
+            reply,
+        })
+        .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl CapabilitySecretStore for PostgresStore {
+    async fn current_capability_secret(&self) -> (u64, [u8; 32]) {
+        self.call(|reply| DbRequest::CurrentCapabilitySecret { reply })
+            .await
+            .unwrap_or_else(|| {
+                tracing::error!(
+                    "db request actor unavailable; using a process-local capability secret"
+                );
+                // Same non-persistent-`kid` trick `current_capability_secret_db`
+                // falls back to when the database itself is unreachable.
+                let ephemeral_kid = 0x8000_0000_0000_0000u64 | u64::from(rand::random::<u32>());
+                (ephemeral_kid, rand::random())
+            })
+    }
+
+    async fn capability_secret(&self, kid: u64) -> Option<[u8; 32]> {
+        self.call(|reply| DbRequest::CapabilitySecret { kid, reply })
+            .await
+            .flatten()
+    }
+}
+
+#[async_trait::async_trait]
+impl TenantAuthStore for PostgresStore {
+    async fn find_tenant_by_binding(
+        &self,
+        key_type: KeyType,
+        key_id: &str,
+    ) -> Result<Option<TenantId>> {
+        let key_id = key_id.to_string();
+        self.call(|reply| DbRequest::FindTenantByBinding {
+            key_type,
+            key_id,
+            reply,
+        })
+        .await
+        .unwrap_or_else(|| Err(StoreError::Other("db request actor unavailable".into())))
     }
 }
 
