@@ -183,13 +183,19 @@ let
       BPF_SYSCALL = yes;
       BPF_JIT = yes;
       PERF_EVENTS = yes; # tracepoint attach (oom:mark_victim) goes through the perf subsystem.
-      # BPF_EVENTS, KPROBE_EVENTS and TRACEPOINTS were tried explicitly here
-      # first and rejected by `ignoreConfigErrors = false` as "unused option"
-      # -- this kernel version no longer exposes them as their own
-      # user-settable symbols (folded into/implied by BPF_SYSCALL,
-      # PERF_EVENTS and KPROBES respectively). Found by booting, per this
-      # file's own convention.
+      # FTRACE gates TRACEPOINTS/KPROBE_EVENTS/BPF_EVENTS below -- without it
+      # `structuredExtraConfig` can't even ask those questions, which is why
+      # naming them explicitly first failed as "unused option" (found by
+      # booting: `ignoreConfigErrors = false` catches a gate that isn't
+      # satisfied the same way it catches a renamed/removed symbol, and the
+      # error text alone doesn't distinguish the two -- confirmed by
+      # `BPF_PROG_LOAD` itself returning EINVAL on a real boot once the
+      # kernel built "successfully" with these still off).
+      FTRACE = yes;
+      TRACEPOINTS = yes;
       KPROBES = yes;
+      KPROBE_EVENTS = yes; # kprobe-attached BPF programs (mapping_set_error()).
+      BPF_EVENTS = yes; # tracepoint-attached BPF programs (oom:mark_victim).
       KALLSYMS = yes; # kprobes resolve attach points by symbol name.
       # The cgroup v2 memory controller, for scoping nix-daemon's build
       # children into their own `memory.max`-capped leaf (paired with the

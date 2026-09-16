@@ -234,7 +234,11 @@ async fn main() -> Result<()> {
     let detection = match DetectionState::setup() {
         Ok(state) => Some(Arc::new(Mutex::new(state))),
         Err(err) => {
-            eprintln!("guest-agent: eBPF detection setup failed: {err}");
+            let chain: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+            eprintln!(
+                "guest-agent: eBPF detection setup failed: {}",
+                chain.join(": ")
+            );
             None
         }
     };
@@ -327,7 +331,10 @@ fn log_dev_contents() {
 /// same shape as the daemon port's loop, even though in practice the worker
 /// only ever dials this once per boot (right after `wait_for_vsock_ready`
 /// succeeds, before it dials `NIX_DAEMON_PORT`).
-async fn control_accept_loop(listener: VsockListener, detection: Option<Arc<Mutex<DetectionState>>>) {
+async fn control_accept_loop(
+    listener: VsockListener,
+    detection: Option<Arc<Mutex<DetectionState>>>,
+) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -452,8 +459,12 @@ enum ControlReply {
 fn format_status(status: FailureStatus) -> String {
     match status {
         FailureStatus::None => "NONE".to_string(),
-        FailureStatus::OutOfMemory { builder_victim: true } => "OOM BUILDER".to_string(),
-        FailureStatus::OutOfMemory { builder_victim: false } => "OOM OTHER".to_string(),
+        FailureStatus::OutOfMemory {
+            builder_victim: true,
+        } => "OOM BUILDER".to_string(),
+        FailureStatus::OutOfMemory {
+            builder_victim: false,
+        } => "OOM OTHER".to_string(),
         FailureStatus::DiskFull => "ENOSPC".to_string(),
     }
 }
@@ -722,19 +733,21 @@ async fn run_with_stdin(bin: &str, args: &[&str], stdin: &[u8]) -> Result<()> {
 
 /// Spawn `nix-daemon --stdio` and relay `stream` onto its stdin/stdout until
 /// either side closes.
-async fn serve(mut stream: VsockStream, detection: Option<Arc<Mutex<DetectionState>>>) -> Result<()> {
+async fn serve(
+    mut stream: VsockStream,
+    detection: Option<Arc<Mutex<DetectionState>>>,
+) -> Result<()> {
     tracing::info!("spawning nix-daemon for a new connection");
     let mut child = spawn_nix_daemon()?;
     // PLAN.md Phase 18: scope this nix-daemon instance (and everything it
     // forks for the sandboxed build) into the memory-capped build cgroup --
     // best-effort, same as `cgroup::setup()` itself: a guest where this
     // fails still builds, just without OOM attribution for this connection.
-    if detection.is_some() {
-        if let Some(pid) = child.id() {
-            if let Err(err) = cgroup::move_into_build_cgroup(pid).await {
-                eprintln!("guest-agent: moving nix-daemon into the build cgroup failed: {err}");
-            }
-        }
+    if detection.is_some()
+        && let Some(pid) = child.id()
+        && let Err(err) = cgroup::move_into_build_cgroup(pid).await
+    {
+        eprintln!("guest-agent: moving nix-daemon into the build cgroup failed: {err}");
     }
     let mut child_stdin = child.stdin.take().ok_or_else(|| eyre::eyre!("no stdin"))?;
     let mut child_stdout = child

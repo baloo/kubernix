@@ -52,6 +52,10 @@ let
     inherit (guest-vm) kernel initrd;
     inherit vm-test-lib;
   };
+  vm-status-test = pkgs.callPackage ./vm-status-test.nix {
+    inherit (guest-vm) kernel initrd;
+    inherit vm-test-lib;
+  };
   images = pkgs.callPackage ./images.nix {
     inherit kubernix-server kubernix-worker;
     guestVmKernel = guest-vm.kernel;
@@ -74,7 +78,7 @@ in {
   kubernix-guest-vm-kernel = guest-vm.kernel;
   kubernix-guest-vm-initrd = guest-vm.initrd;
   guest-vm-test = guest-vm.test;
-  inherit vm-lifecycle-test vm-build-test vm-encryption-test vm-network-test vm-caps-test;
+  inherit vm-lifecycle-test vm-build-test vm-encryption-test vm-network-test vm-caps-test vm-status-test;
   test = import ./test.nix {
     inherit pkgs kubernix-server kubernix-worker kubernix-plugin;
   };

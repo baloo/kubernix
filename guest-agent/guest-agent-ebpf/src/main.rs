@@ -13,11 +13,20 @@
 //!   children (`guest-agent/src/cgroup.rs`) so a kill's `(pid, comm)` can be
 //!   checked against that cgroup's membership userspace-side to decide
 //!   builder-victim vs. non-builder-victim.
-//! - [`mapping_set_error`]: a kprobe on `mapping_set_error()` itself, which
-//!   fires whenever the kernel *records* a writeback failure independent of
-//!   whether any application ever calls `fsync()` -- the hook that actually
-//!   closes the "`close()` swallows write errors" gap on ext4's normal
-//!   delayed allocation.
+//! - [`errseq_set`]: a kprobe on `errseq_set()`, which fires whenever the
+//!   kernel *records* a writeback failure independent of whether any
+//!   application ever calls `fsync()` -- the hook that actually closes the
+//!   "`close()` swallows write errors" gap on ext4's normal delayed
+//!   allocation. Not `mapping_set_error()` itself, despite that being the
+//!   function whose job this conceptually is: `mapping_set_error` is
+//!   `static inline` in `<linux/pagemap.h>`, so it has no stable symbol to
+//!   kprobe at all -- this kernel's own `System.map` shows only
+//!   compiler-generated `mapping_set_error.part.0` clones, duplicated
+//!   per-translation-unit at different addresses, found by booting and
+//!   checking. `mapping_set_error`'s own body calls `errseq_set(eseq, err)`
+//!   with the same error value whenever it actually has one to record --
+//!   a real, exported, stable symbol (`EXPORT_SYMBOL(errseq_set)` in
+//!   `lib/errseq.c`) that serves the same purpose.
 //!
 //! Both write into tiny fixed-size `Array` maps rather than a ring/perf
 //! buffer: there is nothing to stream here, just "did this happen since the
@@ -86,16 +95,16 @@ fn try_oom_mark_victim(ctx: &TracePointContext) -> Result<u32, u32> {
 }
 
 #[kprobe]
-pub fn mapping_set_error(ctx: ProbeContext) -> u32 {
-    match try_mapping_set_error(&ctx) {
+pub fn errseq_set(ctx: ProbeContext) -> u32 {
+    match try_errseq_set(&ctx) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
 }
 
-fn try_mapping_set_error(ctx: &ProbeContext) -> Result<u32, u32> {
-    // `mapping_set_error(struct address_space *mapping, int error)` -- the
-    // error code is argument index 1 (0-indexed), a plain `int`.
+fn try_errseq_set(ctx: &ProbeContext) -> Result<u32, u32> {
+    // `errseq_t errseq_set(errseq_t *eseq, int err)` -- the error code is
+    // argument index 1 (0-indexed), a plain `int`.
     let error: i32 = ctx.arg(1).ok_or(1u32)?;
     if error == -ENOSPC {
         if let Some(slot) = ENOSPC_FLAG.get_ptr_mut(0) {
@@ -104,6 +113,14 @@ fn try_mapping_set_error(ctx: &ProbeContext) -> Result<u32, u32> {
     }
     Ok(0)
 }
+
+// Required by the kernel's BPF_PROG_LOAD syscall (EINVAL without it --
+// found by booting): every loaded program must declare a license, checked
+// against which kernel helpers it's allowed to call. `aya-ebpf` doesn't
+// supply a default -- the crate expects a program to declare its own.
+#[unsafe(no_mangle)]
+#[link_section = "license"]
+pub static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
 
 #[cfg(not(test))]
 #[panic_handler]

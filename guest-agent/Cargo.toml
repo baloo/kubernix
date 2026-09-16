@@ -13,7 +13,7 @@ edition = "2024"
 # for why it's a whole separate Cargo workspace, built with a different,
 # nightly toolchain) -- this is the plain stable-toolchain userspace loader
 # half, no different from any other dependency of this crate.
-aya = "0.13"
+aya = "0.14"
 color-eyre.workspace = true
 eyre.workspace = true
 tokio.workspace = true

@@ -159,6 +159,14 @@ nix-test-vm-network:
 nix-test-vm-caps:
     nix-build nix -A vm-caps-test
 
+# PLAN.md Phase 18: drive the STATUS?/RESET control-port verbs against a
+# real guest -- confirms the aya-loaded eBPF OOM/ENOSPC detection actually
+# attaches at boot (a guest where that failed answers ERR instead of OK)
+# and that a fresh boot's detection state starts and stays clear. Needs
+# /dev/kvm, same as nix-test-guest-vm.
+nix-test-vm-status:
+    nix-build nix -A vm-status-test
+
 # Remove build artifacts.
 clean:
     cargo clean

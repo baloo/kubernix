@@ -15,6 +15,11 @@ use eyre::{Context, Result};
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const BUILD_CGROUP: &str = "/sys/fs/cgroup/build";
+/// Where `aya`'s tracepoint loader expects to find `tracefs` -- the modern,
+/// standalone mount point (as opposed to the older `debugfs`-nested
+/// `/sys/kernel/debug/tracing`, which this guest has no other reason to
+/// mount at all).
+const TRACEFS_MOUNT: &str = "/sys/kernel/tracing";
 
 /// Fraction of observed `/proc/meminfo` `MemTotal` handed to the build
 /// cgroup's `memory.max` -- matches PLAN.md's "grant ~all available memory
@@ -34,6 +39,17 @@ pub async fn setup() -> Result<()> {
         .await
         .wrap_err("mounting cgroup2")?;
 
+    // `aya`'s tracepoint attach (`ebpf::DetectionState::setup`) looks the
+    // `oom:mark_victim` tracepoint's event id up under here -- found by
+    // booting: `BPF_PROG_LOAD` alone succeeds without this mounted, but the
+    // later `attach` call fails outright with "tracefs not found".
+    tokio::fs::create_dir_all(TRACEFS_MOUNT)
+        .await
+        .wrap_err_with(|| format!("creating {TRACEFS_MOUNT}"))?;
+    crate::run("/bin/mount", &["-t", "tracefs", "tracefs", TRACEFS_MOUNT])
+        .await
+        .wrap_err("mounting tracefs")?;
+
     // The memory controller has to be delegated to child cgroups explicitly
     // via the root's own `cgroup.subtree_control` before a leaf's own
     // `memory.max` does anything.
@@ -46,12 +62,9 @@ pub async fn setup() -> Result<()> {
         .wrap_err_with(|| format!("creating {BUILD_CGROUP}"))?;
 
     let memory_max = build_cgroup_memory_max().unwrap_or(u64::MAX);
-    tokio::fs::write(
-        format!("{BUILD_CGROUP}/memory.max"),
-        memory_max.to_string(),
-    )
-    .await
-    .wrap_err("setting the build cgroup's memory.max")?;
+    tokio::fs::write(format!("{BUILD_CGROUP}/memory.max"), memory_max.to_string())
+        .await
+        .wrap_err("setting the build cgroup's memory.max")?;
     eprintln!("guest-agent: build cgroup ready, memory.max={memory_max}");
     Ok(())
 }

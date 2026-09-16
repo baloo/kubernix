@@ -36,7 +36,7 @@ pub struct DetectionState {
 
 impl DetectionState {
     /// Loads `PROGRAM`, attaches both the `oom:mark_victim` tracepoint and
-    /// the `mapping_set_error()` kprobe. Failure here is treated as fatal by
+    /// the `errseq_set()` kprobe. Failure here is treated as fatal by
     /// the caller (`main`) the same way a failed vsock listener bind would
     /// be -- Phase 18's whole mechanism is inert without this, so a guest
     /// that can't load it should fail loudly at boot rather than silently
@@ -55,14 +55,14 @@ impl DetectionState {
             .wrap_err("attaching oom_mark_victim to oom:mark_victim")?;
 
         let kprobe: &mut KProbe = ebpf
-            .program_mut("mapping_set_error")
-            .ok_or_else(|| eyre::eyre!("mapping_set_error program missing from bytecode"))?
+            .program_mut("errseq_set")
+            .ok_or_else(|| eyre::eyre!("errseq_set program missing from bytecode"))?
             .try_into()
-            .wrap_err("mapping_set_error is not a kprobe program")?;
-        kprobe.load().wrap_err("loading mapping_set_error kprobe")?;
+            .wrap_err("errseq_set is not a kprobe program")?;
+        kprobe.load().wrap_err("loading errseq_set kprobe")?;
         kprobe
-            .attach("mapping_set_error", 0)
-            .wrap_err("attaching mapping_set_error kprobe")?;
+            .attach("errseq_set", 0)
+            .wrap_err("attaching errseq_set kprobe")?;
 
         let oom_victim_pid: Array<_, u32> = Array::try_from(
             ebpf.take_map("OOM_VICTIM_PID")

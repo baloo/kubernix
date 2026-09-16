@@ -145,6 +145,29 @@ writeText "kubernix-vm-test-lib.sh" ''
       | tail -n +2 || true
   }
 
+  # vm_status <vsock-socket> [control-port=621]
+  #
+  # Speaks the `STATUS?` control-port verb (PLAN.md Phase 18) end to end,
+  # mirroring `vm_caps` above. Prints guest-agent's reply -- `OK NONE` /
+  # `OK OOM BUILDER` / `OK OOM OTHER` / `OK ENOSPC`, or `ERR ...`.
+  vm_status() {
+    local vsock_socket="$1" port="''${2:-621}"
+    printf 'CONNECT %d\nSTATUS?\n' "$port" \
+      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
+      | tail -n +2 || true
+  }
+
+  # vm_reset <vsock-socket> [control-port=621]
+  #
+  # Speaks the `RESET` control-port verb (PLAN.md Phase 18) end to end,
+  # mirroring `vm_caps` above. Prints guest-agent's reply, `OK` or `ERR ...`.
+  vm_reset() {
+    local vsock_socket="$1" port="''${2:-621}"
+    printf 'CONNECT %d\nRESET\n' "$port" \
+      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
+      | tail -n +2 || true
+  }
+
   # vm_stream_logs <vsock-socket> [log-port=622]
   #
   # Dials `guest-agent`'s debug log-stream port (`LOG_PORT`,
