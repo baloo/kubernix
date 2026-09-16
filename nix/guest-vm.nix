@@ -167,6 +167,40 @@ let
       # outright with ENOSYS ("Function not implemented").
       SECCOMP = yes;
       SECCOMP_FILTER = yes;
+
+      # PLAN.md Phase 18: `guest-agent`'s own eBPF-based resource-exhaustion
+      # detection (an `oom:mark_victim` tracepoint, a `mapping_set_error()`
+      # kprobe -- see `guest-agent/src/ebpf.rs`) is a second, independent use
+      # of BPF/kprobes from the sandbox's own SECCOMP_FILTER above: this one
+      # loads real classic tracing programs from userspace via `bpf(2)`
+      # (`aya`), not a seccomp filter installed by the build's own sandbox
+      # jail. Every symbol below is a hypothesis to confirm by booting, the
+      # same as everywhere else in this file (`ignoreConfigErrors = false`
+      # hard-fails the Nix build on a wrong name rather than silently
+      # dropping it) -- found for this kernel version by iterating exactly
+      # that way.
+      BPF = yes;
+      BPF_SYSCALL = yes;
+      BPF_JIT = yes;
+      PERF_EVENTS = yes; # tracepoint attach (oom:mark_victim) goes through the perf subsystem.
+      # BPF_EVENTS, KPROBE_EVENTS and TRACEPOINTS were tried explicitly here
+      # first and rejected by `ignoreConfigErrors = false` as "unused option"
+      # -- this kernel version no longer exposes them as their own
+      # user-settable symbols (folded into/implied by BPF_SYSCALL,
+      # PERF_EVENTS and KPROBES respectively). Found by booting, per this
+      # file's own convention.
+      KPROBES = yes;
+      KALLSYMS = yes; # kprobes resolve attach points by symbol name.
+      # The cgroup v2 memory controller, for scoping nix-daemon's build
+      # children into their own `memory.max`-capped leaf (paired with the
+      # OOM tracepoint above for unambiguous kill attribution --
+      # `guest-agent/src/cgroup.rs`). `CGROUPS` above is only
+      # `CLONE_NEWCGROUP` namespace support for the sandbox; this is the
+      # actual controller and the unified-hierarchy (`cgroup2`) filesystem
+      # `guest-agent` mounts at `/sys/fs/cgroup`, neither of which existed
+      # before this phase.
+      CGROUP_BPF = yes;
+      MEMCG = yes;
       # The sandboxed build's private network namespace still needs a real
       # AF_INET to set up its loopback interface — `NET`/`NET_NS` alone only
       # get the namespace itself, not the IP protocol family inside it.
