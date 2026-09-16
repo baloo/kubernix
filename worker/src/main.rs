@@ -291,7 +291,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     tracing::info!(?subjects, "waiting for jobs");
     let mut messages = consumer.messages().await?;
 
-    while let Some(message) = messages.next().await {
+    'jobs: while let Some(message) = messages.next().await {
         let message = match message {
             Ok(m) => m,
             Err(e) => {
@@ -335,7 +335,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
                     delivered, "no worker satisfied this job's required features after \
                      redelivery; failing it"
                 );
-                let outcome = Outcome::Failed(format!(
+                let outcome = Outcome::failed(format!(
                     "kubernix: no worker in the fleet declares every required feature \
                      ({:?}) for job {}",
                     job.required_features, job.job_id
@@ -359,6 +359,12 @@ async fn main() -> color_eyre::eyre::Result<()> {
         // the subprocess path everywhere below) whenever `vm_pool` itself is
         // disabled, exactly as before this step.
         let mut vm_conn: Option<VmConn> = None;
+        // PLAN.md Phase 18: kept alongside `vm_conn` so the retry loop below
+        // can reset/query the guest's detection state and reconnect after a
+        // same-tier retry, without re-deriving anything `ensure_vm_for`
+        // already worked out (the vsock socket path, and whether *this*
+        // boot was FRESH — gates ENOSPC recovery).
+        let mut vm_handle: Option<vm::VmHandle> = None;
         if let Some(pool) = vm_pool.as_mut() {
             let dialed = match pool.ensure_vm_for(&job.tenant).await {
                 Ok(handle) => {
@@ -368,17 +374,23 @@ async fn main() -> color_eyre::eyre::Result<()> {
                         "tenant VM ready"
                     );
                     match handle.connect().await {
-                        Ok(stream) => VmConn::open(stream).await.map_err(eyre::Report::from),
+                        Ok(stream) => VmConn::open(stream)
+                            .await
+                            .map(|conn| (conn, handle))
+                            .map_err(eyre::Report::from),
                         Err(report) => Err(report),
                     }
                 }
                 Err(report) => Err(report),
             };
             match dialed {
-                Ok(conn) => vm_conn = Some(conn),
+                Ok((conn, handle)) => {
+                    vm_conn = Some(conn);
+                    vm_handle = Some(handle);
+                }
                 Err(report) => {
                     tracing::error!(job_id = %job.job_id, error = ?report, "could not reach the tenant VM's daemon");
-                    let outcome = Outcome::Failed(infra_failure_message(
+                    let outcome = Outcome::failed(infra_failure_message(
                         &job.job_id,
                         "starting the tenant VM failed",
                     ));
@@ -399,7 +411,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
             let outcome =
-                Outcome::Failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
+                Outcome::failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
             if let Err(e) = job.publish_result(&jetstream, &outcome, &[], None).await {
                 tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
             }
@@ -414,7 +426,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
             Ok(outputs) => outputs,
             Err(report) => {
                 tracing::error!(job_id = %job.job_id, error = ?report, "undecodable derivation");
-                let outcome = Outcome::Failed(infra_failure_message(
+                let outcome = Outcome::failed(infra_failure_message(
                     &job.job_id,
                     "reading the derivation failed",
                 ));
@@ -428,16 +440,134 @@ async fn main() -> color_eyre::eyre::Result<()> {
             }
         };
 
-        let (mut outcome, log) = job
-            .run_build(
-                &client,
-                outputs,
-                &builder,
-                store_uri.as_deref(),
-                &store_dir,
-                vm_conn.as_mut(),
-            )
-            .await;
+        // PLAN.md Phase 18: whether *this job's* VM boot (not any later
+        // retry's) was FRESH — computed once, before the retry loop, since
+        // it's what gates ENOSPC recovery ("nothing to gain from wiping an
+        // already-empty disk").
+        let original_boot_was_fresh = vm_handle.as_ref().map(|h| h.fresh).unwrap_or(false);
+        let already_on_big_parallel = worker_classes.iter().any(|c| c == "big-parallel");
+        let mut enospc_retried = false;
+        let mut oom_local_retried = false;
+
+        let mut outcome;
+        let mut log;
+        loop {
+            if let Some(handle) = &vm_handle
+                && let Err(e) = vm::reset_job_status(&handle.vsock_socket).await
+            {
+                tracing::warn!(job_id = %job.job_id, error = ?e, "resetting guest detection state failed");
+            }
+
+            let (this_outcome, this_log) = job
+                .run_build(
+                    &client,
+                    outputs.clone(),
+                    &builder,
+                    store_uri.as_deref(),
+                    &store_dir,
+                    vm_conn.as_mut(),
+                )
+                .await;
+            outcome = this_outcome;
+            log = this_log;
+
+            if !matches!(outcome, Outcome::Failed { .. }) {
+                break;
+            }
+            let (Some(pool), Some(handle)) = (vm_pool.as_mut(), vm_handle.as_ref()) else {
+                // No VM: an ordinary build failure, or an infra failure with
+                // no guest to ask -- nothing to retry.
+                break;
+            };
+
+            let status = match vm::query_status(&handle.vsock_socket).await {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::warn!(job_id = %job.job_id, error = ?e, "querying guest detection state failed");
+                    break;
+                }
+            };
+
+            let action = next_action(
+                status,
+                original_boot_was_fresh,
+                already_on_big_parallel,
+                enospc_retried,
+                oom_local_retried,
+            );
+            tracing::info!(job_id = %job.job_id, ?status, ?action, "resource-exhaustion retry decision");
+
+            match action {
+                RetryAction::GiveUp => break,
+                RetryAction::TerminalEnospc => {
+                    outcome = terminal_failure(outcome, FailureKind::DiskFull);
+                    break;
+                }
+                RetryAction::TerminalOom => {
+                    outcome = terminal_failure(outcome, FailureKind::OutOfMemory);
+                    break;
+                }
+                RetryAction::RetryEnospcWipe => {
+                    enospc_retried = true;
+                    match pool.wipe_and_reboot(&job.tenant).await {
+                        Ok(new_handle) => match reconnect(&new_handle).await {
+                            Ok(conn) => {
+                                vm_conn = Some(conn);
+                                vm_handle = Some(new_handle);
+                            }
+                            Err(e) => {
+                                tracing::error!(job_id = %job.job_id, error = ?e, "reconnecting after an ENOSPC wipe-and-reboot failed");
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!(job_id = %job.job_id, error = ?e, "ENOSPC wipe-and-reboot failed");
+                            break;
+                        }
+                    }
+                }
+                RetryAction::RetryOomLocal => {
+                    oom_local_retried = true;
+                    match reconnect(handle).await {
+                        Ok(conn) => vm_conn = Some(conn),
+                        Err(e) => {
+                            tracing::error!(job_id = %job.job_id, error = ?e, "reconnecting for a same-tier OOM retry failed");
+                            break;
+                        }
+                    }
+                }
+                RetryAction::EscalateOom => {
+                    let escalated_subject = format!("kubernix.jobs.{system}.big-parallel");
+                    tracing::warn!(
+                        job_id = %job.job_id, subject = %escalated_subject,
+                        "confirmed builder OOM; escalating to big-parallel"
+                    );
+                    // The original message's payload is already exactly the
+                    // right BuildRequest bytes -- escalation only ever
+                    // changes the subject, never the job's own content.
+                    match jetstream
+                        .publish(escalated_subject, message.payload.clone())
+                        .await
+                    {
+                        Ok(ack) => {
+                            if let Err(e) = ack.await {
+                                tracing::error!(job_id = %job.job_id, error = %e, "awaiting the escalation publish ack failed");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(job_id = %job.job_id, error = %e, "publishing the escalated job failed")
+                        }
+                    }
+                    if let Err(e) = message.ack().await {
+                        tracing::error!(job_id = %job.job_id, error = %e, "failed to ack escalated job");
+                    }
+                    // The job isn't done -- it's been handed to a different
+                    // subject/worker entirely, so no JobResult is published
+                    // for this attempt.
+                    continue 'jobs;
+                }
+            }
+        }
 
         // Artifacts first, then the result: publishing a success whose outputs
         // are not yet fetchable would be worse than reporting the upload failure.
@@ -448,7 +578,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
             Ok(uploaded) => uploaded,
             Err(report) => {
                 tracing::error!(job_id = %job.job_id, error = ?report, "artifact upload failed");
-                outcome = Outcome::Failed(infra_failure_message(
+                outcome = Outcome::failed(infra_failure_message(
                     &job.job_id,
                     "uploading artifacts failed",
                 ));
@@ -553,9 +683,121 @@ fn worker_capabilities_satisfy(classes: &[String], required: &[String]) -> bool 
 /// anything else — a failure to even reach the point of building — log the
 /// real error with `tracing::error!(error = ?report, ...)` first and use
 /// [`infra_failure_message`] for the text that actually goes out.
+#[derive(Debug)]
 enum Outcome {
     Completed(Vec<StorePath>),
-    Failed(String),
+    Failed {
+        message: String,
+        /// Set only on a *terminal* resource-exhaustion failure (PLAN.md
+        /// Phase 18) -- `None` for every ordinary build failure and every
+        /// infra failure alike, matching how an empty `errorMsg` already
+        /// means "not set" on the wire (`Job::publish_result`).
+        failure_kind: Option<FailureKind>,
+    },
+}
+
+impl Outcome {
+    /// Shorthand for the overwhelming majority of `Failed` constructions,
+    /// which never carry a `failure_kind` -- an ordinary build failure or an
+    /// infra failure (S3, NATS, a malformed derivation).
+    fn failed(message: impl Into<String>) -> Outcome {
+        Outcome::Failed {
+            message: message.into(),
+            failure_kind: None,
+        }
+    }
+}
+
+/// PLAN.md Phase 18: what the retry loop should do next, given the guest's
+/// reported `STATUS?` and the job/worker's own state. A pure function so
+/// every combination is cheaply table-tested without any real VM or vsock
+/// connection -- see the `next_action` tests below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryAction {
+    /// Not a resource-exhaustion failure (or the guest couldn't be asked) --
+    /// report the build failure exactly as it happened, never retried.
+    GiveUp,
+    RetryEnospcWipe,
+    RetryOomLocal,
+    EscalateOom,
+    TerminalOom,
+    TerminalEnospc,
+}
+
+/// See [`RetryAction`]'s doc. `enospc_retried`/`oom_local_retried` bound
+/// each same-tier retry to exactly one attempt -- PLAN.md's "retry once" is
+/// a hard bound, not "retry until it stops failing."
+fn next_action(
+    status: vm::GuestFailureStatus,
+    original_boot_was_fresh: bool,
+    already_on_big_parallel: bool,
+    enospc_retried: bool,
+    oom_local_retried: bool,
+) -> RetryAction {
+    use vm::GuestFailureStatus as S;
+    match status {
+        S::None => RetryAction::GiveUp,
+        S::DiskFull => {
+            if enospc_retried || original_boot_was_fresh {
+                RetryAction::TerminalEnospc
+            } else {
+                RetryAction::RetryEnospcWipe
+            }
+        }
+        S::OutOfMemory {
+            builder_victim: false,
+        } => {
+            if oom_local_retried {
+                RetryAction::TerminalOom
+            } else {
+                RetryAction::RetryOomLocal
+            }
+        }
+        S::OutOfMemory {
+            builder_victim: true,
+        } => {
+            if already_on_big_parallel {
+                RetryAction::TerminalOom
+            } else {
+                RetryAction::EscalateOom
+            }
+        }
+    }
+}
+
+/// Folds a [`FailureKind`] onto an existing failure -- used once a resource-
+/// exhaustion failure's retry/escalation options are exhausted. A no-op on
+/// `Completed` (unreachable in practice: the retry loop only calls this from
+/// branches already matched on `Outcome::Failed`), kept exhaustive rather
+/// than `unreachable!()`ing on a variant this function has no business
+/// asserting about.
+fn terminal_failure(outcome: Outcome, kind: FailureKind) -> Outcome {
+    match outcome {
+        Outcome::Failed { message, .. } => Outcome::Failed {
+            message,
+            failure_kind: Some(kind),
+        },
+        completed => completed,
+    }
+}
+
+/// Re-dials a `VmHandle` and opens a fresh `DaemonConnection` on it -- the
+/// retry loop's own small wrapper around `VmHandle::connect` +
+/// `VmConn::open`, used identically for both the same-tier and post-wipe
+/// reconnects.
+async fn reconnect(handle: &vm::VmHandle) -> eyre::Result<VmConn> {
+    let stream = handle.connect().await?;
+    VmConn::open(stream).await.map_err(eyre::Report::from)
+}
+
+/// PLAN.md Phase 18: what a *terminal* resource-exhaustion failure was --
+/// see `guest-agent/src/ebpf.rs::FailureStatus` and
+/// `worker/src/vm.rs::GuestFailureStatus`, the two upstream signals this is
+/// derived from once every retry/escalation option is exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    OutOfMemory,
+    DiskFull,
 }
 
 /// The wire text for an infra failure — one that happened before or around
@@ -588,7 +830,7 @@ impl Job {
     ) -> eyre::Result<(Vec<upload::OutputArtifact>, Option<ObjectKey>)> {
         let outputs: Vec<StorePath> = match outcome {
             Outcome::Completed(paths) => paths.clone(),
-            Outcome::Failed(_) => Vec::new(),
+            Outcome::Failed { .. } => Vec::new(),
         };
 
         let log_key = upload::log_key(&self.tenant, &self.derivation_path)
@@ -701,7 +943,7 @@ impl Job {
                             message.push('\n');
                             message.push_str(&tail.join("\n"));
                         }
-                        Outcome::Failed(message)
+                        Outcome::failed(message)
                     };
                     (outcome, archive)
                 }
@@ -712,7 +954,7 @@ impl Job {
                     );
                     let message = infra_failure_message(&self.job_id, "running the builder failed");
                     let _ = client.publish(log_subject, message.clone().into()).await;
-                    (Outcome::Failed(message.clone()), message.into_bytes())
+                    (Outcome::failed(message.clone()), message.into_bytes())
                 }
             };
         }
@@ -723,7 +965,7 @@ impl Job {
                 tracing::error!(job_id = %self.job_id, %builder, error = ?e, "could not start the builder");
                 let message = infra_failure_message(&self.job_id, "starting the builder failed");
                 let _ = client.publish(log_subject, message.clone().into()).await;
-                return (Outcome::Failed(message.clone()), message.into_bytes());
+                return (Outcome::failed(message.clone()), message.into_bytes());
             }
         };
 
@@ -756,14 +998,14 @@ impl Job {
                     message.push('\n');
                     message.push_str(&tail.join("\n"));
                 }
-                Outcome::Failed(message)
+                Outcome::failed(message)
             }
             Err(e) => {
                 tracing::error!(
                     job_id = %self.job_id, drv = %self.derivation_path, error = ?e,
                     "builder invocation failed"
                 );
-                Outcome::Failed(infra_failure_message(
+                Outcome::failed(infra_failure_message(
                     &self.job_id,
                     "running the builder failed",
                 ))
@@ -864,9 +1106,17 @@ impl Job {
                         list.set(i as u32, path.as_str());
                     }
                 }
-                Outcome::Failed(message) => {
+                Outcome::Failed {
+                    message,
+                    failure_kind,
+                } => {
                     result.set_status(kubernix_capnp::JobStatus::Failed);
                     result.set_error_msg(message.as_str());
+                    result.set_failure_kind(match failure_kind {
+                        Some(FailureKind::OutOfMemory) => kubernix_capnp::FailureKind::OutOfMemory,
+                        Some(FailureKind::DiskFull) => kubernix_capnp::FailureKind::DiskFull,
+                        None => kubernix_capnp::FailureKind::None,
+                    });
                 }
             }
 
@@ -913,6 +1163,96 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PLAN.md Phase 18: `next_action` table test -- every
+    // (GuestFailureStatus, original_boot_was_fresh, already_on_big_parallel,
+    // enospc_retried, oom_local_retried) combination that actually matters.
+
+    #[test]
+    fn next_action_ordinary_failure_is_never_retried() {
+        assert_eq!(
+            next_action(vm::GuestFailureStatus::None, true, true, true, true),
+            RetryAction::GiveUp
+        );
+        assert_eq!(
+            next_action(vm::GuestFailureStatus::None, false, false, false, false),
+            RetryAction::GiveUp
+        );
+    }
+
+    #[test]
+    fn next_action_enospc_retries_once_only_on_reuse() {
+        // REUSE boot, first failure: wipe and retry.
+        assert_eq!(
+            next_action(vm::GuestFailureStatus::DiskFull, false, false, false, false),
+            RetryAction::RetryEnospcWipe
+        );
+        // FRESH boot: nothing to gain from wiping an already-empty disk.
+        assert_eq!(
+            next_action(vm::GuestFailureStatus::DiskFull, true, false, false, false),
+            RetryAction::TerminalEnospc
+        );
+        // REUSE boot, but already retried once: terminal, not a second wipe.
+        assert_eq!(
+            next_action(vm::GuestFailureStatus::DiskFull, false, false, true, false),
+            RetryAction::TerminalEnospc
+        );
+    }
+
+    #[test]
+    fn next_action_non_builder_oom_retries_once_locally() {
+        let status = vm::GuestFailureStatus::OutOfMemory {
+            builder_victim: false,
+        };
+        assert_eq!(
+            next_action(status, false, false, false, false),
+            RetryAction::RetryOomLocal
+        );
+        assert_eq!(
+            next_action(status, false, false, false, true),
+            RetryAction::TerminalOom,
+            "a second non-builder OOM after the one local retry is terminal, not another retry"
+        );
+    }
+
+    #[test]
+    fn next_action_builder_oom_escalates_unless_already_on_big_parallel() {
+        let status = vm::GuestFailureStatus::OutOfMemory {
+            builder_victim: true,
+        };
+        assert_eq!(
+            next_action(status, false, false, false, false),
+            RetryAction::EscalateOom
+        );
+        assert_eq!(
+            next_action(status, false, true, false, false),
+            RetryAction::TerminalOom,
+            "already on big-parallel: nowhere bigger to escalate to"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_sets_failure_kind_on_a_failed_outcome() {
+        let outcome = Outcome::failed("build failed");
+        let terminal = terminal_failure(outcome, FailureKind::OutOfMemory);
+        match terminal {
+            Outcome::Failed {
+                message,
+                failure_kind,
+            } => {
+                assert_eq!(message, "build failed");
+                assert_eq!(failure_kind, Some(FailureKind::OutOfMemory));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_failure_is_a_noop_on_a_completed_outcome() {
+        let outcome = Outcome::Completed(Vec::new());
+        let terminal = terminal_failure(outcome, FailureKind::DiskFull);
+        assert!(matches!(terminal, Outcome::Completed(_)));
+    }
 
     #[test]
     fn infra_failure_message_carries_no_error_detail() {

@@ -957,7 +957,9 @@ fn parse_status_reply(reply: &[u8]) -> eyre::Result<GuestFailureStatus> {
             builder_victim: false,
         }),
         "ENOSPC" => Ok(GuestFailureStatus::DiskFull),
-        other => Err(eyre!("STATUS? reply carried an unrecognised state: {other:?}")),
+        other => Err(eyre!(
+            "STATUS? reply carried an unrecognised state: {other:?}"
+        )),
     }
 }
 
