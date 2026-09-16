@@ -10,6 +10,16 @@ enum JobStatus {
   failed @3;
 }
 
+# PLAN.md Phase 18: distinguishes a terminal resource-exhaustion failure
+# (the worker's local retry, and the one kvm->big-parallel escalation hop,
+# were exhausted without success) from an ordinary build failure, so the
+# frontend/client can report *why* without text-matching errorMsg.
+enum FailureKind {
+  none        @0;
+  outOfMemory @1;
+  diskFull    @2;
+}
+
 # An input the client staged to the object store for this build. The worker
 # fetches it and imports it before building.
 struct InputRef {
@@ -88,6 +98,11 @@ struct JobResult {
   # Object store key of the build log. Set on failure too -- a failed build's
   # log is the most useful thing it produced.
   logKey      @6 :Text;
+  # `none` (the zero value) on success and on any ordinary failure alike,
+  # matching how an empty errorMsg already means "not set" -- only set to
+  # outOfMemory/diskFull on a terminal resource-exhaustion failure. PLAN.md
+  # Phase 18.
+  failureKind @7 :FailureKind;
 }
 
 # Request/reply on kubernix.uploads. The worker asks for permission to write
