@@ -7,6 +7,7 @@ let
 
   lixSource = flakeNodes."${flakeRoots.lix}";
   nixpkgsSource = flakeNodes."${flakeRoots.nixpkgs}";
+  rustOverlaySource = flakeNodes."${flakeRoots.rust-overlay}";
 
   fetchRepo = locked: builtins.fetchTarball {
     url = "https://github.com/${locked.owner}/${locked.repo}/archive/${locked.rev}.tar.gz";
@@ -15,6 +16,9 @@ let
 
   lix = fetchRepo lixSource.locked;
   nixpkgs = fetchRepo nixpkgsSource.locked;
+  # PLAN.md Phase 18: pinned nightly Rust (rust-src + bpfel-unknown-none) for
+  # the guest-agent-ebpf crate; see nix/guest-agent-ebpf.nix.
+  rustOverlay = import (fetchRepo rustOverlaySource.locked);
 in let
   overlay = self: super: {
     lix = self.callPackage "${lix}/package.nix" {
@@ -23,6 +27,7 @@ in let
   };
 in import nixpkgs ({
   overlays = [
+    rustOverlay
     overlay
   ];
 } // args)

@@ -4,6 +4,11 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs";
     lix.url = "github:lix-project/lix";
+    # PLAN.md Phase 18: the guest-agent-ebpf crate needs a nightly Rust
+    # toolchain with `rust-src` (for `-Z build-std=core`) to target
+    # `bpfel-unknown-none` -- nixpkgs' own rustc is stable-only, and there's
+    # no in-tree way to get a pinned nightly otherwise.
+    rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
   outputs = { self, ... }:

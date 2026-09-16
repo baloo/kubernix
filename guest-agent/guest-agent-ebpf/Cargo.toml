@@ -1,0 +1,26 @@
+[package]
+name = "kubernix-guest-agent-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+# PLAN.md Phase 18: deliberately its own Cargo workspace (note the empty
+# `[workspace]` table below), separate from the root workspace at
+# `/Cargo.toml`. This crate is `no_std`, targets `bpfel-unknown-none`, and
+# needs `-Z build-std=core` on a nightly toolchain (see
+# `nix/guest-agent-ebpf.nix`) -- none of which applies to, or should leak
+# into, the rest of the (stable-toolchain) workspace guest-agent's own
+# `Cargo.toml` lives in.
+[workspace]
+
+[dependencies]
+aya-ebpf = "0.2"
+aya-log-ebpf = "0.2"
+
+[[bin]]
+name = "kubernix-guest-agent-ebpf"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1

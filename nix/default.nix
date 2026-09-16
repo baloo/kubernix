@@ -18,6 +18,10 @@ let
   kubernix-server = pkgs.callPackage ./server.nix { inherit workspaceSource outputHashes; };
   kubernix-worker = pkgs.callPackage ./worker.nix { inherit workspaceSource outputHashes; };
   kubernix-plugin = pkgs.callPackage ./plugin.nix { };
+  # PLAN.md Phase 18, Step 0: kernel-side eBPF bytecode, built with its own
+  # pinned nightly toolchain (see the file's own header comment) -- distinct
+  # from `kubernix-guest-agent` below, which embeds this via `include_bytes!`.
+  kubernix-guest-agent-ebpf = pkgs.callPackage ./guest-agent-ebpf.nix { };
   kubernix-guest-agent = pkgs.callPackage ./guest-agent.nix { inherit workspaceSource outputHashes; };
   kubernix-guest-init = pkgs.pkgsStatic.callPackage ./guest-init.nix { inherit workspaceSource outputHashes; };
   # Shared shell helpers the guest-VM boot tests below all `source` -- see
@@ -42,6 +46,10 @@ let
     inherit (guest-vm) kernel initrd;
     inherit vm-test-lib;
   };
+  vm-caps-test = pkgs.callPackage ./vm-caps-test.nix {
+    inherit (guest-vm) kernel initrd;
+    inherit vm-test-lib;
+  };
   images = pkgs.callPackage ./images.nix {
     inherit kubernix-server kubernix-worker;
     guestVmKernel = guest-vm.kernel;
@@ -58,12 +66,13 @@ let
   };
 in {
   inherit kubernix-server kubernix-worker kubernix-plugin kubernix-guest-agent kubernix-guest-init;
+  inherit kubernix-guest-agent-ebpf;
   inherit (images) kubernix-server-image kubernix-worker-image;
   inherit vm-encryption-test-image;
   kubernix-guest-vm-kernel = guest-vm.kernel;
   kubernix-guest-vm-initrd = guest-vm.initrd;
   guest-vm-test = guest-vm.test;
-  inherit vm-lifecycle-test vm-build-test vm-encryption-test vm-network-test;
+  inherit vm-lifecycle-test vm-build-test vm-encryption-test vm-network-test vm-caps-test;
   test = import ./test.nix {
     inherit pkgs kubernix-server kubernix-worker kubernix-plugin;
   };
