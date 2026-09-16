@@ -91,7 +91,7 @@ spec:
             - name: KUBERNIX_VM_VCPUS
               value: {{ .Values.worker.vm.vcpus | quote }}
             - name: KUBERNIX_VM_MEMORY_MB
-              value: {{ .Values.worker.vm.memoryMb | quote }}
+              value: {{ include "kubernix.worker.vmMemoryMb" . | quote }}
             - name: KUBERNIX_VM_STORE_IMG_MB
               value: {{ .Values.worker.vm.storeImgMb | quote }}
             # PLAN.md Phase 17: static capability classes this worker
@@ -113,10 +113,15 @@ spec:
             # (and overridable by) worker.resources — this is what actually
             # grants /dev/kvm to the container via whatever device-plugin
             # DaemonSet on the cluster registers it, with no `privileged:
-            # true` and no node-specific `kvm` group GID to guess at. Bump
-            # worker.resources' own requests/limits to cover each tenant
-            # VM's memoryMb/vcpus on top of the worker process's own
-            # footprint — nothing here does that arithmetic automatically.
+            # true` and no node-specific `kvm` group GID to guess at.
+            #
+            # PLAN.md Phase 18: size worker.resources.limits.memory for the
+            # pod as a whole (worker process + its one tenant VM); memoryMb
+            # above is now *derived* from it (minus worker.vm.overheadMb),
+            # the opposite direction from before this phase — an operator
+            # no longer keeps these two numbers in sync by hand. vcpus is
+            # still an independent setting: nothing here relates it to
+            # worker.resources' cpu requests/limits.
             {{- $vmResources := dict "limits" (dict .Values.worker.vm.kvmResourceName "1") }}
             {{- toYaml (mergeOverwrite $vmResources .Values.worker.resources) | nindent 12 }}
       volumes:

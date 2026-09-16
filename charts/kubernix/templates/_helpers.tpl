@@ -19,6 +19,37 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 {{- end -}}
 
 {{/*
+PLAN.md Phase 18: KUBERNIX_VM_MEMORY_MB, chart-computed from
+worker.resources.limits.memory minus worker.vm.overheadMb rather than an
+independent operator-set value -- removes one way for the two settings to
+drift out of sync. worker.vm.memoryMb, if set, is an explicit override that
+wins outright. Falls back to the old fixed default (768) when neither is
+set, matching today's behaviour for anyone who hasn't set resource limits.
+Only a plain Mi/Gi quantity is supported for worker.resources.limits.memory
+(Helm has no built-in Kubernetes-quantity parser); anything else fails
+loudly with a clear message rather than silently miscomputing.
+*/}}
+{{- define "kubernix.worker.vmMemoryMb" -}}
+{{- if .Values.worker.vm.memoryMb -}}
+{{- .Values.worker.vm.memoryMb -}}
+{{- else if (dig "limits" "memory" "" .Values.worker.resources) -}}
+{{- $mem := dig "limits" "memory" "" .Values.worker.resources -}}
+{{- if not (regexMatch "^[0-9]+(Mi|Gi)$" $mem) -}}
+{{- fail (printf "worker.resources.limits.memory %q must be a plain Mi/Gi quantity (e.g. \"2Gi\") for worker.vm.memoryMb to be computed from it -- set worker.vm.memoryMb explicitly instead" $mem) -}}
+{{- end -}}
+{{- $overhead := int .Values.worker.vm.overheadMb -}}
+{{- $num := regexFind "^[0-9]+" $mem | int -}}
+{{- $limitMb := $num -}}
+{{- if hasSuffix "Gi" $mem -}}
+{{- $limitMb = mul $num 1024 -}}
+{{- end -}}
+{{- max 128 (sub $limitMb $overhead) -}}
+{{- else -}}
+768
+{{- end -}}
+{{- end -}}
+
+{{/*
 Per-component selector labels — every Deployment/Service/Job below is one of
 sshd, cache, gc, rotate, worker, or the db-role-passwords/sshd-hostkey hooks.
 Call as `include "kubernix.selectorLabels" (dict "context" $ "component" "sshd")`.

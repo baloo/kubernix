@@ -184,7 +184,19 @@ worker:
   # extended resource above has granted the device to the pod's cgroup.
   vm:
     vcpus: 1
-    memoryMb: 768
+    # PLAN.md Phase 18: an explicit override, if set -- wins outright over
+    # the chart-computed value below. Leave unset (the default) to have
+    # KUBERNIX_VM_MEMORY_MB derived from worker.resources.limits.memory
+    # minus overheadMb, so the VM gets ~all of the pod's own memory budget
+    # without an operator having to keep two settings in sync by hand. Falls
+    # back to the old fixed 768 if neither this nor
+    # worker.resources.limits.memory is set (today's default).
+    # memoryMb: 512
+    # Fixed overhead subtracted from worker.resources.limits.memory when
+    # memoryMb is unset -- covers the worker process itself plus
+    # cloud-hypervisor's/passt's own host-side footprint beyond what they
+    # hand the guest.
+    overheadMb: 256
     storeImgMb: 8192
     kvmResourceName: devices.kubevirt.io/kvm
   # Static capability classes this worker pool declares (PLAN.md Phase 17),
