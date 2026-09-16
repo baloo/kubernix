@@ -22,7 +22,9 @@ let
   # pinned nightly toolchain (see the file's own header comment) -- distinct
   # from `kubernix-guest-agent` below, which embeds this via `include_bytes!`.
   kubernix-guest-agent-ebpf = pkgs.callPackage ./guest-agent-ebpf.nix { };
-  kubernix-guest-agent = pkgs.callPackage ./guest-agent.nix { inherit workspaceSource outputHashes; };
+  kubernix-guest-agent = pkgs.callPackage ./guest-agent.nix {
+    inherit workspaceSource outputHashes kubernix-guest-agent-ebpf;
+  };
   kubernix-guest-init = pkgs.pkgsStatic.callPackage ./guest-init.nix { inherit workspaceSource outputHashes; };
   # Shared shell helpers the guest-VM boot tests below all `source` -- see
   # `vm-test-lib.nix`'s own header for why.

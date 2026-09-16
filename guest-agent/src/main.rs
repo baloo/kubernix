@@ -52,16 +52,22 @@
 //! events -- the whole point of a second channel is a *cleaner* stream, not
 //! just a different pipe for the same noise.
 
+mod cgroup;
+mod ebpf;
+
 use std::net::Shutdown;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use eyre::{Context, Result, eyre};
 use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
 };
 use tokio::process::{Child, Command};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
+
+use ebpf::{DetectionState, FailureStatus};
 
 /// Fixed by convention between `guest-agent` and whatever dials it (the
 /// worker, or this crate's own boot test in the meantime) — there is exactly
@@ -214,6 +220,25 @@ async fn main() -> Result<()> {
     }
     log_dev_contents();
 
+    // PLAN.md Phase 18: the cgroup v2 leaf nix-daemon's build children get
+    // scoped into, and the eBPF programs that watch it -- both need to be
+    // ready before the first connection is ever accepted on
+    // `NIX_DAEMON_PORT` below. Neither is allowed to block boot on failure:
+    // a guest that can't set these up is still a guest that can build
+    // (without the retry/escalation mechanism, not without building at
+    // all), so this stays best-effort like the mount loop above rather than
+    // aborting `main`.
+    if let Err(err) = cgroup::setup().await {
+        eprintln!("guest-agent: cgroup setup failed: {err}");
+    }
+    let detection = match DetectionState::setup() {
+        Ok(state) => Some(Arc::new(Mutex::new(state))),
+        Err(err) => {
+            eprintln!("guest-agent: eBPF detection setup failed: {err}");
+            None
+        }
+    };
+
     // Phase 15 Step 5: bring up the guest's side of the `passt` link so
     // `nix-daemon` can reach substituters directly. Best-effort like the
     // mount loop above -- a VM booted without networking wired up (e.g. the
@@ -251,8 +276,9 @@ async fn main() -> Result<()> {
         .wrap_err("binding log vsock listener")?;
     eprintln!("guest-agent listening on log vsock port {LOG_PORT}");
 
+    let control_detection = detection.clone();
     tokio::spawn(async move {
-        control_accept_loop(control_listener).await;
+        control_accept_loop(control_listener, control_detection).await;
     });
 
     tokio::spawn(async move {
@@ -272,8 +298,9 @@ async fn main() -> Result<()> {
         // One `nix-daemon` per connection, same as the real daemon's own
         // Unix-socket accept loop. Errors here are per-connection, not fatal
         // to the agent: a build worth retrying dials again.
+        let detection = detection.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve(stream).await {
+            if let Err(err) = serve(stream, detection).await {
                 eprintln!("guest-agent: connection handling failed: {err}");
             }
         });
@@ -300,7 +327,7 @@ fn log_dev_contents() {
 /// same shape as the daemon port's loop, even though in practice the worker
 /// only ever dials this once per boot (right after `wait_for_vsock_ready`
 /// succeeds, before it dials `NIX_DAEMON_PORT`).
-async fn control_accept_loop(listener: VsockListener) {
+async fn control_accept_loop(listener: VsockListener, detection: Option<Arc<Mutex<DetectionState>>>) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -310,8 +337,9 @@ async fn control_accept_loop(listener: VsockListener) {
             }
         };
         eprintln!("guest-agent: accepted control connection from {peer:?}");
+        let detection = detection.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_control(stream).await {
+            if let Err(err) = handle_control(stream, detection).await {
                 eprintln!("guest-agent: control connection failed: {err}");
             }
         });
@@ -365,9 +393,17 @@ async fn log_accept_loop(listener: VsockListener, tx: broadcast::Sender<Vec<u8>>
 /// - `CAPS?` -- report nested-virtualization support as seen from inside
 ///   this guest (PLAN.md Phase 17). See `worker/src/vm.rs::boot_probe` for
 ///   the client side.
-///
-/// (`STATUS?`, PLAN.md Phase 18, lands in the same dispatch later.)
-async fn handle_control(mut stream: VsockStream) -> Result<()> {
+/// - `STATUS?` -- report whatever resource-exhaustion signal has fired
+///   since the last `RESET`, without clearing it (PLAN.md Phase 18). See
+///   `worker/src/vm.rs::query_status`.
+/// - `RESET` -- clear the OOM/ENOSPC detection state, scoping it to the
+///   build about to start (PLAN.md Phase 18). Sent by the worker right
+///   before it opens a new build's daemon-protocol connection. See
+///   `worker/src/vm.rs::reset_job_status`.
+async fn handle_control(
+    mut stream: VsockStream,
+    detection: Option<Arc<Mutex<DetectionState>>>,
+) -> Result<()> {
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -376,9 +412,10 @@ async fn handle_control(mut stream: VsockStream) -> Result<()> {
         .await
         .wrap_err("reading control line")?;
 
-    let reply = match dispatch_control(line.trim_end()).await {
+    let reply = match dispatch_control(line.trim_end(), detection).await {
         Ok(ControlReply::Ok) => "OK\n".to_string(),
         Ok(ControlReply::OkWithData(n)) => format!("OK {n}\n"),
+        Ok(ControlReply::OkWithStatus(status)) => format!("OK {}\n", format_status(status)),
         // `eyre::Report`'s `Display` only surfaces the outermost context
         // (e.g. "cryptsetup open"), discarding exactly the underlying
         // command's stderr that explains *why* -- join the full chain so a
@@ -407,9 +444,24 @@ async fn handle_control(mut stream: VsockStream) -> Result<()> {
 enum ControlReply {
     Ok,
     OkWithData(u32),
+    OkWithStatus(FailureStatus),
 }
 
-async fn dispatch_control(line: &str) -> Result<ControlReply> {
+/// `OK <data>\n`'s wire text for a `STATUS?` reply -- see
+/// `worker/src/vm.rs::parse_status_reply`, the client-side counterpart.
+fn format_status(status: FailureStatus) -> String {
+    match status {
+        FailureStatus::None => "NONE".to_string(),
+        FailureStatus::OutOfMemory { builder_victim: true } => "OOM BUILDER".to_string(),
+        FailureStatus::OutOfMemory { builder_victim: false } => "OOM OTHER".to_string(),
+        FailureStatus::DiskFull => "ENOSPC".to_string(),
+    }
+}
+
+async fn dispatch_control(
+    line: &str,
+    detection: Option<Arc<Mutex<DetectionState>>>,
+) -> Result<ControlReply> {
     let mut parts = line.split(' ');
     let cmd = parts.next().ok_or_else(|| eyre!("empty control line"))?;
     match cmd {
@@ -418,6 +470,16 @@ async fn dispatch_control(line: &str) -> Result<ControlReply> {
             Ok(ControlReply::Ok)
         }
         "CAPS?" => Ok(ControlReply::OkWithData(count_nested_virt_flags()?)),
+        "STATUS?" => {
+            let detection = detection.ok_or_else(|| eyre!("eBPF detection not available"))?;
+            let status = detection.lock().await.status().await;
+            Ok(ControlReply::OkWithStatus(status))
+        }
+        "RESET" => {
+            let detection = detection.ok_or_else(|| eyre!("eBPF detection not available"))?;
+            detection.lock().await.reset()?;
+            Ok(ControlReply::Ok)
+        }
         other => Err(eyre!("unrecognised control command {other:?}")),
     }
 }
@@ -613,7 +675,7 @@ async fn configure_network() -> Result<()> {
     Ok(())
 }
 
-async fn run(bin: &str, args: &[&str]) -> Result<()> {
+pub(crate) async fn run(bin: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(bin)
         .args(args)
         .output()
@@ -660,9 +722,20 @@ async fn run_with_stdin(bin: &str, args: &[&str], stdin: &[u8]) -> Result<()> {
 
 /// Spawn `nix-daemon --stdio` and relay `stream` onto its stdin/stdout until
 /// either side closes.
-async fn serve(mut stream: VsockStream) -> Result<()> {
+async fn serve(mut stream: VsockStream, detection: Option<Arc<Mutex<DetectionState>>>) -> Result<()> {
     tracing::info!("spawning nix-daemon for a new connection");
     let mut child = spawn_nix_daemon()?;
+    // PLAN.md Phase 18: scope this nix-daemon instance (and everything it
+    // forks for the sandboxed build) into the memory-capped build cgroup --
+    // best-effort, same as `cgroup::setup()` itself: a guest where this
+    // fails still builds, just without OOM attribution for this connection.
+    if detection.is_some() {
+        if let Some(pid) = child.id() {
+            if let Err(err) = cgroup::move_into_build_cgroup(pid).await {
+                eprintln!("guest-agent: moving nix-daemon into the build cgroup failed: {err}");
+            }
+        }
+    }
     let mut child_stdin = child.stdin.take().ok_or_else(|| eyre::eyre!("no stdin"))?;
     let mut child_stdout = child
         .stdout
@@ -810,7 +883,7 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
     async fn dispatch_control_caps_returns_data() {
         // Real /proc/cpuinfo on the machine running the test -- whatever it
         // reports, dispatch should surface it as OkWithData, not Ok/Err.
-        match dispatch_control("CAPS?").await {
+        match dispatch_control("CAPS?", None).await {
             Ok(ControlReply::OkWithData(_)) => {}
             other => panic!("expected OkWithData, got {other:?}"),
         }
@@ -818,12 +891,48 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
 
     #[tokio::test]
     async fn dispatch_control_unrecognised_verb_errors() {
-        let err = dispatch_control("WAT").await.unwrap_err();
+        let err = dispatch_control("WAT", None).await.unwrap_err();
         assert!(err.to_string().contains("unrecognised control command"));
     }
 
     #[tokio::test]
     async fn dispatch_control_empty_line_errors() {
-        assert!(dispatch_control("").await.is_err());
+        assert!(dispatch_control("", None).await.is_err());
+    }
+
+    // PLAN.md Phase 18: STATUS?/RESET without a real eBPF-backed
+    // `DetectionState` (unit tests never boot a real kernel) still exercise
+    // the dispatch's own plumbing -- both verbs should fail cleanly (not
+    // panic) rather than pretend to answer when detection isn't available,
+    // the same shape `dispatch_control_unrecognised_verb_errors` checks for
+    // an unknown verb.
+    #[tokio::test]
+    async fn dispatch_control_status_without_detection_errors() {
+        let err = dispatch_control("STATUS?", None).await.unwrap_err();
+        assert!(err.to_string().contains("eBPF detection not available"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_reset_without_detection_errors() {
+        let err = dispatch_control("RESET", None).await.unwrap_err();
+        assert!(err.to_string().contains("eBPF detection not available"));
+    }
+
+    #[test]
+    fn format_status_matches_wire_convention() {
+        assert_eq!(format_status(FailureStatus::None), "NONE");
+        assert_eq!(
+            format_status(FailureStatus::OutOfMemory {
+                builder_victim: true
+            }),
+            "OOM BUILDER"
+        );
+        assert_eq!(
+            format_status(FailureStatus::OutOfMemory {
+                builder_victim: false
+            }),
+            "OOM OTHER"
+        );
+        assert_eq!(format_status(FailureStatus::DiskFull), "ENOSPC");
     }
 }

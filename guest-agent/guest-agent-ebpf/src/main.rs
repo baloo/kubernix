@@ -1,30 +1,107 @@
-//! PLAN.md Phase 18, Step 0: eBPF build-toolchain spike.
+//! PLAN.md Phase 18: guest-kernel-side eBPF programs for resource-exhaustion
+//! detection. Loaded and attached by `guest-agent`'s userspace side
+//! (`guest-agent/src/ebpf.rs`) at startup, living for the guest's whole
+//! lifetime; only the maps' contents are reset per-build (via the `RESET`
+//! control verb), not the attachment itself.
 //!
-//! A single trivial tracepoint program, attached by `guest-agent`'s userspace
-//! loader (`guest-agent/src/ebpf.rs`) at startup, whose only job is to prove
-//! that this workspace can build and load real eBPF bytecode inside the
-//! guest kernel before any OOM/ENOSPC-specific logic is written. It logs one
-//! line (via `aya-log-ebpf`, read back by the userspace side) every time a
-//! process calls `getpid(2)` -- a syscall guaranteed to exist and easy to
-//! trigger manually from inside the guest to confirm the program actually
-//! fires. Superseded by the real `oom:mark_victim`/`mapping_set_error` hooks
-//! once this proves out; kept here as the toolchain's own regression check.
+//! Two independent signals, matching PLAN.md's "two independent signals, not
+//! one" decision:
+//!
+//! - [`oom_mark_victim`]: a tracepoint on `oom:mark_victim`, the exact
+//!   structured event the OOM killer fires when it picks a victim. Paired
+//!   with `guest-agent`'s own cgroup v2 scoping of `nix-daemon`'s build
+//!   children (`guest-agent/src/cgroup.rs`) so a kill's `(pid, comm)` can be
+//!   checked against that cgroup's membership userspace-side to decide
+//!   builder-victim vs. non-builder-victim.
+//! - [`mapping_set_error`]: a kprobe on `mapping_set_error()` itself, which
+//!   fires whenever the kernel *records* a writeback failure independent of
+//!   whether any application ever calls `fsync()` -- the hook that actually
+//!   closes the "`close()` swallows write errors" gap on ext4's normal
+//!   delayed allocation.
+//!
+//! Both write into tiny fixed-size `Array` maps rather than a ring/perf
+//! buffer: there is nothing to stream here, just "did this happen since the
+//! last reset" plus the one `(pid, comm)` needed for OOM attribution, so a
+//! map userspace can poll with a plain lookup is simpler than wiring up an
+//! async event channel for a signal this coarse.
+//!
+//! The tracepoint's exact field layout (offsets past the 8-byte common
+//! tracepoint header) and the kprobe's argument index are hypotheses to
+//! confirm against this kernel's own
+//! `/sys/kernel/tracing/events/oom/mark_victim/format` by booting, the same
+//! "found by booting" methodology `nix/guest-vm.nix` uses throughout.
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{macros::tracepoint, programs::TracePointContext};
-use aya_log_ebpf::info;
+use aya_ebpf::{
+    macros::{kprobe, map, tracepoint},
+    maps::Array,
+    programs::{ProbeContext, TracePointContext},
+};
+
+/// Set to the victim's pid whenever `oom:mark_victim` fires; 0 means "none
+/// since the last `RESET`". `guest-agent`'s userspace side cross-references
+/// this against the build cgroup's `cgroup.procs` membership to decide
+/// builder-victim vs. non-builder-victim -- that decision lives entirely
+/// userspace-side, not here, since cgroup membership can change out from
+/// under a single eBPF program run and is far easier to get right in
+/// ordinary Rust.
+#[map]
+static OOM_VICTIM_PID: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Set to 1 whenever `mapping_set_error()` is called with `-ENOSPC`; 0
+/// means "none since the last `RESET`".
+#[map]
+static ENOSPC_FLAG: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Linux's `ENOSPC` errno value -- `mapping_set_error()`'s `error` argument
+/// carries the kernel's own negative-errno convention (`-ENOSPC`).
+const ENOSPC: i32 = 28;
+
+/// The `oom:mark_victim` tracepoint fires with the standard 8-byte common
+/// tracepoint header (`common_type`/`common_flags`/`common_preempt_count`/
+/// `common_pid`, 2+1+1+4 bytes) followed by this event's own fields, whose
+/// first is the victim's own `pid` (a plain `int`). Confirmed against this
+/// kernel's own tracefs format at boot time, not derived from generic
+/// documentation alone.
+const TRACEPOINT_COMMON_HEADER_LEN: usize = 8;
 
 #[tracepoint]
-pub fn kubernix_probe_spike(ctx: TracePointContext) -> u32 {
-    match try_kubernix_probe_spike(&ctx) {
+pub fn oom_mark_victim(ctx: TracePointContext) -> u32 {
+    match try_oom_mark_victim(&ctx) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
 }
 
-fn try_kubernix_probe_spike(ctx: &TracePointContext) -> Result<u32, u32> {
-    info!(ctx, "kubernix eBPF toolchain spike: getpid observed");
+fn try_oom_mark_victim(ctx: &TracePointContext) -> Result<u32, u32> {
+    let pid: u32 = unsafe {
+        ctx.read_at(TRACEPOINT_COMMON_HEADER_LEN)
+            .map_err(|_| 1u32)?
+    };
+    if let Some(slot) = OOM_VICTIM_PID.get_ptr_mut(0) {
+        unsafe { *slot = pid };
+    }
+    Ok(0)
+}
+
+#[kprobe]
+pub fn mapping_set_error(ctx: ProbeContext) -> u32 {
+    match try_mapping_set_error(&ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_mapping_set_error(ctx: &ProbeContext) -> Result<u32, u32> {
+    // `mapping_set_error(struct address_space *mapping, int error)` -- the
+    // error code is argument index 1 (0-indexed), a plain `int`.
+    let error: i32 = ctx.arg(1).ok_or(1u32)?;
+    if error == -ENOSPC {
+        if let Some(slot) = ENOSPC_FLAG.get_ptr_mut(0) {
+            unsafe { *slot = 1 };
+        }
+    }
     Ok(0)
 }
 

@@ -8,6 +8,12 @@ edition = "2024"
 # stack. It needs only enough to accept a vsock connection and exec
 # `nix-daemon --stdio` on the other end of it.
 [dependencies]
+# PLAN.md Phase 18: loads/attaches the kernel-side programs built by the
+# separate `guest-agent-ebpf` crate (see its own Cargo.toml header comment
+# for why it's a whole separate Cargo workspace, built with a different,
+# nightly toolchain) -- this is the plain stable-toolchain userspace loader
+# half, no different from any other dependency of this crate.
+aya = "0.13"
 color-eyre.workspace = true
 eyre.workspace = true
 tokio.workspace = true
