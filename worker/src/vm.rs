@@ -209,6 +209,10 @@ pub struct VmHandle {
     pub guest_port: u32,
     #[allow(dead_code)]
     pub store_img: PathBuf,
+    /// Whether the boot behind this handle was `FRESH` (`store.img` just
+    /// created) as opposed to `REUSE` (an existing one mounted) — PLAN.md
+    /// Phase 18's retry loop gates ENOSPC recovery on this.
+    pub fresh: bool,
 }
 
 impl VmHandle {
@@ -885,6 +889,88 @@ fn parse_caps_reply(reply: &[u8]) -> eyre::Result<u32> {
     }
 }
 
+/// PLAN.md Phase 18: what `STATUS?` reports — see
+/// `guest-agent/src/ebpf.rs::FailureStatus`, this function's server-side
+/// mirror, and `guest-agent/src/main.rs::format_status` for the exact wire
+/// text [`parse_status_reply`] below parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestFailureStatus {
+    None,
+    OutOfMemory { builder_victim: bool },
+    DiskFull,
+}
+
+/// Clears the guest's OOM/ENOSPC detection state — sent right before opening
+/// a new build's daemon-protocol connection, so whatever `STATUS?` reports
+/// afterwards is scoped to *this* build, not the VM's whole lifetime. Follows
+/// the same `dial_control_port` + verb-string + one-shot-read pattern as
+/// `push_key`/`boot_probe`.
+pub async fn reset_job_status(vsock_socket: &Path) -> eyre::Result<()> {
+    let mut stream = dial_control_port(vsock_socket).await?;
+    stream
+        .write_all(b"RESET\n")
+        .await
+        .wrap_err("sending RESET")?;
+    let mut reply = Vec::new();
+    stream
+        .read_to_end(&mut reply)
+        .await
+        .wrap_err("reading the RESET reply")?;
+    if !reply.starts_with(b"OK") {
+        return Err(eyre!(
+            "guest-agent rejected RESET: {:?}",
+            String::from_utf8_lossy(&reply)
+        ));
+    }
+    Ok(())
+}
+
+/// Asks the guest what resource-exhaustion signal (if any) has fired since
+/// the last [`reset_job_status`] — called once, right after a VM-path build
+/// failure.
+pub async fn query_status(vsock_socket: &Path) -> eyre::Result<GuestFailureStatus> {
+    let mut stream = dial_control_port(vsock_socket).await?;
+    stream
+        .write_all(b"STATUS?\n")
+        .await
+        .wrap_err("sending STATUS?")?;
+    let mut reply = Vec::new();
+    stream
+        .read_to_end(&mut reply)
+        .await
+        .wrap_err("reading the STATUS? reply")?;
+    parse_status_reply(&reply)
+}
+
+fn parse_status_reply(reply: &[u8]) -> eyre::Result<GuestFailureStatus> {
+    let text = String::from_utf8_lossy(reply);
+    let text = text.trim();
+    let rest = text
+        .strip_prefix("OK ")
+        .ok_or_else(|| eyre!("guest-agent rejected STATUS?: {text:?}"))?;
+    match rest.trim() {
+        "NONE" => Ok(GuestFailureStatus::None),
+        "OOM BUILDER" => Ok(GuestFailureStatus::OutOfMemory {
+            builder_victim: true,
+        }),
+        "OOM OTHER" => Ok(GuestFailureStatus::OutOfMemory {
+            builder_victim: false,
+        }),
+        "ENOSPC" => Ok(GuestFailureStatus::DiskFull),
+        other => Err(eyre!("STATUS? reply carried an unrecognised state: {other:?}")),
+    }
+}
+
+/// Deletes `store.img` outright — the ENOSPC-on-`REUSE` retry path (PLAN.md
+/// Phase 18): the next `ensure_vm_for` call for this tenant sees the file
+/// gone, computes `fresh = true`, and reuses every existing
+/// boot/`push_key`/`mkfs.ext4` code path unchanged. No new boot path needed.
+async fn wipe_store_image(store_img: &Path) -> eyre::Result<()> {
+    tokio::fs::remove_file(store_img)
+        .await
+        .wrap_err_with(|| format!("removing {}", store_img.display()))
+}
+
 /// Poll for `path` to exist, up to `timeout` — used to wait for `passt`'s
 /// vhost-user socket to appear before pointing `cloud-hypervisor` at it as a
 /// client. Unlike `wait_for_vsock_ready`, existence is the whole check: there
@@ -1156,6 +1242,12 @@ pub async fn wipe_orphaned_store_images(state_dir: &Path) -> eyre::Result<()> {
 struct WarmVm {
     tenant: TenantId,
     vm: LaunchedVm,
+    /// Whether *this boot* was a `FRESH` `store.img` creation, as opposed to
+    /// mounting one that already existed — PLAN.md Phase 18's ENOSPC
+    /// recovery only wipes-and-retries on a `REUSE` boot (nothing to gain
+    /// from wiping an already-empty disk), so the job loop needs to know
+    /// which one it got.
+    fresh: bool,
 }
 
 /// One warm VM per worker process, LRU-of-one by tenant identity. No
@@ -1227,6 +1319,7 @@ impl<L: VmLauncher> VmPool<L> {
                     vsock_socket: warm.vm.vsock_socket.clone(),
                     guest_port: NIX_DAEMON_PORT,
                     store_img,
+                    fresh: warm.fresh,
                 });
             }
             // Either a different tenant, or the same tenant's VM died on its
@@ -1285,6 +1378,7 @@ impl<L: VmLauncher> VmPool<L> {
         self.warm = Some(WarmVm {
             tenant: tenant.clone(),
             vm,
+            fresh,
         });
 
         Ok(VmHandle {
@@ -1292,7 +1386,23 @@ impl<L: VmLauncher> VmPool<L> {
             vsock_socket,
             guest_port: NIX_DAEMON_PORT,
             store_img,
+            fresh,
         })
+    }
+
+    /// PLAN.md Phase 18's ENOSPC-on-`REUSE` recovery: evicts the current warm
+    /// VM, deletes its `store.img` outright, then re-runs `ensure_vm_for` for
+    /// the same tenant — which will see the file gone, compute `fresh = true`,
+    /// and reuse every existing boot/`push_key`/`mkfs.ext4` code path
+    /// unchanged. Callers are expected to have already checked
+    /// `!handle.fresh` (wiping an already-empty disk has nothing to gain) —
+    /// this method doesn't re-check, so it can also serve a future caller
+    /// that wants an unconditional wipe.
+    pub async fn wipe_and_reboot(&mut self, tenant: &TenantId) -> eyre::Result<VmHandle> {
+        self.evict().await;
+        let store_img = store_img_path(&self.config, tenant);
+        wipe_store_image(&store_img).await?;
+        self.ensure_vm_for(tenant).await
     }
 
     async fn evict(&mut self) {
@@ -1595,5 +1705,79 @@ mod tests {
         assert!(is_transient_connect_error(ErrorKind::ConnectionRefused));
         assert!(!is_transient_connect_error(ErrorKind::PermissionDenied));
         assert!(!is_transient_connect_error(ErrorKind::Other));
+    }
+
+    // PLAN.md Phase 18
+
+    #[test]
+    fn parse_status_reply_every_known_state() {
+        assert_eq!(
+            parse_status_reply(b"OK NONE\n").unwrap(),
+            GuestFailureStatus::None
+        );
+        assert_eq!(
+            parse_status_reply(b"OK OOM BUILDER\n").unwrap(),
+            GuestFailureStatus::OutOfMemory {
+                builder_victim: true
+            }
+        );
+        assert_eq!(
+            parse_status_reply(b"OK OOM OTHER\n").unwrap(),
+            GuestFailureStatus::OutOfMemory {
+                builder_victim: false
+            }
+        );
+        assert_eq!(
+            parse_status_reply(b"OK ENOSPC\n").unwrap(),
+            GuestFailureStatus::DiskFull
+        );
+    }
+
+    #[test]
+    fn parse_status_reply_rejects_unrecognised_and_error_replies() {
+        assert!(parse_status_reply(b"OK WAT\n").is_err());
+        assert!(parse_status_reply(b"ERR eBPF detection not available\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn wipe_and_reboot_deletes_and_recreates_with_fresh_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = FakeLauncher::default();
+        let mut pool = VmPool::with_launcher(test_config(dir.path()), launcher.clone());
+        let tenant = TenantId::from_wire("tenant-a").unwrap();
+
+        let first = pool.ensure_vm_for(&tenant).await.unwrap();
+        assert!(first.fresh, "first boot for a tenant is always FRESH");
+        assert!(tokio::fs::try_exists(&first.store_img).await.unwrap());
+
+        let rebooted = pool.wipe_and_reboot(&tenant).await.unwrap();
+        assert!(
+            rebooted.fresh,
+            "wipe_and_reboot must see the deleted image and boot FRESH again"
+        );
+        assert!(tokio::fs::try_exists(&rebooted.store_img).await.unwrap());
+        assert_eq!(
+            launcher.boot_count(),
+            2,
+            "wipe_and_reboot evicts the old VM and boots exactly one new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_vm_reuse_reports_the_boot_that_actually_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = FakeLauncher::default();
+        let mut pool = VmPool::with_launcher(test_config(dir.path()), launcher.clone());
+        let tenant = TenantId::from_wire("tenant-a").unwrap();
+
+        let first = pool.ensure_vm_for(&tenant).await.unwrap();
+        assert!(first.fresh);
+        let reused = pool.ensure_vm_for(&tenant).await.unwrap();
+        assert!(
+            reused.fresh,
+            "reusing a still-warm VM must report the boot that actually happened (FRESH, since \
+             this tenant's very first boot created store.img), not silently flip to REUSE just \
+             because no new boot happened on this call"
+        );
     }
 }
