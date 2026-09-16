@@ -167,6 +167,19 @@ nix-test-vm-caps:
 nix-test-vm-status:
     nix-build nix -A vm-status-test
 
+# PLAN.md Phase 18: trigger a real cgroup-scoped OOM kill inside a real
+# guest and confirm the oom:mark_victim tracepoint fires and correctly
+# attributes it to the builder. Needs /dev/kvm, same as nix-test-guest-vm.
+nix-test-vm-oom:
+    nix-build nix -A vm-oom-test
+
+# PLAN.md Phase 18: fill a real (small) store.img without ever calling
+# fsync and confirm the errseq_set() kprobe fires -- the actual "does the
+# chosen hook close the silent-ENOSPC-on-close() gap" proof. Needs
+# /dev/kvm, same as nix-test-guest-vm.
+nix-test-vm-enospc:
+    nix-build nix -A vm-enospc-test
+
 # Remove build artifacts.
 clean:
     cargo clean

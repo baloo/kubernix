@@ -53,6 +53,7 @@
 //! just a different pipe for the same noise.
 
 mod cgroup;
+mod diag;
 mod ebpf;
 
 use std::net::Shutdown;
@@ -172,6 +173,26 @@ const GUEST_GATEWAY: &str = "10.42.100.1";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // PLAN.md Phase 18: `TRIGGER_OOM`/`TRIGGER_ENOSPC` (below) re-exec this
+    // same binary as a disposable child process to run one of `diag`'s
+    // payloads, instead of the real PID-1 init logic below -- see
+    // `diag.rs`'s module doc for why. Checked before anything else in
+    // `main` runs (including `color_eyre::install()`, which a short-lived
+    // diagnostic child has no use for).
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--diag-oom-victim") => diag::oom_victim(),
+        Some("--diag-fill-store") => {
+            let path = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("/nix/store/.kubernix-enospc-test");
+            diag::fill_store(path);
+            return Ok(());
+        }
+        _ => {}
+    }
+
     color_eyre::install().ok();
 
     // Since `guest-agent` *is* `/init` (unpacked straight out of the
@@ -407,6 +428,10 @@ async fn log_accept_loop(listener: VsockListener, tx: broadcast::Sender<Vec<u8>>
 ///   build about to start (PLAN.md Phase 18). Sent by the worker right
 ///   before it opens a new build's daemon-protocol connection. See
 ///   `worker/src/vm.rs::reset_job_status`.
+/// - `TRIGGER_OOM` / `TRIGGER_ENOSPC` -- diagnostic-only (PLAN.md Phase
+///   18): drive `diag.rs`'s payloads from the outside, for
+///   `nix/vm-oom-test.nix`/`vm-enospc-test.nix`. No production client ever
+///   sends either.
 async fn handle_control(
     mut stream: VsockStream,
     detection: Option<Arc<Mutex<DetectionState>>>,
@@ -488,11 +513,63 @@ async fn dispatch_control(
         }
         "RESET" => {
             let detection = detection.ok_or_else(|| eyre!("eBPF detection not available"))?;
-            detection.lock().await.reset()?;
+            detection.lock().await.reset().await?;
+            Ok(ControlReply::Ok)
+        }
+        // PLAN.md Phase 18, diagnostic-only: drives `diag.rs`'s payloads
+        // from the outside, for `nix/vm-oom-test.nix`/`vm-enospc-test.nix`.
+        // A real deployment never sends either -- only the worker's
+        // `KEY`/`CAPS?`/`STATUS?`/`RESET` traffic is production use.
+        "TRIGGER_OOM" => {
+            trigger_oom().await?;
+            Ok(ControlReply::Ok)
+        }
+        "TRIGGER_ENOSPC" => {
+            trigger_enospc().await;
             Ok(ControlReply::Ok)
         }
         other => Err(eyre!("unrecognised control command {other:?}")),
     }
+}
+
+/// Re-execs this same binary as `/init --diag-oom-victim` (see `diag.rs`'s
+/// module doc), moves its pid into the build cgroup exactly the way `serve`
+/// does for a real `nix-daemon` instance, and spawns a reaper task so it
+/// doesn't outlive its own `SIGKILL` as a zombie. Returns as soon as the
+/// child is launched and scoped -- it's expected to keep running (and,
+/// under a real `memory.max`, eventually get OOM-killed) well past this
+/// control connection's own one-shot reply.
+async fn trigger_oom() -> Result<()> {
+    let self_exe = std::env::current_exe().unwrap_or_else(|_| "/init".into());
+    let mut child = Command::new(self_exe)
+        .arg("--diag-oom-victim")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .wrap_err("spawning the OOM diagnostic child")?;
+    if let Some(pid) = child.id() {
+        cgroup::move_into_build_cgroup(pid)
+            .await
+            .wrap_err("moving the OOM diagnostic child into the build cgroup")?;
+    }
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(())
+}
+
+/// Runs `diag::fill_store` in a blocking task against a fixed path under
+/// `/nix/store` -- no subprocess needed, unlike [`trigger_oom`]: ENOSPC
+/// detection has no builder/non-builder attribution to set up, so there's
+/// nothing a separate process buys here. Awaits completion (the write loop
+/// itself is bounded, see `diag.rs`) so the caller's `STATUS?` poll
+/// afterwards has a real chance of already seeing the flag set.
+async fn trigger_enospc() {
+    let _ = tokio::task::spawn_blocking(|| {
+        diag::fill_store("/nix/store/.kubernix-enospc-test");
+    })
+    .await;
 }
 
 async fn unlock_and_mount(mut parts: std::str::Split<'_, char>) -> Result<()> {

@@ -168,6 +168,33 @@ writeText "kubernix-vm-test-lib.sh" ''
       | tail -n +2 || true
   }
 
+  # vm_trigger_oom <vsock-socket> [control-port=621]
+  #
+  # Speaks the diagnostic-only `TRIGGER_OOM` control-port verb (PLAN.md
+  # Phase 18) -- mirroring `vm_caps` above. Prints guest-agent's reply
+  # (`OK` or `ERR ...`); the actual OOM kill happens asynchronously well
+  # after this call returns, so a caller polls `vm_status` afterwards.
+  vm_trigger_oom() {
+    local vsock_socket="$1" port="''${2:-621}"
+    printf 'CONNECT %d\nTRIGGER_OOM\n' "$port" \
+      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
+      | tail -n +2 || true
+  }
+
+  # vm_trigger_enospc <vsock-socket> [control-port=621]
+  #
+  # Speaks the diagnostic-only `TRIGGER_ENOSPC` control-port verb (PLAN.md
+  # Phase 18) -- mirroring `vm_caps` above. Blocks until guest-agent's own
+  # write-past-capacity loop finishes (bounded, see `guest-agent/src/diag.rs`)
+  # before replying, so the caller's `vm_status` poll afterwards has a real
+  # chance of already seeing the flag set.
+  vm_trigger_enospc() {
+    local vsock_socket="$1" port="''${2:-621}"
+    printf 'CONNECT %d\nTRIGGER_ENOSPC\n' "$port" \
+      | timeout 60 socat - "UNIX-CONNECT:$vsock_socket" \
+      | tail -n +2 || true
+  }
+
   # vm_stream_logs <vsock-socket> [log-port=622]
   #
   # Dials `guest-agent`'s debug log-stream port (`LOG_PORT`,
