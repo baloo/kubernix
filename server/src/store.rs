@@ -269,6 +269,18 @@ pub trait PathStore: Send + Sync {
     /// path is inert to clients, which is the safe direction to fall.
     async fn signer(&self, tenant: &TenantId) -> Option<Arc<dyn Signer>>;
 
+    /// Whether this tenant wants an unverifiable push refused outright,
+    /// rather than accepted into [`Tier::Quarantined`]. See
+    /// `daemon_rpc::NarSink::finalize`.
+    ///
+    /// `true` by default: quarantine is a narrow accommodation (round-tripping
+    /// an input-addressed build closure through `nix copy`), not the baseline
+    /// expectation, so a tenant opts into accepting unverifiable pushes rather
+    /// than opting out of the stricter behavior.
+    async fn reject_unverified_pushes(&self, _tenant: &TenantId) -> bool {
+        true
+    }
+
     /// Note that a path was read — either its metadata (`queryPathInfo`, a
     /// narinfo) or its bytes (`narFromPath`, a NAR fetch). PLAN.md Phase 12:
     /// this is what retention ages against, so both count, and missing either
@@ -404,6 +416,10 @@ struct Inner {
     signer: Option<Arc<dyn Signer>>,
     /// How much each path can be vouched for.
     tiers: HashMap<StorePath, Tier>,
+    /// Override for [`PathStore::reject_unverified_pushes`]. `None` means the
+    /// trait's own default (`true`) applies; tests flip this to exercise the
+    /// quarantine path.
+    reject_unverified_pushes: Option<bool>,
 }
 
 /// Object key for a path's compressed NAR.
@@ -472,6 +488,13 @@ impl MemoryStore {
     fn write<T>(&self, tenant: &TenantId, f: impl FnOnce(&mut Inner) -> T) -> T {
         let mut inner = self.inner.lock().unwrap();
         f(inner.entry(tenant.clone()).or_default())
+    }
+
+    /// Test-only override for [`PathStore::reject_unverified_pushes`]. Real
+    /// stores read this from the `tenants` table instead.
+    #[cfg(test)]
+    pub fn set_reject_unverified_pushes(&self, tenant: &TenantId, reject: bool) {
+        self.write(tenant, |inner| inner.reject_unverified_pushes = Some(reject));
     }
 }
 
@@ -630,6 +653,10 @@ impl PathStore for MemoryStore {
             )
         })
     }
+
+    async fn reject_unverified_pushes(&self, tenant: &TenantId) -> bool {
+        self.read(tenant, |inner| inner.reject_unverified_pushes.unwrap_or(true))
+    }
 }
 
 #[async_trait::async_trait]
@@ -684,6 +711,24 @@ mod tests {
         // An unknown value must not become vouchable by accident.
         let parsed: Tier = "not-a-real-tier".parse().unwrap();
         assert_eq!(parsed, Tier::Quarantined);
+    }
+
+    #[tokio::test]
+    async fn reject_unverified_pushes_defaults_to_true() {
+        let store = MemoryStore::new();
+        assert!(store.reject_unverified_pushes(&tenant("alice")).await);
+    }
+
+    #[tokio::test]
+    async fn reject_unverified_pushes_can_be_relaxed_per_tenant() {
+        let store = MemoryStore::new();
+        let alice = tenant("alice");
+        let bob = tenant("bob");
+        store.set_reject_unverified_pushes(&alice, false);
+
+        assert!(!store.reject_unverified_pushes(&alice).await);
+        // Untouched tenants keep the stricter default.
+        assert!(store.reject_unverified_pushes(&bob).await);
     }
 
     fn info(path: &str) -> PathInfo {

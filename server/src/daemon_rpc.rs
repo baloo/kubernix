@@ -1139,9 +1139,10 @@ impl legacy_protocol::stream::Server for NarSink {
 
         // Decide what the frontend is willing to say about this path before
         // recording it. A content address can be checked against the bytes;
-        // anything else is the client's word, and is quarantined rather than
-        // refused so that ordinary `nix copy` of a build closure keeps
-        // working. See PLAN.md Phase 9.
+        // anything else is the client's word. By default that's refused
+        // outright, but a tenant may opt into quarantining it instead so that
+        // ordinary `nix copy` of an input-addressed build closure keeps
+        // working — see `Store::reject_unverified_pushes`.
         let tier = match &self.ca {
             Some(ca) => {
                 match crate::store_path::StoreDir(&self.connection.store_dir).verify(
@@ -1173,7 +1174,28 @@ impl legacy_protocol::stream::Server for NarSink {
                     }
                 }
             }
-            None => Tier::Quarantined,
+            None => {
+                if self.tenant_view().reject_unverified_pushes().await {
+                    tracing::warn!(
+                        path = %self.info.path,
+                        tenant = %self.connection.tenant.id,
+                        "refusing an unverifiable push; this tenant rejects them"
+                    );
+                    return Err(rpc_error::failed_with_traces(
+                        format!(
+                            "kubernix: refusing {}: no content address, and this tenant \
+                             rejects unverified pushes",
+                            self.info.path
+                        ),
+                        &[
+                            "the frontend can only verify content-addressed paths; this \
+                             tenant has not opted into accepting anything else"
+                                .to_string(),
+                        ],
+                    ));
+                }
+                Tier::Quarantined
+            }
         };
 
         // A path we already vouch for must not be demoted by someone pushing

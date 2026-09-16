@@ -114,6 +114,10 @@ impl TenantView {
         self.store.signer(&self.tenant).await
     }
 
+    pub async fn reject_unverified_pushes(&self) -> bool {
+        self.store.reject_unverified_pushes(&self.tenant).await
+    }
+
     pub async fn record_access(&self, path: &StorePath) {
         self.store.record_access(&self.tenant, path).await
     }

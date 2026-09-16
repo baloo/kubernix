@@ -744,6 +744,23 @@ impl PostgresStore {
         .map(|s| s.parse().unwrap())
     }
 
+    async fn reject_unverified_pushes_db(&self, tenant: &TenantId) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT reject_unverified_pushes FROM tenants WHERE id = $1",
+        )
+        .bind(tenant.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, %tenant, "reject_unverified_pushes lookup failed");
+            None
+        })
+        // No row for this tenant yet is the same as an unestablished tenant
+        // anywhere else in this file: fall back to the column's own default,
+        // the stricter behavior, rather than trusting an absence.
+        .unwrap_or(true)
+    }
+
     /// Append to `path_access` — deliberately not an `UPDATE store_paths SET
     /// last_access = ...`. See `server/migrations/20260814_retention_and_gc.sql`
     /// and `crate::gc` for why: a direct update would make the store's
@@ -1076,6 +1093,10 @@ enum DbRequest {
         path: StorePath,
         reply: oneshot::Sender<Option<Tier>>,
     },
+    RejectUnverifiedPushes {
+        tenant: TenantId,
+        reply: oneshot::Sender<bool>,
+    },
     RecordAccess {
         tenant: TenantId,
         path: StorePath,
@@ -1200,6 +1221,9 @@ impl DbRequest {
                 reply,
             } => {
                 let _ = reply.send(store.tier_db(&tenant, &path).await);
+            }
+            DbRequest::RejectUnverifiedPushes { tenant, reply } => {
+                let _ = reply.send(store.reject_unverified_pushes_db(&tenant).await);
             }
             DbRequest::RecordAccess {
                 tenant,
@@ -1437,6 +1461,13 @@ impl PathStore for PostgresStore {
         })
         .await
         .flatten()
+    }
+
+    async fn reject_unverified_pushes(&self, tenant: &TenantId) -> bool {
+        let tenant = tenant.clone();
+        self.call(|reply| DbRequest::RejectUnverifiedPushes { tenant, reply })
+            .await
+            .unwrap_or(true)
     }
 
     async fn record_access(&self, tenant: &TenantId, path: &StorePath) {
@@ -2161,6 +2192,30 @@ mod tests {
             .await
             .unwrap();
         assert!(verified);
+    }
+
+    #[tokio::test]
+    async fn reject_unverified_pushes_defaults_to_true_for_a_new_tenant() {
+        let Some(store) = db().await else { return };
+        let t = Tenant::from_ssh("reject-default", None, false);
+        store.register_tenant(&t).await.unwrap();
+
+        assert!(store.reject_unverified_pushes(&t.id).await);
+    }
+
+    #[tokio::test]
+    async fn reject_unverified_pushes_reads_back_a_relaxed_tenant() {
+        let Some(store) = db().await else { return };
+        let t = Tenant::from_ssh("reject-relaxed", None, false);
+        store.register_tenant(&t).await.unwrap();
+
+        sqlx::query("UPDATE tenants SET reject_unverified_pushes = FALSE WHERE id = $1")
+            .bind(t.id.as_str())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(!store.reject_unverified_pushes(&t.id).await);
     }
 
     #[tokio::test]
