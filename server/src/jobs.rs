@@ -120,7 +120,22 @@ pub enum JobOutcome {
     Failed {
         message: String,
         log_key: String,
+        /// Set only on a terminal resource-exhaustion failure (PLAN.md
+        /// Phase 18) -- `None` for every ordinary build failure. See
+        /// `worker/src/main.rs::FailureKind`, the worker-side counterpart
+        /// this is decoded from.
+        failure_kind: Option<FailureKind>,
     },
+}
+
+/// PLAN.md Phase 18. Kept as its own small enum here rather than shared
+/// with `worker`'s identical-looking type -- this codebase's established
+/// pattern for the several structurally-similar Outcome-like types is an
+/// explicit conversion at each capnp boundary, not a fifth shared type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    OutOfMemory,
+    DiskFull,
 }
 
 #[derive(Clone)]
@@ -341,7 +356,16 @@ pub fn decode_outcome(payload: &[u8]) -> eyre::Result<JobOutcome> {
             } else {
                 message
             };
-            Ok(JobOutcome::Failed { message, log_key })
+            let failure_kind = match result.get_failure_kind()? {
+                kubernix_capnp::FailureKind::None => None,
+                kubernix_capnp::FailureKind::OutOfMemory => Some(FailureKind::OutOfMemory),
+                kubernix_capnp::FailureKind::DiskFull => Some(FailureKind::DiskFull),
+            };
+            Ok(JobOutcome::Failed {
+                message,
+                log_key,
+                failure_kind,
+            })
         }
     }
 }

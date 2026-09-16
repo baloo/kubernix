@@ -745,20 +745,18 @@ impl PostgresStore {
     }
 
     async fn reject_unverified_pushes_db(&self, tenant: &TenantId) -> bool {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT reject_unverified_pushes FROM tenants WHERE id = $1",
-        )
-        .bind(tenant.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, %tenant, "reject_unverified_pushes lookup failed");
-            None
-        })
-        // No row for this tenant yet is the same as an unestablished tenant
-        // anywhere else in this file: fall back to the column's own default,
-        // the stricter behavior, rather than trusting an absence.
-        .unwrap_or(true)
+        sqlx::query_scalar::<_, bool>("SELECT reject_unverified_pushes FROM tenants WHERE id = $1")
+            .bind(tenant.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, %tenant, "reject_unverified_pushes lookup failed");
+                None
+            })
+            // No row for this tenant yet is the same as an unestablished tenant
+            // anywhere else in this file: fall back to the column's own default,
+            // the stricter behavior, rather than trusting an absence.
+            .unwrap_or(true)
     }
 
     /// Append to `path_access` — deliberately not an `UPDATE store_paths SET
@@ -817,26 +815,43 @@ impl PostgresStore {
             }
         };
 
-        let (status, error_msg, output_paths, log_key): (&str, Option<&str>, Vec<&str>, &str) =
-            match outcome {
-                JobOutcome::Completed {
-                    outputs, log_key, ..
-                } => (
-                    "completed",
-                    None,
-                    outputs.iter().map(StorePath::as_str).collect(),
-                    log_key,
-                ),
-                JobOutcome::Failed { message, log_key } => {
-                    ("failed", Some(message.as_str()), Vec::new(), log_key)
-                }
-            };
+        let (status, error_msg, output_paths, log_key, failure_kind): (
+            &str,
+            Option<&str>,
+            Vec<&str>,
+            &str,
+            Option<&str>,
+        ) = match outcome {
+            JobOutcome::Completed {
+                outputs, log_key, ..
+            } => (
+                "completed",
+                None,
+                outputs.iter().map(StorePath::as_str).collect(),
+                log_key,
+                None,
+            ),
+            JobOutcome::Failed {
+                message,
+                log_key,
+                failure_kind,
+            } => (
+                "failed",
+                Some(message.as_str()),
+                Vec::new(),
+                log_key,
+                failure_kind.map(|k| match k {
+                    crate::jobs::FailureKind::OutOfMemory => "out_of_memory",
+                    crate::jobs::FailureKind::DiskFull => "disk_full",
+                }),
+            ),
+        };
 
         if let Err(e) = sqlx::query(
             "INSERT INTO jobs (
                  id, tenant, derivation_path, system, status, error_msg,
-                 output_paths, log_key, finished_at
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())",
+                 output_paths, log_key, failure_kind, finished_at
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())",
         )
         .bind(job_id)
         .bind(tenant.as_str())
@@ -846,6 +861,7 @@ impl PostgresStore {
         .bind(error_msg)
         .bind(&output_paths)
         .bind(log_key)
+        .bind(failure_kind)
         .execute(&mut *tx)
         .await
         {
@@ -2125,7 +2141,7 @@ mod tests {
             .await;
 
         let row = sqlx::query(
-            "SELECT status, error_msg, output_paths, log_key, finished_at IS NOT NULL AS has_finished_at
+            "SELECT status, error_msg, output_paths, log_key, failure_kind, finished_at IS NOT NULL AS has_finished_at
                FROM jobs WHERE id = $1",
         )
         .bind(job_id)
@@ -2136,6 +2152,7 @@ mod tests {
         assert!(row.get::<Option<String>, _>("error_msg").is_none());
         assert_eq!(row.get::<Vec<String>, _>("output_paths"), vec![P]);
         assert_eq!(row.get::<String, _>("log_key"), format!("{t}/log/{job_id}"));
+        assert!(row.get::<Option<String>, _>("failure_kind").is_none());
         assert!(row.get::<bool, _>("has_finished_at"));
     }
 
@@ -2155,6 +2172,7 @@ mod tests {
                 &JobOutcome::Failed {
                     message: "builder exited with 1".to_string(),
                     log_key: format!("{t}/log/{job_id}"),
+                    failure_kind: None,
                 },
             )
             .await;
@@ -2172,6 +2190,46 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(error_msg.as_deref(), Some("builder exited with 1"));
+        let failure_kind: Option<String> =
+            sqlx::query_scalar("SELECT failure_kind FROM jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(
+            failure_kind.is_none(),
+            "an ordinary build failure must not carry a failure_kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resource_exhaustion_failure_records_its_failure_kind() {
+        let Some(store) = db().await else { return };
+        let t = tenant("job-oom");
+        let job_id = uuid::Uuid::new_v4();
+        let drv = StorePath::new(format!("00000000000000000000000000000000-{job_id}.drv"));
+
+        store
+            .record_job_outcome(
+                &t,
+                job_id,
+                &drv,
+                "x86_64-linux",
+                &JobOutcome::Failed {
+                    message: "out of memory".to_string(),
+                    log_key: format!("{t}/log/{job_id}"),
+                    failure_kind: Some(crate::jobs::FailureKind::OutOfMemory),
+                },
+            )
+            .await;
+
+        let failure_kind: Option<String> =
+            sqlx::query_scalar("SELECT failure_kind FROM jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(failure_kind.as_deref(), Some("out_of_memory"));
     }
 
     #[tokio::test]

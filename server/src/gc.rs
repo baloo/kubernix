@@ -571,6 +571,7 @@ mod tests {
                 &crate::jobs::JobOutcome::Failed {
                     message: "test outcome".to_string(),
                     log_key: log_key.to_string(),
+                    failure_kind: None,
                 },
             )
             .await;

@@ -1075,10 +1075,38 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                         }
                     }
                 }
-                JobOutcome::Failed { message, log_key } => {
-                    tracing::warn!(%path, %message, %log_key, "build failed");
-                    result.set_status(legacy_protocol::build_result::Status::PermanentFailure);
-                    result.set_error_msg(message.as_bytes());
+                JobOutcome::Failed {
+                    message,
+                    log_key,
+                    failure_kind,
+                } => {
+                    tracing::warn!(%path, %message, %log_key, ?failure_kind, "build failed");
+                    // PLAN.md Phase 18: an unrecovered resource-exhaustion
+                    // failure (every retry/escalation option exhausted) maps
+                    // to the vendored Lix protocol's own existing
+                    // `transientFailure @6 # possibly transient` status
+                    // instead of `PermanentFailure` -- a real client may
+                    // itself retry on this. No schema change to
+                    // `protocol/vendor/lix`: this is additive use of an
+                    // already-defined enum value. Every ordinary build
+                    // failure (`failure_kind: None`) keeps today's
+                    // `PermanentFailure` unchanged.
+                    let (status, wire_message) = match failure_kind {
+                        Some(crate::jobs::FailureKind::OutOfMemory) => (
+                            legacy_protocol::build_result::Status::TransientFailure,
+                            format!("kubernix: build failed (out of memory): {message}"),
+                        ),
+                        Some(crate::jobs::FailureKind::DiskFull) => (
+                            legacy_protocol::build_result::Status::TransientFailure,
+                            format!("kubernix: build failed (disk full): {message}"),
+                        ),
+                        None => (
+                            legacy_protocol::build_result::Status::PermanentFailure,
+                            message,
+                        ),
+                    };
+                    result.set_status(status);
+                    result.set_error_msg(wire_message.as_bytes());
                 }
             }
             result.set_times_built(1);
