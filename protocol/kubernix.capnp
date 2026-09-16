@@ -41,6 +41,14 @@ struct BuildRequest {
   # and hands it back with every upload/download URL request; it never needs
   # to parse it. PLAN.md Phase 14.
   token          @7 :Data;
+  # The derivation's full declared requiredSystemFeatures (kvm/big-parallel,
+  # and any tags kubernix doesn't route on). The frontend already used the
+  # *known* tags to pick the subject this was published to; this is what lets
+  # a worker that can't actually satisfy every declared feature (e.g. it
+  # subscribed to the kvm subject but wasn't deployed with big-parallel too)
+  # Nak the message instead of building it -- see `worker/src/main.rs`.
+  # PLAN.md Phase 17.
+  requiredFeatures @8 :List(Text);
 }
 
 struct BuildResponse {

@@ -71,7 +71,8 @@ const NIX_DAEMON_PORT: u32 = 620;
 /// (`guest-agent/src/main.rs::CONTROL_PORT`), duplicated here for the same
 /// reason as `NIX_DAEMON_PORT` above. Carries the Step 4 `KEY ... FRESH|REUSE`
 /// handshake that unlocks and mounts the tenant's `store.img` before any
-/// daemon-protocol traffic is sent to `NIX_DAEMON_PORT`.
+/// daemon-protocol traffic is sent to `NIX_DAEMON_PORT`, and, since PLAN.md
+/// Phase 17, `boot_probe`'s `CAPS?` nested-virt self-test.
 const CONTROL_PORT: u32 = 621;
 
 /// Phase 15 Step 5's fixed point-to-point address plan for the `passt` link,
@@ -126,6 +127,14 @@ pub struct VmConfig {
     /// Guest CID passed to `--vsock`. Fixed rather than allocated: only one
     /// VM is ever live per worker in this design (see module doc).
     pub cid: u32,
+    /// Guest CID for [`boot_probe`]'s one-off kvm self-test (PLAN.md Phase
+    /// 17). Distinct from `cid` above on principle rather than necessity —
+    /// the probe fully completes, torn down, before the job loop (and so
+    /// before any tenant VM) ever starts, so reusing `cid` would be safe
+    /// under today's strict startup ordering, but a dedicated CID makes that
+    /// safety unconditional instead of dependent on that ordering never
+    /// changing.
+    pub probe_cid: u32,
 }
 
 impl VmConfig {
@@ -153,6 +162,7 @@ impl VmConfig {
             std::env::var("KUBERNIX_VM_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
         let passt = std::env::var("KUBERNIX_VM_PASST_BIN").unwrap_or_else(|_| "passt".to_string());
 
+        let cid: u32 = parse_env_or("KUBERNIX_VM_CID", 3)?;
         Ok(Some(VmConfig {
             state_dir: PathBuf::from(state_dir),
             kernel: PathBuf::from(kernel),
@@ -163,7 +173,8 @@ impl VmConfig {
             memory_mb: parse_env_or("KUBERNIX_VM_MEMORY_MB", 768)?,
             store_img_size_mb: parse_env_or("KUBERNIX_VM_STORE_IMG_MB", 8192)?,
             boot_timeout: Duration::from_secs(parse_env_or("KUBERNIX_VM_BOOT_TIMEOUT_SECS", 30)?),
-            cid: parse_env_or("KUBERNIX_VM_CID", 3)?,
+            cid,
+            probe_cid: parse_env_or("KUBERNIX_VM_PROBE_CID", cid + 1)?,
         }))
     }
 }
@@ -700,29 +711,7 @@ impl VmLauncher for CloudHypervisorLauncher {
     }
 
     async fn push_key(&self, vsock_socket: &Path, key: &StoreKey, fresh: bool) -> eyre::Result<()> {
-        let mut stream = tokio::net::UnixStream::connect(vsock_socket)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "dialing {} for the control-channel key push",
-                    vsock_socket.display()
-                )
-            })?;
-        stream
-            .write_all(format!("CONNECT {CONTROL_PORT}\n").as_bytes())
-            .await
-            .wrap_err("sending the vsock CONNECT handshake to the control channel")?;
-        let mut buf = [0u8; 32];
-        let n = stream
-            .read(&mut buf)
-            .await
-            .wrap_err("reading the control-channel CONNECT reply")?;
-        if !buf[..n].starts_with(b"OK") {
-            return Err(eyre!(
-                "vsock CONNECT to guest control port {CONTROL_PORT} refused: {:?}",
-                String::from_utf8_lossy(&buf[..n])
-            ));
-        }
+        let mut stream = dial_control_port(vsock_socket).await?;
 
         let mode = if fresh { "FRESH" } else { "REUSE" };
         stream
@@ -742,6 +731,157 @@ impl VmLauncher for CloudHypervisorLauncher {
             ));
         }
         Ok(())
+    }
+}
+
+/// Dial `vsock_socket`'s control-channel port and complete cloud-hypervisor's
+/// own `CONNECT <port>\n` -> `OK...` vsock proxy handshake, returning the
+/// still-open stream ready for a guest-agent control verb. Shared by
+/// `push_key` and `boot_probe` — the *outer* framing layer both speak before
+/// getting to whichever verb of guest-agent's own protocol they actually
+/// want (`KEY ...` / `CAPS?`, PLAN.md Phase 17).
+async fn dial_control_port(vsock_socket: &Path) -> eyre::Result<tokio::net::UnixStream> {
+    let mut stream = tokio::net::UnixStream::connect(vsock_socket)
+        .await
+        .wrap_err_with(|| format!("dialing {} for the control channel", vsock_socket.display()))?;
+    stream
+        .write_all(format!("CONNECT {CONTROL_PORT}\n").as_bytes())
+        .await
+        .wrap_err("sending the vsock CONNECT handshake to the control channel")?;
+    let mut buf = [0u8; 32];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .wrap_err("reading the control-channel CONNECT reply")?;
+    if !buf[..n].starts_with(b"OK") {
+        return Err(eyre!(
+            "vsock CONNECT to guest control port {CONTROL_PORT} refused: {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        ));
+    }
+    Ok(stream)
+}
+
+/// Boots a disk-less, network-less, untenanted probe VM at worker startup to
+/// check whether nested virtualization actually reaches the guest — `/dev/kvm`
+/// presence alone (what the `devices.kubevirt.io/kvm` device plugin checks
+/// for in the chart) does not guarantee this, since the plugin may only test
+/// that the device file exists, not that nested virt actually works on that
+/// node. Returns the count of `vmx`/`svm` lines the guest itself sees in
+/// `/proc/cpuinfo`, via the `CAPS?` control-port verb
+/// (`guest-agent/src/main.rs::count_nested_virt_flags`) — this checks the
+/// perspective that actually matters (would an L2 VM inside this guest see
+/// the flags), not host-side capability.
+///
+/// Entirely outside `VmPool`/`VmHandle`'s per-tenant lifecycle: no `--disk`,
+/// no `--net`/`passt` (no networking is needed just to ask `CAPS?`), no
+/// `UidAllocator::allocate` — runs as the worker process's own uid. That is a
+/// `v1` choice, not a closed question: there is no tenant data or `store.img`
+/// here to isolate from, which is what made `UidAllocator`'s per-tenant
+/// identities worth their complexity in the first place, but it is worth
+/// revisiting if the threat model around `cloud-hypervisor` itself changes.
+///
+/// Tears the child process down unconditionally before returning, success or
+/// failure — never fatal to worker startup on its own (see the call site in
+/// `main.rs`): a worker whose probe fails or reports zero flags simply never
+/// declares itself `kvm`-capable, and is still a fully useful plain/
+/// `big-parallel` worker. PLAN.md Phase 17.
+pub async fn boot_probe(config: &VmConfig) -> eyre::Result<u32> {
+    let probe_dir = config.state_dir.join("probe");
+    tokio::fs::create_dir_all(&probe_dir)
+        .await
+        .wrap_err_with(|| format!("creating {}", probe_dir.display()))?;
+    let vsock_socket = probe_dir.join("vsock.sock");
+    let _ = tokio::fs::remove_file(&vsock_socket).await;
+    let console_log = probe_dir.join("console.log");
+    let ch_log = probe_dir.join("cloud-hypervisor.log");
+
+    let mut ch_command = Command::new(&config.cloud_hypervisor);
+    ch_command
+        .arg("--kernel")
+        .arg(&config.kernel)
+        .arg("--initramfs")
+        .arg(&config.initrd)
+        .arg("--cmdline")
+        .arg("console=ttyS0 reboot=t panic=1")
+        .arg("--cpus")
+        .arg(format!("boot={}", config.vcpus))
+        .arg("--memory")
+        .arg(format!("size={}M", config.memory_mb))
+        .arg("--vsock")
+        .arg(format!(
+            "cid={},socket={}",
+            config.probe_cid,
+            vsock_socket.display()
+        ))
+        .arg("--console")
+        .arg("off")
+        .arg("--serial")
+        .arg(format!("file={}", console_log.display()))
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let ch_stdout = std::fs::File::create(&ch_log)
+        .wrap_err_with(|| format!("creating {}", ch_log.display()))?;
+    let ch_stderr = ch_stdout
+        .try_clone()
+        .wrap_err("cloning the cloud-hypervisor log file handle")?;
+    ch_command
+        .stdout(Stdio::from(ch_stdout))
+        .stderr(Stdio::from(ch_stderr));
+
+    let mut child = ch_command.spawn().wrap_err_with(|| {
+        format!(
+            "spawning {} for the kvm probe",
+            config.cloud_hypervisor.display()
+        )
+    })?;
+
+    let result: eyre::Result<u32> = async {
+        tokio::time::timeout(
+            config.boot_timeout,
+            wait_for_vsock_ready(&vsock_socket, CONTROL_PORT),
+        )
+        .await
+        .wrap_err("timed out waiting for guest-agent's control port")??;
+
+        let mut stream = dial_control_port(&vsock_socket).await?;
+        stream
+            .write_all(b"CAPS?\n")
+            .await
+            .wrap_err("sending CAPS?")?;
+        let mut reply = Vec::new();
+        stream
+            .read_to_end(&mut reply)
+            .await
+            .wrap_err("reading the CAPS? reply")?;
+        parse_caps_reply(&reply)
+    }
+    .await;
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    match result {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            let console_tail = console_log_tail(&console_log).await;
+            let ch_tail = console_log_tail(&ch_log).await;
+            Err(e.wrap_err(format!(
+                "console log:\n{console_tail}\ncloud-hypervisor log:\n{ch_tail}"
+            )))
+        }
+    }
+}
+
+fn parse_caps_reply(reply: &[u8]) -> eyre::Result<u32> {
+    let text = String::from_utf8_lossy(reply);
+    let text = text.trim();
+    match text.strip_prefix("OK ") {
+        Some(rest) => rest
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| eyre!("CAPS? reply {text:?} did not carry a decimal count: {e}")),
+        None => Err(eyre!("guest-agent rejected CAPS?: {text:?}")),
     }
 }
 
@@ -1264,6 +1404,7 @@ mod tests {
             store_img_size_mb: 1,
             boot_timeout: Duration::from_secs(1),
             cid: 3,
+            probe_cid: 4,
         }
     }
 

@@ -5,9 +5,11 @@
 //! - `NIX_DAEMON_PORT`: on each accepted connection, spawns `nix-daemon
 //!   --stdio` and splices the connection's bytes straight onto the child's
 //!   stdin/stdout, in both directions, until either side closes.
-//! - `CONTROL_PORT` (Phase 15 Step 4): a tiny one-shot protocol that unlocks
-//!   and mounts the tenant's `store.img` before any `nix-daemon` connection
-//!   is worth accepting — see [`handle_control`].
+//! - `CONTROL_PORT` (Phase 15 Step 4): a verb-prefixed line protocol,
+//!   one-shot per connection. `KEY` unlocks and mounts the tenant's
+//!   `store.img` before any `nix-daemon` connection is worth accepting;
+//!   `CAPS?` (Phase 17) answers a boot-time nested-virt self-test. See
+//!   [`handle_control`].
 //! - `LOG_PORT`: a debugging aid, not part of the production protocol surface
 //!   — streams this process's `tracing` output to whoever connects. See the
 //!   "Logging" section below for why it's a separate channel.
@@ -351,11 +353,20 @@ async fn log_accept_loop(listener: VsockListener, tx: broadcast::Sender<Vec<u8>>
     }
 }
 
-/// One-shot control protocol: read a single `KEY <64 hex chars> <FRESH|REUSE>`
-/// line, open `RAW_DEVICE` as plain `dm-crypt` with that key, `mkfs.ext4` it
-/// first if `FRESH`, mount the result at `STORE_MOUNT`, and reply `OK` or
-/// `ERR <message>` before closing. See `worker/src/vm.rs::push_key` for the
-/// client side of this exact protocol.
+/// One-shot-per-connection, verb-prefixed line protocol: read a single line,
+/// dispatch on its first space-separated token, and reply either `OK\n`,
+/// `OK <data>\n` (a verb that answers with data rather than plain
+/// success), or `ERR <message>\n`, before closing. Verbs today:
+///
+/// - `KEY <64 hex chars> <FRESH|REUSE>` -- open `RAW_DEVICE` as plain
+///   `dm-crypt` with that key, `mkfs.ext4` it first if `FRESH`, mount the
+///   result at `STORE_MOUNT`. See `worker/src/vm.rs::push_key` for the
+///   client side.
+/// - `CAPS?` -- report nested-virtualization support as seen from inside
+///   this guest (PLAN.md Phase 17). See `worker/src/vm.rs::boot_probe` for
+///   the client side.
+///
+/// (`STATUS?`, PLAN.md Phase 18, lands in the same dispatch later.)
 async fn handle_control(mut stream: VsockStream) -> Result<()> {
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
@@ -365,8 +376,9 @@ async fn handle_control(mut stream: VsockStream) -> Result<()> {
         .await
         .wrap_err("reading control line")?;
 
-    let reply = match unlock_and_mount(line.trim_end()).await {
-        Ok(()) => "OK\n".to_string(),
+    let reply = match dispatch_control(line.trim_end()).await {
+        Ok(ControlReply::Ok) => "OK\n".to_string(),
+        Ok(ControlReply::OkWithData(n)) => format!("OK {n}\n"),
         // `eyre::Report`'s `Display` only surfaces the outermost context
         // (e.g. "cryptsetup open"), discarding exactly the underlying
         // command's stderr that explains *why* -- join the full chain so a
@@ -391,12 +403,26 @@ async fn handle_control(mut stream: VsockStream) -> Result<()> {
     Ok(())
 }
 
-async fn unlock_and_mount(line: &str) -> Result<()> {
+#[derive(Debug)]
+enum ControlReply {
+    Ok,
+    OkWithData(u32),
+}
+
+async fn dispatch_control(line: &str) -> Result<ControlReply> {
     let mut parts = line.split(' ');
     let cmd = parts.next().ok_or_else(|| eyre!("empty control line"))?;
-    if cmd != "KEY" {
-        return Err(eyre!("unrecognised control command {cmd:?}"));
+    match cmd {
+        "KEY" => {
+            unlock_and_mount(parts).await?;
+            Ok(ControlReply::Ok)
+        }
+        "CAPS?" => Ok(ControlReply::OkWithData(count_nested_virt_flags()?)),
+        other => Err(eyre!("unrecognised control command {other:?}")),
     }
+}
+
+async fn unlock_and_mount(mut parts: std::str::Split<'_, char>) -> Result<()> {
     let hex_key = parts
         .next()
         .ok_or_else(|| eyre!("missing key in KEY command"))?;
@@ -426,6 +452,26 @@ async fn unlock_and_mount(line: &str) -> Result<()> {
     }
     mount_store().await?;
     Ok(())
+}
+
+/// In-process equivalent of `egrep -c '(vmx|svm)' /proc/cpuinfo`: the count of
+/// `/proc/cpuinfo` lines advertising a nested-virt-capable flag, i.e. how many
+/// CPUs this guest itself sees as `vmx`/`svm`-capable. Reflects whatever the
+/// hypervisor's CPU model passes through to the guest, not host-side
+/// capability directly -- which is exactly the perspective that matters for
+/// whether an L2 VM inside this guest would actually work (PLAN.md Phase 17).
+/// No `regex` crate, no process spawn: a plain read and line scan, matching
+/// this crate's minimal-dependency commitment.
+fn count_nested_virt_flags() -> Result<u32> {
+    let contents = std::fs::read_to_string("/proc/cpuinfo").wrap_err("reading /proc/cpuinfo")?;
+    Ok(count_nested_virt_flags_str(&contents))
+}
+
+fn count_nested_virt_flags_str(cpuinfo: &str) -> u32 {
+    cpuinfo
+        .lines()
+        .filter(|line| line.contains("vmx") || line.contains("svm"))
+        .count() as u32
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
@@ -733,5 +779,51 @@ async fn reap(child: &mut Child) {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!("guest-agent: nix-daemon exited with {status}"),
         Err(err) => eprintln!("guest-agent: waiting on nix-daemon: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_nested_virt_flags_str_no_match() {
+        let cpuinfo = "processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: fpu vme de pse\n";
+        assert_eq!(count_nested_virt_flags_str(cpuinfo), 0);
+    }
+
+    #[test]
+    fn count_nested_virt_flags_str_multi_core_intel() {
+        let cpuinfo = "\
+processor\t: 0\nflags\t\t: fpu vme de pse tsc vmx\n\n\
+processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
+        assert_eq!(count_nested_virt_flags_str(cpuinfo), 2);
+    }
+
+    #[test]
+    fn count_nested_virt_flags_str_amd() {
+        let cpuinfo = "processor\t: 0\nflags\t\t: fpu vme de pse tsc svm\n";
+        assert_eq!(count_nested_virt_flags_str(cpuinfo), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_caps_returns_data() {
+        // Real /proc/cpuinfo on the machine running the test -- whatever it
+        // reports, dispatch should surface it as OkWithData, not Ok/Err.
+        match dispatch_control("CAPS?").await {
+            Ok(ControlReply::OkWithData(_)) => {}
+            other => panic!("expected OkWithData, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_unrecognised_verb_errors() {
+        let err = dispatch_control("WAT").await.unwrap_err();
+        assert!(err.to_string().contains("unrecognised control command"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_empty_line_errors() {
+        assert!(dispatch_control("").await.is_err());
     }
 }

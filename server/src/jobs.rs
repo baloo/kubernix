@@ -27,8 +27,26 @@ use crate::tenant::TenantId;
 pub const JOBS_STREAM: &str = "kubernix_jobs";
 pub const RESULTS_STREAM: &str = "kubernix_results";
 
-pub fn jobs_subject(system: &System) -> String {
-    format!("kubernix.jobs.{system}")
+/// The subject a job publishes to, given its declared `requiredSystemFeatures`
+/// (PLAN.md Phase 17). A plain job (no recognised features) publishes to
+/// exactly the same subject as before this phase existed.
+///
+/// `kvm` takes priority over `big-parallel` when a derivation declares both:
+/// `kvm` is a hard functional requirement (the build cannot run at all
+/// without it), `big-parallel` is only a sizing hint, so it's the one worth
+/// picking a single subject on. This does not silently drop the other
+/// declared feature — the full list still travels with the job (see
+/// `BuildJob::required_features`), so a worker that's `kvm`-subscribed but
+/// wasn't also deployed with `big-parallel` can still notice and Nak the
+/// job rather than build it. Unrecognised tags are ignored for routing.
+pub fn jobs_subject(system: &System, features: &[&str]) -> String {
+    if features.contains(&"kvm") {
+        format!("kubernix.jobs.{system}.kvm")
+    } else if features.contains(&"big-parallel") {
+        format!("kubernix.jobs.{system}.big-parallel")
+    } else {
+        format!("kubernix.jobs.{system}")
+    }
 }
 
 pub fn logs_subject(job_id: &Uuid) -> String {
@@ -69,6 +87,12 @@ pub struct BuildJob {
     /// trusting `tenant` or a worker-reported `OutputInfo.store_path` at face
     /// value. PLAN.md Phase 14.
     pub token: CapabilityToken,
+    /// The derivation's full declared `requiredSystemFeatures`, used to pick
+    /// the subject this job publishes to (`jobs_subject`) and sent along on
+    /// the wire so a worker can double-check it actually satisfies every
+    /// declared feature, not just the one the subject routed on. PLAN.md
+    /// Phase 17.
+    pub required_features: Vec<String>,
 }
 
 /// Per-output metadata the worker reports, which is what `narinfo` is generated
@@ -191,6 +215,13 @@ impl JobQueue {
             req.set_tenant(job.tenant.as_str());
             req.set_token(job.token.as_bytes());
 
+            let mut features = req
+                .reborrow()
+                .init_required_features(job.required_features.len() as u32);
+            for (i, feature) in job.required_features.iter().enumerate() {
+                features.set(i as u32, feature.as_str());
+            }
+
             let mut inputs = req.reborrow().init_inputs(job.inputs.len() as u32);
             for (i, input) in job.inputs.iter().enumerate() {
                 let mut entry = inputs.reborrow().get(i as u32);
@@ -207,7 +238,8 @@ impl JobQueue {
         capnp::serialize::write_message(&mut payload, &message)
             .wrap_err("encoding the build request")?;
 
-        let subject = jobs_subject(&job.system);
+        let features: Vec<&str> = job.required_features.iter().map(String::as_str).collect();
+        let subject = jobs_subject(&job.system, &features);
         tracing::info!(
             job_id = %job.job_id,
             tenant = %job.tenant,
@@ -311,5 +343,57 @@ pub fn decode_outcome(payload: &[u8]) -> eyre::Result<JobOutcome> {
             };
             Ok(JobOutcome::Failed { message, log_key })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn system() -> System {
+        System::from("x86_64-linux".to_string())
+    }
+
+    #[test]
+    fn plain_job_is_unaffected() {
+        // Byte-identical to the pre-Phase-17 subject format.
+        assert_eq!(jobs_subject(&system(), &[]), "kubernix.jobs.x86_64-linux");
+    }
+
+    #[test]
+    fn unknown_feature_falls_back_to_plain() {
+        assert_eq!(
+            jobs_subject(&system(), &["ca-derivations"]),
+            "kubernix.jobs.x86_64-linux"
+        );
+    }
+
+    #[test]
+    fn kvm_only() {
+        assert_eq!(
+            jobs_subject(&system(), &["kvm"]),
+            "kubernix.jobs.x86_64-linux.kvm"
+        );
+    }
+
+    #[test]
+    fn big_parallel_only() {
+        assert_eq!(
+            jobs_subject(&system(), &["big-parallel"]),
+            "kubernix.jobs.x86_64-linux.big-parallel"
+        );
+    }
+
+    #[test]
+    fn both_declared_kvm_wins() {
+        assert_eq!(
+            jobs_subject(&system(), &["big-parallel", "kvm"]),
+            "kubernix.jobs.x86_64-linux.kvm"
+        );
+        // Order in the input slice must not matter.
+        assert_eq!(
+            jobs_subject(&system(), &["kvm", "big-parallel"]),
+            "kubernix.jobs.x86_64-linux.kvm"
+        );
     }
 }

@@ -962,6 +962,12 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             // capability token will authorize below.
             let parsed = derivation::parse(&drv, &store_dir)
                 .map_err(|e| rpc_error::failed(format!("kubernix: malformed derivation: {e}")))?;
+            // PLAN.md Phase 17: the derivation's declared requiredSystemFeatures,
+            // already sitting in `parsed.env` -- no new parsing needed, just
+            // read the one key. `jobs::jobs_subject` picks the subject from the
+            // *known* tags; the full list still travels with the job so a
+            // worker can Nak one it can't fully satisfy.
+            let required_features = required_system_features(&parsed.env);
             let drv_name = path.derivation_name();
             let mut expected_outputs = Vec::with_capacity(parsed.outputs.len());
             for output in &parsed.outputs {
@@ -1018,6 +1024,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 inputs: staged,
                 tenant: tenant.clone(),
                 token,
+                required_features,
             };
 
             let outcome = queue
@@ -1079,6 +1086,17 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             Ok(())
         }
     }
+}
+
+/// The derivation's declared `requiredSystemFeatures`, split on whitespace --
+/// the standard Nix `env` attribute, space-separated (e.g. `"kvm
+/// big-parallel"`). No new parsing surface: `env` already carries this
+/// verbatim from `derivation::parse`, so this just reads the one key.
+/// PLAN.md Phase 17.
+fn required_system_features(env: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    env.get("requiredSystemFeatures")
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
 }
 
 /// Accumulates a streamed NAR, committing it on `finalize`.
@@ -1371,6 +1389,35 @@ mod tests {
                 options: RefCell::new(ClientOptions::default()),
             }
         }
+    }
+
+    #[test]
+    fn required_system_features_missing_key() {
+        assert!(required_system_features(&std::collections::BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn required_system_features_single_tag() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("requiredSystemFeatures".to_string(), "kvm".to_string());
+        assert_eq!(required_system_features(&env), vec!["kvm".to_string()]);
+    }
+
+    #[test]
+    fn required_system_features_multiple_tags() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "requiredSystemFeatures".to_string(),
+            "big-parallel kvm ca-derivations".to_string(),
+        );
+        assert_eq!(
+            required_system_features(&env),
+            vec![
+                "big-parallel".to_string(),
+                "kvm".to_string(),
+                "ca-derivations".to_string(),
+            ]
+        );
     }
 
     fn info(path: &str) -> PathInfo {

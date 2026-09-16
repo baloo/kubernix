@@ -153,6 +153,12 @@ nix-test-vm-encryption:
 nix-test-vm-network:
     nix-build nix -A vm-network-test
 
+# PLAN.md Phase 17: drive the CAPS? control-port verb against a real guest
+# and confirm it reports real nested-virt support (vmx/svm flags visible
+# from inside the guest itself). Needs /dev/kvm, same as nix-test-guest-vm.
+nix-test-vm-caps:
+    nix-build nix -A vm-caps-test
+
 # Remove build artifacts.
 clean:
     cargo clean

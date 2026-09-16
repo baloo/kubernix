@@ -316,6 +316,20 @@ in {
       default = 8192;
       description = "Size (MB) of a freshly created, sparse per-tenant store.img.";
     };
+
+    systemFeatures = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "big-parallel" ];
+      description = ''
+        PLAN.md Phase 17: static capability classes this worker declares,
+        analogous to a Nix `machines` file's supportedFeatures column — routes
+        `requiredSystemFeatures = "big-parallel"` jobs here. "kvm" is not
+        settable here: kvm-class routing is gated by the worker's own
+        boot-time nested-virt self-test (`worker/src/vm.rs::boot_probe`),
+        never by static declaration alone.
+      '';
+    };
   };
 
   config = mkMerge [
@@ -427,6 +441,8 @@ in {
           NATS_URL = cfg_worker.natsUrl;
           NIX_SYSTEM = cfg_worker.system;
           RUST_LOG = "debug";
+        } // optionalAttrs (cfg_worker.systemFeatures != [ ]) {
+          KUBERNIX_WORKER_CLASSES = concatStringsSep "," cfg_worker.systemFeatures;
         } // optionalAttrs (cfg_worker.store != null) {
           KUBERNIX_NIX_STORE = cfg_worker.store;
         } // optionalAttrs (cfg_worker.vmKernel != null) {

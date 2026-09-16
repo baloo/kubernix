@@ -23,7 +23,11 @@ spec:
         natsServerMonitoringEndpoint: {{ printf "%s-nats:8222" (include "kubernix.fullname" .) | quote }}
         stream: kubernix_jobs
         # Must match worker/src/main.rs's durable consumer name exactly:
-        # `format!("worker-{}", system.replace('-', "_"))`.
+        # `format!("worker-{}", system.replace('-', "_"))`. Unchanged by
+        # PLAN.md Phase 17's capability-class routing: one worker uses one
+        # consumer with a `filter_subjects` list spanning every class it
+        # declares, so this lag figure now reflects the queue depth across
+        # all of them together, not just the plain subject.
         consumer: {{ printf "worker-%s" (.Values.worker.system | replace "-" "_") | quote }}
         lagThreshold: {{ .Values.worker.autoscaling.lagThreshold | quote }}
         activationLagThreshold: {{ .Values.worker.autoscaling.activationLagThreshold | quote }}

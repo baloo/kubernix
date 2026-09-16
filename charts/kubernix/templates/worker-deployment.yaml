@@ -94,6 +94,11 @@ spec:
               value: {{ .Values.worker.vm.memoryMb | quote }}
             - name: KUBERNIX_VM_STORE_IMG_MB
               value: {{ .Values.worker.vm.storeImgMb | quote }}
+            # PLAN.md Phase 17: static capability classes this worker
+            # declares — "kvm" is never set here, only ever probe-confirmed
+            # at startup. See worker.systemFeatures' comment above.
+            - name: KUBERNIX_WORKER_CLASSES
+              value: {{ .Values.worker.systemFeatures | join "," | quote }}
             - name: RUST_LOG
               value: debug
           # $HOME and KUBERNIX_NIX_STORE both point under here — baked into

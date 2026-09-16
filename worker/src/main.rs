@@ -29,6 +29,12 @@ type VmConn = kubernix_daemon_protocol::DaemonConnection<tokio::net::UnixStream>
 /// credentials; this worker never does.
 pub const UPLOADS_SUBJECT: &str = "kubernix.uploads";
 
+/// Bounds Nak-based redelivery of a job this worker can't fully satisfy
+/// (PLAN.md Phase 17): past this many deliveries, a still-unsatisfied job is
+/// reported as a failure instead of Nak'd again, so a feature combination no
+/// worker in the fleet declares fails visibly rather than looping forever.
+const MAX_JOB_DELIVER: i64 = 5;
+
 use async_nats::jetstream::{self, consumer::PullConsumer};
 use eyre::{Context as _, OptionExt as _};
 use futures_util::stream::StreamExt;
@@ -50,6 +56,13 @@ struct Job {
     /// upload/download URL request, which is what the frontend actually
     /// checks a key against. PLAN.md Phase 14.
     token: CapabilityToken,
+    /// The derivation's full declared `requiredSystemFeatures` — the subject
+    /// this job arrived on already routed on the *known* tags, but this
+    /// worker still checks the full list against its own capability set
+    /// before building, in case it can't actually satisfy every one of them
+    /// (e.g. it's subscribed to the kvm subject but wasn't deployed with
+    /// big-parallel too). See `worker_capabilities_satisfy`. PLAN.md Phase 17.
+    required_features: Vec<String>,
 }
 
 struct InputRef {
@@ -168,7 +181,63 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let client = async_nats::connect(&nats_url).await?;
     let jetstream = jetstream::new(client.clone());
 
-    let subject = format!("kubernix.jobs.{system}");
+    let http = reqwest::Client::new();
+    let nix = upload::NixStore {
+        nix_store: &builder,
+        nix_cli: &nix_cli,
+        store_uri: store_uri.as_deref(),
+        store_dir: &store_dir,
+    };
+
+    // Phase 15 Steps 2-4: per-tenant VM lifecycle, opt-in on
+    // KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD — a worker without them keeps
+    // building exactly as it does today. Moved ahead of consumer creation
+    // (Phase 17): the kvm boot-time probe below needs to run, and its result
+    // needs to be known, before the subject list a consumer subscribes to
+    // can be computed.
+    let vm_config = vm::VmConfig::from_env()?;
+    let mut vm_pool = if let Some(config) = &vm_config {
+        // Step 4: every `store.img` left on disk by a previous run of this
+        // process is ciphertext this process holds no key for — wipe them
+        // before serving a single job rather than let them sit as
+        // unrecoverable dead weight.
+        vm::wipe_orphaned_store_images(&config.state_dir)
+            .await
+            .wrap_err("wiping orphaned tenant store images")?;
+        Some(vm::VmPool::new(config.clone()).wrap_err("setting up the per-tenant uid allocator")?)
+    } else {
+        tracing::info!(
+            "KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD not set; per-tenant VM lifecycle disabled"
+        );
+        None
+    };
+
+    // PLAN.md Phase 17: this worker's own capability classes — the union of
+    // whatever it's statically declared (KUBERNIX_WORKER_CLASSES, a chart/
+    // deployment fact analogous to a Nix `machines` file's supportedFeatures
+    // column) and, independently, whatever its own boot-time probe confirms.
+    // `kvm` is deliberately never settable via the static var — see
+    // `worker_capabilities_satisfy`'s doc and the probe below.
+    let mut worker_classes =
+        parse_static_worker_classes(&std::env::var("KUBERNIX_WORKER_CLASSES").unwrap_or_default());
+    if let Some(config) = &vm_config {
+        match vm::boot_probe(config).await {
+            Ok(n) if n > 0 => {
+                tracing::info!(vmx_svm_count = n, "kvm probe: nested virt confirmed");
+                worker_classes.push("kvm".to_string());
+            }
+            Ok(_) => tracing::warn!(
+                "kvm probe: 0 vmx/svm flags seen guest-side, not subscribing to kvm jobs"
+            ),
+            Err(e) => tracing::warn!(error = ?e, "kvm probe failed, not subscribing to kvm jobs"),
+        }
+    }
+    tracing::info!(classes = ?worker_classes, "worker capability classes");
+
+    let mut subjects = vec![format!("kubernix.jobs.{system}")];
+    for class in &worker_classes {
+        subjects.push(format!("kubernix.jobs.{system}.{class}"));
+    }
 
     // A WorkQueue stream permits only one consumer per filter subject, so a
     // leftover consumer from a previous run blocks startup with "filtered
@@ -204,43 +273,22 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let consumer: PullConsumer = stream
         .create_consumer(jetstream::consumer::pull::Config {
             durable_name: Some(format!("worker-{}", system.replace('-', "_"))),
-            filter_subject: subject.clone(),
+            filter_subjects: subjects.clone(),
             // One at a time: a build holds its message un-acked while it runs.
             max_ack_pending: 1,
             ack_wait: std::time::Duration::from_secs(3600),
+            // Bounds Nak-based redelivery (PLAN.md Phase 17): a job needing a
+            // feature combination no worker in the fleet actually declares
+            // would otherwise Nak forever with no visible failure. See the
+            // job loop's own delivery-count check below, which is what
+            // turns "redelivered past this bound" into a reported failure
+            // instead of a silently exhausted consumer.
+            max_deliver: MAX_JOB_DELIVER,
             ..Default::default()
         })
         .await?;
 
-    let http = reqwest::Client::new();
-    let nix = upload::NixStore {
-        nix_store: &builder,
-        nix_cli: &nix_cli,
-        store_uri: store_uri.as_deref(),
-        store_dir: &store_dir,
-    };
-
-    // Phase 15 Steps 2-4: per-tenant VM lifecycle, opt-in on
-    // KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD — a worker without them keeps
-    // building exactly as it does today.
-    let vm_config = vm::VmConfig::from_env()?;
-    let mut vm_pool = if let Some(config) = vm_config {
-        // Step 4: every `store.img` left on disk by a previous run of this
-        // process is ciphertext this process holds no key for — wipe them
-        // before serving a single job rather than let them sit as
-        // unrecoverable dead weight.
-        vm::wipe_orphaned_store_images(&config.state_dir)
-            .await
-            .wrap_err("wiping orphaned tenant store images")?;
-        Some(vm::VmPool::new(config).wrap_err("setting up the per-tenant uid allocator")?)
-    } else {
-        tracing::info!(
-            "KUBERNIX_VM_KERNEL/KUBERNIX_VM_INITRD not set; per-tenant VM lifecycle disabled"
-        );
-        None
-    };
-
-    tracing::info!(%subject, "waiting for jobs");
+    tracing::info!(?subjects, "waiting for jobs");
     let mut messages = consumer.messages().await?;
 
     while let Some(message) = messages.next().await {
@@ -262,6 +310,45 @@ async fn main() -> color_eyre::eyre::Result<()> {
                 continue;
             }
         };
+
+        // PLAN.md Phase 17: this worker's own subject list may have routed
+        // it a job it can't actually fully satisfy (e.g. it's subscribed to
+        // the kvm subject but wasn't deployed with big-parallel too, and the
+        // job needs both). Nak rather than build it, so JetStream offers the
+        // message to another consumer of the same subject instead — bounded
+        // by the consumer's `max_deliver`, so a feature combination no
+        // worker in the fleet declares fails visibly instead of Naking
+        // forever.
+        if !worker_capabilities_satisfy(&worker_classes, &job.required_features) {
+            let delivered = message.info().map(|info| info.delivered).unwrap_or(1);
+            if delivered < MAX_JOB_DELIVER {
+                tracing::warn!(
+                    job_id = %job.job_id, ?job.required_features, classes = ?worker_classes,
+                    delivered, "cannot satisfy every required feature, nak'ing for redelivery"
+                );
+                if let Err(e) = message.ack_with(jetstream::AckKind::Nak(None)).await {
+                    tracing::error!(job_id = %job.job_id, error = %e, "failed to nak job");
+                }
+            } else {
+                tracing::error!(
+                    job_id = %job.job_id, ?job.required_features, classes = ?worker_classes,
+                    delivered, "no worker satisfied this job's required features after \
+                     redelivery; failing it"
+                );
+                let outcome = Outcome::Failed(format!(
+                    "kubernix: no worker in the fleet declares every required feature \
+                     ({:?}) for job {}",
+                    job.required_features, job.job_id
+                ));
+                if let Err(e) = job.publish_result(&jetstream, &outcome, &[], None).await {
+                    tracing::error!(job_id = %job.job_id, error = %e, "failed to publish result");
+                }
+                if let Err(e) = message.ack().await {
+                    tracing::error!(job_id = %job.job_id, error = %e, "failed to ack job");
+                }
+            }
+            continue;
+        }
 
         tracing::info!(job_id = %job.job_id, drv = %job.derivation_path, inputs = job.inputs.len(), "building");
 
@@ -411,6 +498,11 @@ fn decode_job(payload: &[u8]) -> eyre::Result<Job> {
     // failing here beats failing later with a refused URL request.
     let tenant = TenantId::from_wire(tenant).ok_or_eyre("build request carries no tenant")?;
 
+    let mut required_features = Vec::new();
+    for feature in request.get_required_features()?.iter() {
+        required_features.push(feature?.to_string()?);
+    }
+
     Ok(Job {
         job_id: request.get_job_id()?.to_string()?,
         derivation_path: StorePath::new(request.get_derivation_path()?.to_string()?),
@@ -418,7 +510,37 @@ fn decode_job(payload: &[u8]) -> eyre::Result<Job> {
         inputs,
         drv: request.get_drv()?.to_vec(),
         token: CapabilityToken::new(request.get_token()?.to_vec()),
+        required_features,
     })
+}
+
+/// Parses `KUBERNIX_WORKER_CLASSES` (comma-separated, e.g. `"big-parallel"`)
+/// into the set of statically-declared capability classes. `kvm` is filtered
+/// out even if present — it is never a static declaration, only ever
+/// probe-confirmed at startup (see `boot_probe`); everything else
+/// unrecognised is filtered out too, same as the frontend's own routing.
+/// PLAN.md Phase 17.
+fn parse_static_worker_classes(env_value: &str) -> Vec<String> {
+    env_value
+        .split(',')
+        .map(str::trim)
+        .filter(|f| *f == "big-parallel")
+        .map(String::from)
+        .collect()
+}
+
+/// Whether this worker's own declared capability classes cover every feature
+/// the job requires. `classes` is this worker's own set (static
+/// `KUBERNIX_WORKER_CLASSES` config, plus `kvm` iff the startup probe
+/// confirmed it) — unrecognised tags in `required` are ignored, matching the
+/// frontend's own routing (`server/src/jobs.rs::jobs_subject`): they were
+/// never something any worker could have declared in the first place.
+/// PLAN.md Phase 17.
+fn worker_capabilities_satisfy(classes: &[String], required: &[String]) -> bool {
+    required
+        .iter()
+        .filter(|f| f.as_str() == "kvm" || f.as_str() == "big-parallel")
+        .all(|f| classes.iter().any(|c| c == f))
 }
 
 /// A job's terminal state.
@@ -806,5 +928,76 @@ mod tests {
         assert!(message.contains("11111111-2222-3333-4444-555555555555"));
         assert!(message.contains("uploading artifacts failed"));
         assert!(!message.contains(leaked));
+    }
+
+    #[test]
+    fn parse_static_worker_classes_empty() {
+        assert!(parse_static_worker_classes("").is_empty());
+    }
+
+    #[test]
+    fn parse_static_worker_classes_single() {
+        assert_eq!(
+            parse_static_worker_classes("big-parallel"),
+            vec!["big-parallel".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_static_worker_classes_trims_whitespace() {
+        assert_eq!(
+            parse_static_worker_classes(" big-parallel , "),
+            vec!["big-parallel".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_static_worker_classes_rejects_kvm_and_unknown() {
+        // kvm is probe-only; anything else unrecognised is dropped too.
+        assert!(parse_static_worker_classes("kvm,made-up-feature").is_empty());
+    }
+
+    #[test]
+    fn worker_satisfies_a_plain_job() {
+        assert!(worker_capabilities_satisfy(&[], &[]));
+    }
+
+    #[test]
+    fn worker_satisfies_unrecognised_features() {
+        // A tag nothing routes on is not something any worker could have
+        // declared, so it's not something this check should demand either.
+        assert!(worker_capabilities_satisfy(
+            &[],
+            &["ca-derivations".to_string()]
+        ));
+    }
+
+    #[test]
+    fn plain_worker_cannot_satisfy_kvm() {
+        assert!(!worker_capabilities_satisfy(&[], &["kvm".to_string()]));
+    }
+
+    #[test]
+    fn kvm_worker_satisfies_kvm() {
+        assert!(worker_capabilities_satisfy(
+            &["kvm".to_string()],
+            &["kvm".to_string()]
+        ));
+    }
+
+    #[test]
+    fn kvm_only_worker_cannot_satisfy_kvm_plus_big_parallel() {
+        assert!(!worker_capabilities_satisfy(
+            &["kvm".to_string()],
+            &["kvm".to_string(), "big-parallel".to_string()]
+        ));
+    }
+
+    #[test]
+    fn worker_declaring_both_satisfies_both() {
+        assert!(worker_capabilities_satisfy(
+            &["kvm".to_string(), "big-parallel".to_string()],
+            &["kvm".to_string(), "big-parallel".to_string()]
+        ));
     }
 }

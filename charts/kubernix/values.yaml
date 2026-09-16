@@ -187,6 +187,17 @@ worker:
     memoryMb: 768
     storeImgMb: 8192
     kvmResourceName: devices.kubevirt.io/kvm
+  # Static capability classes this worker pool declares (PLAN.md Phase 17),
+  # analogous to a Nix `machines` file's supportedFeatures column — routes
+  # `requiredSystemFeatures = "big-parallel"` jobs to workers deployed with
+  # `big-parallel` listed here. "kvm" is NOT settable here: kvm-class
+  # routing is gated by each worker's own boot-time nested-virt self-test
+  # (worker/src/vm.rs::boot_probe), never by static declaration alone —
+  # /dev/kvm's presence (what kvmResourceName above grants access to) does
+  # not by itself prove nested virt actually works on that node.
+  #
+  # example: systemFeatures: ["big-parallel"]
+  systemFeatures: []
   # KEDA scaling (PLAN.md Phase 13 / Phase 15 Step 7) on kubernix_jobs'
   # per-system durable consumer (worker/src/main.rs, `worker-<system>` with
   # dashes replaced by underscores — must track that naming exactly). Left

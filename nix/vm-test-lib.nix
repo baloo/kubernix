@@ -130,6 +130,21 @@ writeText "kubernix-vm-test-lib.sh" ''
       | tail -n +2 || true
   }
 
+  # vm_caps <vsock-socket> [control-port=621]
+  #
+  # Speaks the `CAPS?` control-port verb (PLAN.md Phase 17) end to end:
+  # CONNECT to the control port, then `CAPS?`, mirroring `vm_push_key` above
+  # -- see that function's doc comment for why `tail -n +2` and `|| true`
+  # are both needed. Prints guest-agent's reply, `OK <n>` (the count of
+  # `vmx`/`svm` lines this guest itself sees in `/proc/cpuinfo`) or
+  # `ERR ...`.
+  vm_caps() {
+    local vsock_socket="$1" port="''${2:-621}"
+    printf 'CONNECT %d\nCAPS?\n' "$port" \
+      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
+      | tail -n +2 || true
+  }
+
   # vm_stream_logs <vsock-socket> [log-port=622]
   #
   # Dials `guest-agent`'s debug log-stream port (`LOG_PORT`,
