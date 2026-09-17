@@ -9,7 +9,9 @@
 //! methods reads naturally: `reader.to_store_path(store_dir)` rather than
 //! `read_store_path(reader, store_dir)`.
 
+use async_nats::jetstream::consumer::pull;
 use futures_util::StreamExt as _;
+use uuid::Uuid;
 
 use crate::daemon_capnp::legacy_protocol;
 use crate::jobs::JobQueue;
@@ -363,17 +365,11 @@ impl LogStreamExt for log_stream::Client {
 }
 
 impl JobQueue {
-    /// Submit a job, relay its log into the client's `LogStream`, and return
-    /// the outcome.
+    /// Submit a new job, then [`Self::watch`] it.
     ///
     /// The log subscription and result consumer are created *before* the job
     /// is submitted: logs are core NATS with no replay, so subscribing
     /// afterwards races the worker and can drop the opening lines.
-    ///
-    /// This future is deliberately `!Send` — it holds capnp capabilities —
-    /// which is why it runs on the connection's `LocalSet`. The NATS futures
-    /// it awaits are `Send`, and awaiting a `Send` future from a `!Send` task
-    /// is fine.
     pub(crate) async fn dispatch(
         &self,
         job: crate::jobs::BuildJob,
@@ -383,7 +379,7 @@ impl JobQueue {
 
         let job_id = job.job_id;
 
-        let mut logs = self
+        let logs = self
             .subscribe_logs(&job_id)
             .await
             .wrap_err("subscribing to the job's logs")?;
@@ -394,12 +390,41 @@ impl JobQueue {
 
         self.submit(&job).await.wrap_err("submitting the job")?;
 
+        self.watch(job_id, &job.derivation_path, logger, logs, consumer)
+            .await
+    }
+
+    /// Relay a job's log into the client's `LogStream` and return its
+    /// terminal outcome — the post-submit half of [`Self::dispatch`].
+    ///
+    /// PLAN.md Phase 19: this is also, unchanged, what a second+ request for
+    /// the same `(tenant, derivation_path)` calls to attach to an
+    /// already-dispatched job instead of resubmitting — it only needs its
+    /// own `logs`/`consumer` (created against the existing `job_id`, exactly
+    /// as [`Self::dispatch`] creates them for a fresh one) and never touches
+    /// `submit`. Every caller — the original dispatcher and any later
+    /// attacher, on any replica — ends up relaying the identical log stream
+    /// and computing the identical outcome off the same replay-safe results
+    /// subject.
+    ///
+    /// This future is deliberately `!Send` — it holds capnp capabilities —
+    /// which is why it runs on the connection's `LocalSet`. The NATS futures
+    /// it awaits are `Send`, and awaiting a `Send` future from a `!Send` task
+    /// is fine.
+    pub(crate) async fn watch(
+        &self,
+        job_id: Uuid,
+        derivation_path: &StorePath,
+        logger: &log_stream::Client,
+        mut logs: async_nats::Subscriber,
+        consumer: async_nats::jetstream::consumer::Consumer<pull::Config>,
+    ) -> eyre::Result<crate::jobs::JobOutcome> {
         // The client sees a build activity for the job, and each log line
         // arrives as a result on it — the same shape a local build produces,
         // so it renders identically.
         let activity_id = job_id.as_u128() as u64;
         logger
-            .start_activity(activity_id, job.derivation_path.as_str())
+            .start_activity(activity_id, derivation_path.as_str())
             .await?;
 
         let outcome = {
