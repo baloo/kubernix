@@ -160,7 +160,16 @@ impl JobQueue {
         self.client.clone()
     }
 
-    pub async fn connect(url: &str) -> eyre::Result<Self> {
+    /// `results_retention` sets `RESULTS_STREAM`'s `max_age` and is also
+    /// stored on the returned `JobQueue` (see the field's own doc comment)
+    /// for `daemon_rpc::build_derivation` to pass into
+    /// `PathStore::reserve_job` — PLAN.md Phase 19. Callers should pass the
+    /// same value the worker configures its own copy of this stream with
+    /// (`kubernix.jobs.resultsRetention`, `KUBERNIX_JOB_RESULTS_RETENTION`):
+    /// `get_or_create_stream` only actually applies `max_age` for whichever
+    /// process creates the stream first, so a mismatch here would silently
+    /// pick one side's value depending on start order, not average or error.
+    pub async fn connect(url: &str, results_retention: Duration) -> eyre::Result<Self> {
         tracing::info!(%url, "connecting to NATS");
         let client = async_nats::connect(url)
             .await
@@ -178,11 +187,6 @@ impl JobQueue {
             })
             .await
             .wrap_err_with(|| format!("creating the {JOBS_STREAM} stream"))?;
-
-        // TODO(PLAN.md Phase 19 step 5): chart-driven, not hardcoded --
-        // shared with `jobs.resultsRetention` and threaded to the GC's own
-        // orphan-reservation sweep, so all three can never disagree.
-        let results_retention = Duration::from_secs(24 * 3600);
 
         jetstream
             .get_or_create_stream(jetstream::stream::Config {

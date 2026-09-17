@@ -86,6 +86,11 @@ spec:
           env:
             - name: NATS_URL
               value: {{ printf "nats://%s-nats:4222" .Release.Name | quote }}
+            # PLAN.md Phase 19 -- must match kubernix-sshd's and
+            # kubernix-gc's own copies of this same value (see values.yaml's
+            # own comment).
+            - name: KUBERNIX_JOB_RESULTS_RETENTION
+              value: {{ .Values.jobs.resultsRetention | quote }}
             - name: NIX_SYSTEM
               value: {{ .Values.worker.system | quote }}
             - name: KUBERNIX_VM_VCPUS

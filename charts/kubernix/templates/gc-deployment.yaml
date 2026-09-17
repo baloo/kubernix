@@ -43,6 +43,11 @@ spec:
               value: {{ .Values.gc.jobRetention.logAfter | quote }}
             - name: KUBERNIX_GC_JOB_ROW_CUTOFF
               value: {{ .Values.gc.jobRetention.rowAfter | quote }}
+            # PLAN.md Phase 19 -- same name, and must be the same value, as
+            # kubernix-sshd's and the worker's own copies (see values.yaml's
+            # own comment).
+            - name: KUBERNIX_JOB_RESULTS_RETENTION
+              value: {{ .Values.jobs.resultsRetention | quote }}
             - name: RUST_LOG
               value: debug
           resources:

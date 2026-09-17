@@ -16,6 +16,11 @@
 //!   `KUBERNIX_GC_CUTOFF_QUARANTINED` seconds a quarantined path may go unread (default 1 day)
 //!   `KUBERNIX_GC_JOB_LOG_CUTOFF`     seconds after a job finishes before its log is deleted (default 7 days)
 //!   `KUBERNIX_GC_JOB_ROW_CUTOFF`     seconds after a job finishes before its row is deleted (default 90 days)
+//!   `KUBERNIX_JOB_RESULTS_RETENTION` seconds a `'running'` job may go unclaimed before this
+//!                                    collector reclaims it as orphaned (default 24h) -- same
+//!                                    name, and must be the same value, as `kubernix-sshd`'s and
+//!                                    the worker's own copies (PLAN.md Phase 19); see
+//!                                    `gc::JobRetention::stuck_running_after`'s doc comment
 
 use std::time::Duration;
 
@@ -85,6 +90,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
         row_after: env_secs(
             "KUBERNIX_GC_JOB_ROW_CUTOFF",
             JobRetention::default().row_after,
+        ),
+        stuck_running_after: env_secs(
+            "KUBERNIX_JOB_RESULTS_RETENTION",
+            JobRetention::default().stuck_running_after,
         ),
     };
     let batch_size: i64 = std::env::var("KUBERNIX_GC_BATCH")

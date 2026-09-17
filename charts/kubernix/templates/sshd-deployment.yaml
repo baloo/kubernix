@@ -38,6 +38,10 @@ spec:
             {{- include "kubernix.s3Env" . | nindent 12 }}
             - name: NATS_URL
               value: {{ printf "nats://%s-nats:4222" .Release.Name | quote }}
+            # PLAN.md Phase 19 -- must match the worker's and kubernix-gc's
+            # own copies of this same value (see values.yaml's own comment).
+            - name: KUBERNIX_JOB_RESULTS_RETENTION
+              value: {{ .Values.jobs.resultsRetention | quote }}
             - name: KUBERNIX_SSH_LISTEN
               value: {{ .Values.sshd.listen | quote }}
             - name: KUBERNIX_SSH_HOST_KEY

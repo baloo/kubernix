@@ -137,6 +137,23 @@ impl Job {
     }
 }
 
+/// Parse a seconds-valued env var, falling back to `default` if it's unset
+/// or unparseable. Mirrors `kubernix-gc`/`kubernix-sshd`'s own copies of
+/// this -- small enough, and specific enough to each binary's own env var
+/// names, that a shared helper isn't worth it.
+fn env_secs(name: &str, default: std::time::Duration) -> std::time::Duration {
+    match std::env::var(name) {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(secs) => std::time::Duration::from_secs(secs),
+            Err(e) => {
+                tracing::warn!(%name, value = %v, error = %e, "unparseable, using the default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
@@ -176,6 +193,16 @@ async fn main() -> color_eyre::eyre::Result<()> {
     // carries this.
     let store_dir =
         std::env::var("KUBERNIX_STORE_DIR").unwrap_or_else(|_| "/nix/store".to_string());
+    // PLAN.md Phase 19: must match the frontend's own copy of this value
+    // (`kubernix_server::jobs::JobQueue::connect`'s `results_retention`
+    // parameter) -- `get_or_create_stream` below only actually applies
+    // `max_age` for whichever of the two processes creates the stream
+    // first, so a mismatch would silently pick one side's value rather than
+    // erroring.
+    let results_retention = env_secs(
+        "KUBERNIX_JOB_RESULTS_RETENTION",
+        std::time::Duration::from_secs(24 * 3600),
+    );
 
     tracing::info!(%nats_url, %system, "starting worker");
     let client = async_nats::connect(&nats_url).await?;
@@ -264,7 +291,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .get_or_create_stream(jetstream::stream::Config {
             name: "kubernix_results".to_string(),
             subjects: vec!["kubernix.results.>".to_string()],
-            max_age: std::time::Duration::from_secs(24 * 3600),
+            max_age: results_retention,
             ..Default::default()
         })
         .await?;

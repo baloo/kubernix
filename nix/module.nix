@@ -91,6 +91,21 @@ in {
       default = "nats://localhost:4222";
       description = "NATS connection string. Without it, builds are refused.";
     };
+
+    jobResultsRetention = mkOption {
+      type = types.ints.positive;
+      default = 24 * 3600;
+      description = ''
+        Seconds a job's outcome stays replayable in NATS, and how long a
+        dedup reservation for an in-flight build (PLAN.md Phase 19) may go
+        unclaimed before it is treated as orphaned. Must match
+        `kubernix-worker`'s and `kubernix-gc`'s own copies of this same
+        value (`jobResultsRetention` / `jobRetention.stuckRunningAfter`
+        respectively) -- NATS only actually applies this to the results
+        stream once, on whichever of the two processes creates it first, and
+        a mismatch would silently pick one side's value rather than error.
+      '';
+    };
   } // s3Options;
 
   # The binary cache: narinfo, NARs and logs, under a /<tenant>/ prefix.
@@ -199,6 +214,19 @@ in {
           shorter the row simply waits for the log to catch up.
         '';
       };
+      stuckRunningAfter = mkOption {
+        type = types.ints.positive;
+        default = 24 * 3600;
+        description = ''
+          Seconds a `jobs` row may sit at `status = 'running'` (PLAN.md
+          Phase 19's dedup reservation) before this collector reclaims it as
+          orphaned -- a backstop for a reservation nothing ever asks about
+          again, not the primary recovery path (a live request reclaims a
+          stale one itself, inline). Must match `kubernix-sshd`'s and
+          `kubernix-worker`'s own `jobResultsRetention` -- see that option's
+          description.
+        '';
+      };
     };
   } // s3Options;
 
@@ -255,6 +283,16 @@ in {
       type = types.str;
       default = "nats://localhost:4222";
       description = "NATS connection string.";
+    };
+
+    jobResultsRetention = mkOption {
+      type = types.ints.positive;
+      default = 24 * 3600;
+      description = ''
+        Must match `kubernix-sshd`'s `jobResultsRetention` and
+        `kubernix-gc`'s `jobRetention.stuckRunningAfter` -- see that
+        option's own description (PLAN.md Phase 19).
+      '';
     };
 
     system = mkOption {
@@ -342,6 +380,7 @@ in {
         environment = {
           DATABASE_URL = cfg_sshd.databaseUrl;
           NATS_URL = cfg_sshd.natsUrl;
+          KUBERNIX_JOB_RESULTS_RETENTION = toString cfg_sshd.jobResultsRetention;
           KUBERNIX_SSH_LISTEN = cfg_sshd.listen;
           KUBERNIX_SSH_HOST_KEY = cfg_sshd.hostKey;
           RUST_LOG = "debug";
@@ -392,6 +431,7 @@ in {
           KUBERNIX_GC_CUTOFF_QUARANTINED = toString cfg_gc.cutoffs.quarantined;
           KUBERNIX_GC_JOB_LOG_CUTOFF = toString cfg_gc.jobRetention.logAfter;
           KUBERNIX_GC_JOB_ROW_CUTOFF = toString cfg_gc.jobRetention.rowAfter;
+          KUBERNIX_JOB_RESULTS_RETENTION = toString cfg_gc.jobRetention.stuckRunningAfter;
           RUST_LOG = "debug";
         } // s3Env cfg_gc;
 
@@ -439,6 +479,7 @@ in {
 
         environment = {
           NATS_URL = cfg_worker.natsUrl;
+          KUBERNIX_JOB_RESULTS_RETENTION = toString cfg_worker.jobResultsRetention;
           NIX_SYSTEM = cfg_worker.system;
           RUST_LOG = "debug";
         } // optionalAttrs (cfg_worker.systemFeatures != [ ]) {

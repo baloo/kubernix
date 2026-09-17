@@ -109,6 +109,16 @@ cert-manager:
   crds:
     enabled: true
 
+# PLAN.md Phase 19: shared by kubernix-sshd, the worker, and kubernix-gc via
+# one `KUBERNIX_JOB_RESULTS_RETENTION` env var, so the three can never
+# disagree — how long a job's outcome stays replayable in NATS is exactly
+# the same duration a stuck (crashed, or genuinely abandoned) dedup
+# reservation is allowed to survive before being reclaimed, on either side
+# (inline, by the next request that notices, or by kubernix-gc's own
+# backstop sweep). See `jobs::JobQueue::connect`'s doc comment.
+jobs:
+  resultsRetention: 86400 # 24h
+
 sshd:
   replicas: 1
   listen: "0.0.0.0:2222"

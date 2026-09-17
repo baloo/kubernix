@@ -26,6 +26,14 @@
 //!                             a `tenant_auth_bindings` row without a database
 //!   `KUBERNIX_STORE_DIR`      store dir a client's paths are prefixed with
 //!                             (default `/nix/store`)
+//!   `KUBERNIX_JOB_RESULTS_RETENTION`
+//!                             seconds a job's outcome stays replayable in
+//!                             NATS, and how long a dedup reservation
+//!                             (PLAN.md Phase 19) may go unclaimed before
+//!                             it's orphaned (default 24h) -- must match
+//!                             the worker's own copy of this value
+//!                             (`KUBERNIX_JOB_RESULTS_RETENTION` there too),
+//!                             see `jobs::JobQueue::connect`'s doc comment
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +48,23 @@ use russh::server::Server as _;
 use russh::keys::{Algorithm, PrivateKey};
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Parse a seconds-valued env var, falling back to `default` if it's unset
+/// or unparseable. Mirrors `kubernix-gc`'s own copy of this — small enough,
+/// and specific enough to each binary's own env var names, that a shared
+/// helper isn't worth it.
+fn env_secs(name: &str, default: Duration) -> Duration {
+    match std::env::var(name) {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(e) => {
+                tracing::warn!(%name, value = %v, error = %e, "unparseable, using the default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
@@ -101,7 +126,11 @@ async fn main() -> color_eyre::eyre::Result<()> {
     }
 
     if let Ok(nats_url) = std::env::var("NATS_URL") {
-        match kubernix_server::jobs::JobQueue::connect(&nats_url).await {
+        let results_retention = env_secs(
+            "KUBERNIX_JOB_RESULTS_RETENTION",
+            Duration::from_secs(24 * 3600),
+        );
+        match kubernix_server::jobs::JobQueue::connect(&nats_url, results_retention).await {
             Ok(queue) => {
                 // Serve pre-signed upload URLs. This process is the only holder
                 // of S3 credentials; workers receive per-object capabilities.

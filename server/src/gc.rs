@@ -73,6 +73,19 @@ impl Default for TierCutoffs {
 pub struct JobRetention {
     pub log_after: Duration,
     pub row_after: Duration,
+    /// PLAN.md Phase 19: how long a `jobs` row may sit at `status =
+    /// 'running'` before it's treated as orphaned (the process that
+    /// reserved it crashed, or every watcher walked away, before anything
+    /// ever completed it) rather than still in flight. Must be the same
+    /// value as `jobs::JobQueue::results_retention` — see that field's own
+    /// doc comment for why: a reservation must never be reaped while its
+    /// job's outcome could still legitimately arrive and be replayed. This
+    /// is purely a backstop, not the primary recovery path — a live request
+    /// for the same `(tenant, derivation_path)` reclaims a stale
+    /// reservation itself, inline, the moment it notices one (see
+    /// `PostgresStore::reserve_job_db`); this sweep only catches the case
+    /// where nothing ever asks again.
+    pub stuck_running_after: Duration,
 }
 
 impl Default for JobRetention {
@@ -80,6 +93,7 @@ impl Default for JobRetention {
         Self {
             log_after: Duration::from_secs(7 * 24 * 3600),
             row_after: Duration::from_secs(90 * 24 * 3600),
+            stuck_running_after: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -96,6 +110,9 @@ pub struct GcStats {
     pub job_logs_marked: u64,
     pub job_logs_purged: u64,
     pub jobs_reaped: u64,
+    /// PLAN.md Phase 19: orphaned `'running'` reservations reclaimed this
+    /// pass — see `JobRetention::stuck_running_after`.
+    pub stuck_jobs_reclaimed: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +182,8 @@ async fn run_locked(
     let job_logs_marked = mark_expired_job_logs(conn, job_retention.log_after).await?;
     let job_logs_purged = sweep_job_logs(conn, uploader).await?;
     let jobs_reaped = reap_jobs(conn, job_retention.row_after).await?;
+    let stuck_jobs_reclaimed =
+        reclaim_stuck_running_jobs(conn, job_retention.stuck_running_after).await?;
 
     tracing::info!(
         access_marks_drained,
@@ -174,6 +193,7 @@ async fn run_locked(
         job_logs_marked,
         job_logs_purged,
         jobs_reaped,
+        stuck_jobs_reclaimed,
         "gc pass complete"
     );
 
@@ -186,6 +206,7 @@ async fn run_locked(
         job_logs_marked,
         job_logs_purged,
         jobs_reaped,
+        stuck_jobs_reclaimed,
     })
 }
 
@@ -438,6 +459,39 @@ pub(crate) async fn reap_jobs(conn: &mut PgConnection, row_after: Duration) -> R
     Ok(reaped.rows_affected())
 }
 
+/// PLAN.md Phase 19 backstop: fail any `jobs` row still `status = 'running'`
+/// long enough after `created_at` that its outcome, even if the build
+/// eventually finished, could no longer be replayed from NATS (see
+/// `JobRetention::stuck_running_after`'s doc comment on why this must share
+/// its value with `kubernix_results`' own `max_age`).
+///
+/// Same `WHERE status = 'running' AND created_at < cutoff` predicate as the
+/// inline steal in `PostgresStore::reserve_job_db` — the two race harmlessly
+/// against each other on the same row: whichever gets there first wins
+/// atomically (one `UPDATE`, one row), the other affects zero rows. `gc`
+/// connects `BYPASSRLS` (see the row-level-security migration's doc
+/// comment), so this runs across every tenant's rows in one statement,
+/// unlike a normal serving-path query.
+pub(crate) async fn reclaim_stuck_running_jobs(
+    conn: &mut PgConnection,
+    stuck_running_after: Duration,
+) -> Result<u64> {
+    let reclaimed = sqlx::query(
+        "UPDATE jobs
+            SET status = 'failed',
+                error_msg = 'kubernix: orphaned in-flight record reaped (no result observed \
+                             within the retention window)',
+                finished_at = NOW()
+          WHERE status = 'running'
+            AND created_at < NOW() - make_interval(secs => $1::double precision)",
+    )
+    .bind(stuck_running_after.as_secs_f64())
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(reclaimed.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +594,7 @@ mod tests {
         JobRetention {
             log_after: Duration::from_secs(60),
             row_after: Duration::from_secs(60),
+            stuck_running_after: Duration::from_secs(60),
         }
     }
 
