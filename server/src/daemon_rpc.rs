@@ -27,7 +27,9 @@ use crate::daemon_capnp::{bootstrap, legacy_boot, legacy_protocol, protocol};
 use crate::jobs::{BuildJob, JobOutcome, JobQueue};
 use crate::logging_capnp::log_stream;
 use crate::rpc_error;
-use crate::store::{ClientOptions, Hash, HashType, MemoryStore, PathInfo, Store, StoreError, Tier};
+use crate::store::{
+    ClientOptions, Hash, HashType, MemoryStore, PathInfo, Reservation, Store, StoreError, Tier,
+};
 use crate::store_path::ContentAddress;
 use crate::tenant::Tenant;
 #[cfg(test)]
@@ -1001,39 +1003,88 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
 
             let job_id = Uuid::new_v4();
 
-            // Minted here rather than left implicit: this is the one place
-            // that knows both the tenant this connection has authenticated as
-            // and the output paths just independently verified above, so it
-            // is the only place that can state the job's capability honestly.
-            let capability = crate::capability::Capability {
-                job_id,
-                tenant: tenant.clone(),
-                derivation_path: path.clone(),
-                expected_outputs,
-            };
-            // Not tenant-scoped — see `TenantView`'s module doc — so this
-            // one call goes through the raw store rather than `store`.
-            let (kid, secret) = store.store().current_capability_secret().await;
-            let token = capability.sign(kid, &secret);
+            // PLAN.md Phase 19: reserve `(tenant, path)` before dispatching
+            // anything -- if another request for this exact derivation is
+            // already in flight, attach to it (subscribe to its logs and
+            // result) instead of dispatching a second, fully redundant
+            // build. `path` is itself content-addressed, so this is a safe,
+            // stable dedup key with nothing new to hash; scoped through
+            // `tenant` (never `path` alone) so two tenants building an
+            // identical derivation never share a job. `expected_outputs`
+            // is still computed above either way -- it's needed to verify
+            // the worker's reported outputs (below) whether or not this
+            // connection is the one that dispatched the job.
+            let reservation = store
+                .reserve_job(job_id, &path, system.as_str(), queue.results_retention)
+                .await;
 
-            let job = BuildJob {
-                job_id,
-                derivation_path: path.clone(),
-                system: system.clone(),
-                drv,
-                inputs: staged,
-                tenant: tenant.clone(),
-                token,
-                required_features,
-            };
+            let (effective_job_id, outcome) = match reservation {
+                Reservation::Won => {
+                    // Minted here rather than left implicit: this is the one
+                    // place that knows both the tenant this connection has
+                    // authenticated as and the output paths just
+                    // independently verified above, so it is the only place
+                    // that can state the job's capability honestly.
+                    let capability = crate::capability::Capability {
+                        job_id,
+                        tenant: tenant.clone(),
+                        derivation_path: path.clone(),
+                        expected_outputs: expected_outputs.clone(),
+                    };
+                    // Not tenant-scoped — see `TenantView`'s module doc — so
+                    // this one call goes through the raw store rather than
+                    // `store`.
+                    let (kid, secret) = store.store().current_capability_secret().await;
+                    let token = capability.sign(kid, &secret);
 
-            let outcome = queue
-                .dispatch(job, &logger)
-                .await
-                .map_err(|e| e.into_capnp_error("dispatching the build"))?;
+                    let job = BuildJob {
+                        job_id,
+                        derivation_path: path.clone(),
+                        system: system.clone(),
+                        drv,
+                        inputs: staged,
+                        tenant: tenant.clone(),
+                        token,
+                        required_features,
+                    };
+
+                    let outcome = queue
+                        .dispatch(job, &logger)
+                        .await
+                        .map_err(|e| e.into_capnp_error("dispatching the build"))?;
+                    (job_id, outcome)
+                }
+                Reservation::Lost(existing_id) => {
+                    tracing::info!(%path, %existing_id, "attaching to an already in-flight build");
+                    let logs = queue.subscribe_logs(&existing_id).await.map_err(|e| {
+                        rpc_error::failed(format!(
+                            "kubernix: subscribing to the in-progress build's logs: {e}"
+                        ))
+                    })?;
+                    let consumer = queue
+                        .result_consumer(&existing_id)
+                        .await
+                        .map_err(|e| e.into_capnp_error("attaching to the in-progress build"))?;
+                    let outcome = queue
+                        .watch(
+                            existing_id,
+                            &path,
+                            &logger,
+                            logs,
+                            consumer,
+                            Some(
+                                "kubernix: this derivation is already building -- attached to \
+                                 an in-progress build; earlier output was not captured",
+                            ),
+                        )
+                        .await
+                        .map_err(|e| e.into_capnp_error("watching the in-progress build"))?;
+                    (existing_id, outcome)
+                }
+            };
 
             store
-                .record_job_outcome(job_id, &path, system.as_str(), &outcome)
+                .record_job_outcome(effective_job_id, &path, system.as_str(), &outcome)
                 .await;
 
             let mut result = results.get().init_result();
@@ -1043,10 +1094,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     infos,
                     log_key,
                 } => {
-                    match this
-                        .record_outputs(&infos, &capability.expected_outputs)
-                        .await
-                    {
+                    match this.record_outputs(&infos, &expected_outputs).await {
                         Ok(()) => {
                             tracing::info!(%path, ?outputs, %log_key, "build succeeded");
                             result.set_status(legacy_protocol::build_result::Status::Built);

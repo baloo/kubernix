@@ -144,6 +144,14 @@ pub struct JobQueue {
     jetstream: jetstream::Context,
     /// How long to wait for a worker to report an outcome.
     pub result_timeout: Duration,
+    /// How long a job's outcome stays replayable in `RESULTS_STREAM`
+    /// (its `max_age`, set from this same value in [`Self::connect`]) and,
+    /// PLAN.md Phase 19, how long a `'running'` reservation in `jobs` may go
+    /// unclaimed before it's treated as orphaned rather than still in
+    /// flight — see `PathStore::reserve_job`'s doc comment. One value drives
+    /// both so they can never drift apart: a reservation can never outlive
+    /// the only evidence (the replayed result) that would resolve it.
+    pub results_retention: Duration,
 }
 
 impl JobQueue {
@@ -171,11 +179,16 @@ impl JobQueue {
             .await
             .wrap_err_with(|| format!("creating the {JOBS_STREAM} stream"))?;
 
+        // TODO(PLAN.md Phase 19 step 5): chart-driven, not hardcoded --
+        // shared with `jobs.resultsRetention` and threaded to the GC's own
+        // orphan-reservation sweep, so all three can never disagree.
+        let results_retention = Duration::from_secs(24 * 3600);
+
         jetstream
             .get_or_create_stream(jetstream::stream::Config {
                 name: RESULTS_STREAM.to_string(),
                 subjects: vec!["kubernix.results.>".to_string()],
-                max_age: Duration::from_secs(24 * 3600),
+                max_age: results_retention,
                 ..Default::default()
             })
             .await
@@ -185,6 +198,7 @@ impl JobQueue {
             client,
             jetstream,
             result_timeout: Duration::from_secs(3600),
+            results_retention,
         })
     }
 

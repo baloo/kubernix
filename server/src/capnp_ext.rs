@@ -390,22 +390,27 @@ impl JobQueue {
 
         self.submit(&job).await.wrap_err("submitting the job")?;
 
-        self.watch(job_id, &job.derivation_path, logger, logs, consumer)
+        self.watch(job_id, &job.derivation_path, logger, logs, consumer, None)
             .await
     }
 
     /// Relay a job's log into the client's `LogStream` and return its
     /// terminal outcome — the post-submit half of [`Self::dispatch`].
     ///
-    /// PLAN.md Phase 19: this is also, unchanged, what a second+ request for
-    /// the same `(tenant, derivation_path)` calls to attach to an
-    /// already-dispatched job instead of resubmitting — it only needs its
-    /// own `logs`/`consumer` (created against the existing `job_id`, exactly
-    /// as [`Self::dispatch`] creates them for a fresh one) and never touches
-    /// `submit`. Every caller — the original dispatcher and any later
-    /// attacher, on any replica — ends up relaying the identical log stream
-    /// and computing the identical outcome off the same replay-safe results
-    /// subject.
+    /// PLAN.md Phase 19: this is also what a second+ request for the same
+    /// `(tenant, derivation_path)` calls to attach to an already-dispatched
+    /// job instead of resubmitting — it only needs its own `logs`/`consumer`
+    /// (created against the existing `job_id`, exactly as [`Self::dispatch`]
+    /// creates them for a fresh one) and never touches `submit`. Every
+    /// caller — the original dispatcher and any later attacher, on any
+    /// replica — ends up relaying the identical log stream and computing the
+    /// identical outcome off the same replay-safe results subject.
+    ///
+    /// `preamble`, when given, is pushed as the very first log line — used
+    /// only by an attaching second+ requester to make the log-replay gap
+    /// explicit (core NATS has no replay, so an attacher's `logs` genuinely
+    /// starts from attach time forward and misses whatever the original
+    /// dispatcher already saw).
     ///
     /// This future is deliberately `!Send` — it holds capnp capabilities —
     /// which is why it runs on the connection's `LocalSet`. The NATS futures
@@ -418,6 +423,7 @@ impl JobQueue {
         logger: &log_stream::Client,
         mut logs: async_nats::Subscriber,
         consumer: async_nats::jetstream::consumer::Consumer<pull::Config>,
+        preamble: Option<&str>,
     ) -> eyre::Result<crate::jobs::JobOutcome> {
         // The client sees a build activity for the job, and each log line
         // arrives as a result on it — the same shape a local build produces,
@@ -426,6 +432,11 @@ impl JobQueue {
         logger
             .start_activity(activity_id, derivation_path.as_str())
             .await?;
+        if let Some(preamble) = preamble {
+            logger
+                .push_log_line(activity_id, preamble.as_bytes())
+                .await?;
+        }
 
         let outcome = {
             let mut outcome_fut = Box::pin(self.await_outcome(consumer));
