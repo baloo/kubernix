@@ -21,13 +21,14 @@
 //! its own doc comment.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kubernix_signing::Signer;
 use kubernix_types::StorePath;
 use uuid::Uuid;
 
 use crate::jobs::JobOutcome;
-use crate::store::{MissingPaths, PathInfo, RemoteObject, Result, Store, Tier};
+use crate::store::{MissingPaths, PathInfo, RemoteObject, Reservation, Result, Store, Tier};
 use crate::tenant::TenantId;
 
 #[derive(Clone)]
@@ -131,6 +132,18 @@ impl TenantView {
     ) {
         self.store
             .record_job_outcome(&self.tenant, job_id, derivation_path, system, outcome)
+            .await
+    }
+
+    pub async fn reserve_job(
+        &self,
+        job_id: Uuid,
+        derivation_path: &StorePath,
+        system: &str,
+        retention: Duration,
+    ) -> Reservation {
+        self.store
+            .reserve_job(&self.tenant, job_id, derivation_path, system, retention)
             .await
     }
 }

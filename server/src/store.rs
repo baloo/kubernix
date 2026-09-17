@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kubernix_signing::{LocalSigner, Signer, key_name_for};
 use kubernix_types::{ObjectKey, StorePath};
@@ -14,6 +15,19 @@ use uuid::Uuid;
 
 use crate::jobs::JobOutcome;
 use crate::tenant::{KeyType, TenantId};
+
+/// The outcome of [`PathStore::reserve_job`] -- PLAN.md Phase 19.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reservation {
+    /// No other job for this `(tenant, derivation_path)` is in flight (or
+    /// this call's own steal of a stale one won) -- dispatch proceeds under
+    /// the `job_id` this call reserved with.
+    Won,
+    /// Another job already owns this `(tenant, derivation_path)` and its
+    /// reservation is still fresh. Attach to it (subscribe to its logs and
+    /// result) instead of dispatching a new one.
+    Lost(Uuid),
+}
 
 /// Hash algorithms the daemon protocol can carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,13 +307,46 @@ pub trait PathStore: Send + Sync {
     /// part of this trait.
     async fn record_access(&self, _tenant: &TenantId, _path: &StorePath) {}
 
+    /// Try to reserve `(tenant, derivation_path)` as newly in flight under
+    /// `job_id`, before it is dispatched — PLAN.md Phase 19's dedup
+    /// mechanism. `retention` is the same duration `kubernix_results`'
+    /// JetStream `max_age` is configured with (`jobs.resultsRetention`):
+    /// [`PostgresStore`](crate::postgres_store::PostgresStore) treats a
+    /// `'running'` reservation older than that as stale, since any result it
+    /// could have produced would already be evicted from NATS by then, and
+    /// atomically steals it (reassigning it to `job_id`) rather than
+    /// reporting it as still in flight.
+    ///
+    /// Unlike [`Self::record_job_outcome`] below (which this call's row is
+    /// later completed by), a reservation *is* observable while in flight —
+    /// that visibility is the entire point: it is what lets a second request
+    /// for the same derivation attach to the first instead of dispatching
+    /// its own build.
+    ///
+    /// Default: always [`Reservation::Won`] — a store with no job history
+    /// (`MemoryStore`) has nothing to dedup against, so every call proceeds
+    /// independently, exactly as before this phase existed.
+    async fn reserve_job(
+        &self,
+        _tenant: &TenantId,
+        _job_id: Uuid,
+        _derivation_path: &StorePath,
+        _system: &str,
+        _retention: Duration,
+    ) -> Reservation {
+        Reservation::Won
+    }
+
     /// Record a job's terminal outcome — PLAN.md Phase 12's job/log retention.
     ///
-    /// Called once, when `dispatch()` returns, never on submission: nothing
-    /// today needs to observe an in-flight job, and a "pending" row that a
-    /// crash or timeout leaves unresolved would just be more state to reason
-    /// about for no current benefit. A job lost before an outcome is relayed
-    /// is simply not recorded, same as every job before this existed.
+    /// Called once `dispatch()`/`watch()` returns, by whichever watcher of
+    /// the job gets there first — first requester, a later attacher, or GC's
+    /// own orphan sweep (PLAN.md Phase 19). As of that phase this completes
+    /// the row [`Self::reserve_job`] already inserted (an `UPDATE`, not a
+    /// fresh insert) and, by construction, may be called more than once for
+    /// the same `job_id` with the identical value each time — every caller
+    /// computed the same outcome off the same replay-safe result, so this
+    /// must be idempotent, not "exactly once".
     ///
     /// Best-effort, like [`Self::record_access`]: a lost history row does not
     /// affect anything on the serving path, only how much there is to collect

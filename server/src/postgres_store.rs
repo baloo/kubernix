@@ -51,6 +51,7 @@
 //! without the actor in between.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Sha256, digest::Output};
 use sqlx::Row;
@@ -59,8 +60,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::jobs::JobOutcome;
 use crate::store::{
-    CapabilitySecretStore, Hash, HashType, MissingPaths, PathInfo, PathStore, RemoteObject, Result,
-    StoreError, TenantAuthStore, Tier,
+    CapabilitySecretStore, Hash, HashType, MissingPaths, PathInfo, PathStore, RemoteObject,
+    Reservation, Result, StoreError, TenantAuthStore, Tier,
 };
 use kubernix_signing::{KIND_LOCAL_ED25519, LocalSigner, Signer, key_name_for};
 use kubernix_types::{ObjectKey, StorePath};
@@ -791,9 +792,128 @@ impl PostgresStore {
         }
     }
 
-    /// Insert one `jobs` row for a terminal outcome. Best-effort, like
-    /// [`Self::record_access_db`] — see the trait doc comment for why this is
-    /// insert-only rather than insert-then-update.
+    /// PLAN.md Phase 19: try to reserve `(tenant, derivation_path)` under
+    /// `job_id` — see the trait doc comment on
+    /// [`PathStore::reserve_job`](crate::store::PathStore::reserve_job) for
+    /// the mechanism. One statement does both the ordinary reservation and
+    /// the steal-if-stale case at once: `ON CONFLICT ... WHERE status =
+    /// 'running'` targets exactly the partial unique index
+    /// `jobs_tenant_drv_running`, and the `DO UPDATE ... WHERE` clause only
+    /// fires when the conflicting row's own `created_at` is already older
+    /// than `retention` — otherwise Postgres treats the conflict as
+    /// unresolved and the statement returns no row, same as `DO NOTHING`
+    /// would. `RETURNING id` then means "a row now exists under `job_id`",
+    /// whether it was freshly inserted or stolen; its absence means another,
+    /// still-fresh reservation exists and names it via the follow-up
+    /// `SELECT`.
+    ///
+    /// Fails open to [`Reservation::Won`] on any database error — matching
+    /// this trait's existing best-effort stance elsewhere (see
+    /// [`Self::record_access_db`]): a dedup optimization must never itself
+    /// be the reason a build cannot be dispatched.
+    async fn reserve_job_db(
+        &self,
+        tenant: &TenantId,
+        job_id: Uuid,
+        derivation_path: &StorePath,
+        system: &str,
+        retention: Duration,
+    ) -> Reservation {
+        if let Err(e) = self.ensure_tenant_id(tenant).await {
+            tracing::warn!(error = %e, %tenant, %job_id, "reserving job failed, dispatching independently");
+            return Reservation::Won;
+        }
+
+        // Tried up to twice: a first attempt that finds a fresh conflict
+        // reads which job owns it, but the two statements aren't atomic with
+        // each other — that owner can complete (and free the slot) in
+        // between. A second attempt after seeing that gives this caller the
+        // freed slot for real (a row it can later complete via
+        // `record_job_outcome_db`'s `UPDATE`) instead of returning `Won`
+        // without ever having inserted anything. A third race in the same
+        // narrow window is not worth chasing further: this is dedup
+        // bookkeeping, not the build itself (see the fail-open doc above).
+        for attempt in 0..2 {
+            let mut tx = match self.tenant_scoped(tenant).await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    tracing::warn!(error = %e, %tenant, %job_id, "reserving job failed, dispatching independently");
+                    return Reservation::Won;
+                }
+            };
+
+            let reserved: sqlx::Result<Option<Uuid>> = sqlx::query_scalar(
+                "INSERT INTO jobs (id, tenant, derivation_path, system, status, created_at)
+                 VALUES ($1, $2, $3, $4, 'running', NOW())
+                 ON CONFLICT (tenant, derivation_path) WHERE status = 'running'
+                 DO UPDATE SET
+                     id = EXCLUDED.id,
+                     system = EXCLUDED.system,
+                     created_at = NOW(),
+                     error_msg = NULL,
+                     output_paths = '{}',
+                     log_key = NULL,
+                     failure_kind = NULL,
+                     finished_at = NULL
+                 WHERE jobs.created_at < NOW() - make_interval(secs => $5::double precision)
+                 RETURNING id",
+            )
+            .bind(job_id)
+            .bind(tenant.as_str())
+            .bind(derivation_path.as_str())
+            .bind(system)
+            .bind(retention.as_secs_f64())
+            .fetch_optional(&mut *tx)
+            .await;
+
+            let reserved = match reserved {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, %tenant, %job_id, "reserving job failed, dispatching independently");
+                    return Reservation::Won;
+                }
+            };
+
+            if let Some(won_id) = reserved {
+                debug_assert_eq!(won_id, job_id);
+                if let Err(e) = tx.commit().await {
+                    tracing::warn!(error = %e, %tenant, %job_id, "reserving job failed, dispatching independently");
+                    return Reservation::Won;
+                }
+                return Reservation::Won;
+            }
+
+            // Conflict, and it wasn't stale enough to steal — find what's
+            // actually there.
+            let existing: sqlx::Result<Option<Uuid>> = sqlx::query_scalar(
+                "SELECT id FROM jobs WHERE tenant = $1 AND derivation_path = $2 AND status = 'running'",
+            )
+            .bind(tenant.as_str())
+            .bind(derivation_path.as_str())
+            .fetch_optional(&mut *tx)
+            .await;
+
+            match existing {
+                Ok(Some(existing_id)) => return Reservation::Lost(existing_id),
+                // Raced away between the conflict and this read (it
+                // completed in between) — retry the whole reservation once:
+                // the slot is free now, so the retry's own INSERT succeeds
+                // outright.
+                Ok(None) if attempt == 0 => continue,
+                Ok(None) => return Reservation::Won,
+                Err(e) => {
+                    tracing::warn!(error = %e, %tenant, %job_id, "reserving job failed, dispatching independently");
+                    return Reservation::Won;
+                }
+            }
+        }
+        unreachable!("loop above always returns within two iterations")
+    }
+
+    /// Update the `jobs` row [`Self::reserve_job_db`] already inserted with a
+    /// terminal outcome. Best-effort, like [`Self::record_access_db`] — see
+    /// the trait doc comment for why this may be called more than once (and
+    /// must therefore be idempotent) for the same `job_id`.
     async fn record_job_outcome_db(
         &self,
         tenant: &TenantId,
@@ -847,11 +967,27 @@ impl PostgresStore {
             ),
         };
 
+        // `ON CONFLICT (id) DO UPDATE`, not a plain `UPDATE`: the ordinary
+        // case is that `reserve_job_db` already inserted this row (this
+        // completion is what moves `status` away from `'running'`, which is
+        // what releases `jobs_tenant_drv_running`'s reservation) — but on the
+        // rare double-race edge that method's own doc comment accepts, no
+        // row exists yet, and this still needs to record the outcome rather
+        // than silently lose it. Idempotent either way (see this method's
+        // doc comment): every watcher of this `job_id` computes the same
+        // outcome and may run this exact statement.
         if let Err(e) = sqlx::query(
             "INSERT INTO jobs (
                  id, tenant, derivation_path, system, status, error_msg,
                  output_paths, log_key, failure_kind, finished_at
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())",
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+             ON CONFLICT (id) DO UPDATE SET
+                 status = EXCLUDED.status,
+                 error_msg = EXCLUDED.error_msg,
+                 output_paths = EXCLUDED.output_paths,
+                 log_key = EXCLUDED.log_key,
+                 failure_kind = EXCLUDED.failure_kind,
+                 finished_at = EXCLUDED.finished_at",
         )
         .bind(job_id)
         .bind(tenant.as_str())
@@ -1118,6 +1254,14 @@ enum DbRequest {
         path: StorePath,
         reply: oneshot::Sender<()>,
     },
+    ReserveJob {
+        tenant: TenantId,
+        job_id: Uuid,
+        derivation_path: StorePath,
+        system: String,
+        retention: Duration,
+        reply: oneshot::Sender<Reservation>,
+    },
     RecordJobOutcome {
         tenant: TenantId,
         job_id: Uuid,
@@ -1240,6 +1384,20 @@ impl DbRequest {
             }
             DbRequest::RejectUnverifiedPushes { tenant, reply } => {
                 let _ = reply.send(store.reject_unverified_pushes_db(&tenant).await);
+            }
+            DbRequest::ReserveJob {
+                tenant,
+                job_id,
+                derivation_path,
+                system,
+                retention,
+                reply,
+            } => {
+                let _ = reply.send(
+                    store
+                        .reserve_job_db(&tenant, job_id, &derivation_path, &system, retention)
+                        .await,
+                );
             }
             DbRequest::RecordAccess {
                 tenant,
@@ -1496,6 +1654,28 @@ impl PathStore for PostgresStore {
         .await;
     }
 
+    async fn reserve_job(
+        &self,
+        tenant: &TenantId,
+        job_id: Uuid,
+        derivation_path: &StorePath,
+        system: &str,
+        retention: Duration,
+    ) -> Reservation {
+        let (tenant, derivation_path, system) =
+            (tenant.clone(), derivation_path.clone(), system.to_string());
+        self.call(|reply| DbRequest::ReserveJob {
+            tenant,
+            job_id,
+            derivation_path,
+            system,
+            retention,
+            reply,
+        })
+        .await
+        .unwrap_or(Reservation::Won)
+    }
+
     async fn record_job_outcome(
         &self,
         tenant: &TenantId,
@@ -1676,6 +1856,16 @@ mod tests {
 
     fn p() -> StorePath {
         StorePath::new(P)
+    }
+
+    /// A `.drv` path unique to one test run, the same way
+    /// `a_completed_job_outcome_round_trips` and its neighbors already build
+    /// theirs from a fresh `job_id` — PLAN.md Phase 19's reservation tests
+    /// deliberately collide *within* a test (that's what they assert), so
+    /// each test needs its own path to avoid colliding *across* runs against
+    /// a persistent `KUBERNIX_TEST_DATABASE_URL`.
+    fn reserve_test_drv(uniquifier: Uuid) -> StorePath {
+        StorePath::new(format!("00000000000000000000000000000000-{uniquifier}.drv"))
     }
 
     fn dep() -> StorePath {
@@ -2140,12 +2330,19 @@ mod tests {
             )
             .await;
 
+        // Row-level security: `jobs` is tenant-isolated, so reading it back
+        // needs `app.current_tenant` set the same way every real write does
+        // (`PostgresStore::tenant_scoped`) -- a bare `&store.pool` query has
+        // no tenant context and, found by actually running this against a
+        // real RLS-enabled Postgres rather than only `cargo build`, silently
+        // sees zero rows instead of this test's own freshly written one.
+        let mut tx = store.tenant_scoped(&t).await.unwrap();
         let row = sqlx::query(
             "SELECT status, error_msg, output_paths, log_key, failure_kind, finished_at IS NOT NULL AS has_finished_at
                FROM jobs WHERE id = $1",
         )
         .bind(job_id)
-        .fetch_one(&store.pool)
+        .fetch_one(&mut *tx)
         .await
         .unwrap();
         assert_eq!(row.get::<String, _>("status"), "completed");
@@ -2177,23 +2374,26 @@ mod tests {
             )
             .await;
 
+        // Row-level security -- see `a_completed_job_outcome_round_trips`'s
+        // comment above.
+        let mut tx = store.tenant_scoped(&t).await.unwrap();
         let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
             .bind(job_id)
-            .fetch_one(&store.pool)
+            .fetch_one(&mut *tx)
             .await
             .unwrap();
         assert_eq!(status, "failed");
         let error_msg: Option<String> =
             sqlx::query_scalar("SELECT error_msg FROM jobs WHERE id = $1")
                 .bind(job_id)
-                .fetch_one(&store.pool)
+                .fetch_one(&mut *tx)
                 .await
                 .unwrap();
         assert_eq!(error_msg.as_deref(), Some("builder exited with 1"));
         let failure_kind: Option<String> =
             sqlx::query_scalar("SELECT failure_kind FROM jobs WHERE id = $1")
                 .bind(job_id)
-                .fetch_one(&store.pool)
+                .fetch_one(&mut *tx)
                 .await
                 .unwrap();
         assert!(
@@ -2223,13 +2423,183 @@ mod tests {
             )
             .await;
 
+        // Row-level security -- see `a_completed_job_outcome_round_trips`'s
+        // comment above.
+        let mut tx = store.tenant_scoped(&t).await.unwrap();
         let failure_kind: Option<String> =
             sqlx::query_scalar("SELECT failure_kind FROM jobs WHERE id = $1")
                 .bind(job_id)
-                .fetch_one(&store.pool)
+                .fetch_one(&mut *tx)
                 .await
                 .unwrap();
         assert_eq!(failure_kind.as_deref(), Some("out_of_memory"));
+    }
+
+    #[tokio::test]
+    async fn reserve_job_wins_when_nothing_is_in_flight() {
+        let Some(store) = db().await else { return };
+        let t = tenant("reserve-fresh");
+        let job_id = uuid::Uuid::new_v4();
+        let drv = reserve_test_drv(job_id);
+
+        let r = store
+            .reserve_job(&t, job_id, &drv, "x86_64-linux", Duration::from_secs(3600))
+            .await;
+        assert_eq!(r, Reservation::Won);
+    }
+
+    #[tokio::test]
+    async fn reserve_job_loses_to_an_existing_fresh_reservation() {
+        let Some(store) = db().await else { return };
+        let t = tenant("reserve-lose");
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let drv = reserve_test_drv(first);
+
+        assert_eq!(
+            store
+                .reserve_job(&t, first, &drv, "x86_64-linux", Duration::from_secs(3600))
+                .await,
+            Reservation::Won
+        );
+        assert_eq!(
+            store
+                .reserve_job(&t, second, &drv, "x86_64-linux", Duration::from_secs(3600))
+                .await,
+            Reservation::Lost(first),
+            "a second request for the same (tenant, derivation) must attach to the first job, \
+             never dispatch its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_job_does_not_collide_across_tenants() {
+        let Some(store) = db().await else { return };
+        let alice = tenant("reserve-alice");
+        let bob = tenant("reserve-bob");
+        let alice_job = uuid::Uuid::new_v4();
+        let bob_job = uuid::Uuid::new_v4();
+        // Same derivation path on purpose: it's exactly the case (a shared,
+        // content-addressed `.drv`) this test guards against being dedup'd
+        // across tenants.
+        let drv = reserve_test_drv(alice_job);
+
+        assert_eq!(
+            store
+                .reserve_job(
+                    &alice,
+                    alice_job,
+                    &drv,
+                    "x86_64-linux",
+                    Duration::from_secs(3600)
+                )
+                .await,
+            Reservation::Won
+        );
+        assert_eq!(
+            store
+                .reserve_job(
+                    &bob,
+                    bob_job,
+                    &drv,
+                    "x86_64-linux",
+                    Duration::from_secs(3600)
+                )
+                .await,
+            Reservation::Won,
+            "two tenants building the identical (content-addressed) derivation must never share \
+             a reservation or a job id"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_job_steals_a_reservation_older_than_retention() {
+        let Some(store) = db().await else { return };
+        let t = tenant("reserve-steal");
+        let stale = uuid::Uuid::new_v4();
+        let fresh = uuid::Uuid::new_v4();
+        let drv = reserve_test_drv(stale);
+
+        assert_eq!(
+            store
+                .reserve_job(&t, stale, &drv, "x86_64-linux", Duration::from_secs(3600))
+                .await,
+            Reservation::Won
+        );
+        // Backdate it past any retention this test uses -- standing in for
+        // the process that reserved it having crashed before completing it.
+        // Row-level security means this has to go through a
+        // tenant-scoped transaction (`app.current_tenant` set), the same as
+        // every real write to `jobs` -- an ad hoc `&store.pool` query with no
+        // tenant context set would match zero rows here, silently.
+        let mut tx = store.tenant_scoped(&t).await.unwrap();
+        sqlx::query("UPDATE jobs SET created_at = NOW() - INTERVAL '2 hours' WHERE id = $1")
+            .bind(stale)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let r = store
+            .reserve_job(&t, fresh, &drv, "x86_64-linux", Duration::from_secs(3600))
+            .await;
+        assert_eq!(
+            r,
+            Reservation::Won,
+            "a reservation older than the retention window must be stolen, not reported as \
+             still in flight"
+        );
+
+        // Row-level security again -- see the tenant-scoped write above.
+        let mut tx = store.tenant_scoped(&t).await.unwrap();
+        let (id, status): (uuid::Uuid, String) = sqlx::query_as(
+            "SELECT id, status FROM jobs WHERE tenant = $1 AND derivation_path = $2",
+        )
+        .bind(t.as_str())
+        .bind(drv.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(id, fresh, "the stolen row must now belong to the new job");
+        assert_eq!(status, "running");
+    }
+
+    #[tokio::test]
+    async fn completing_a_job_frees_its_reservation_for_a_new_build() {
+        let Some(store) = db().await else { return };
+        let t = tenant("reserve-completed");
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let drv = reserve_test_drv(first);
+
+        assert_eq!(
+            store
+                .reserve_job(&t, first, &drv, "x86_64-linux", Duration::from_secs(3600))
+                .await,
+            Reservation::Won
+        );
+        store
+            .record_job_outcome(
+                &t,
+                first,
+                &drv,
+                "x86_64-linux",
+                &JobOutcome::Completed {
+                    outputs: vec![p()],
+                    infos: Vec::new(),
+                    log_key: format!("{t}/log/{first}"),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            store
+                .reserve_job(&t, second, &drv, "x86_64-linux", Duration::from_secs(3600))
+                .await,
+            Reservation::Won,
+            "a completed job's row must not keep blocking a genuinely new build of the same \
+             derivation"
+        );
     }
 
     #[tokio::test]
