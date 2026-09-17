@@ -66,6 +66,21 @@ let
       args = [ "-c" "echo built after rotation > $out" ];
     }
   '';
+
+  # PLAN.md Phase 19: `sleep 5` deliberately holds this build open long
+  # enough that two independent `nix build` invocations (below, from two
+  # separate local stores so client-side Nix's own build lock can't collapse
+  # them first) reliably overlap -- one genuinely attaches to the other's
+  # in-flight job rather than either finishing before the second even
+  # connects.
+  dedup = pkgs.writeText "dedup.nix" ''
+    derivation {
+      name = "kubernix-dedup";
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      args = [ "-c" "echo DEDUP-BUILDING; sleep 5; echo built once > $out" ];
+    }
+  '';
 in
 pkgs.testers.nixosTest {
   name = "kubernix-end-to-end";
@@ -265,6 +280,60 @@ pkgs.testers.nixosTest {
     ).strip()
     print(f"tenant {tenant}")
     assert tenant == tenant_id, f"unexpected tenant: {tenant}"
+
+
+    with subtest("two concurrent builds of the same derivation dispatch only one job"):
+        # Two separate local stores, not two `nix build`s against the same
+        # one: sharing a store would let Nix's own client-side build lock on
+        # the output path collapse the second invocation before it ever
+        # reaches kubernix, which would prove nothing about the server's own
+        # dedup (PLAN.md Phase 19). Each store independently decides it needs
+        # to build `dedup` and issues its own `buildDerivation` RPC over its
+        # own SSH session, as the same tenant (same key) -- exactly the
+        # scenario the phase exists for.
+        # Exit codes captured to their own files, not trusted to the
+        # wrapping shell's own status: bare `wait` (no pid argument) always
+        # returns 0 regardless of either background job's own outcome, so
+        # `machine.succeed` on the outer command alone would not notice one
+        # of the two builds failing.
+        machine.succeed(
+            "("
+            f"NIX_SSHOPTS='{ssh_opts}' nix -L --plugin-files {plugin} build "
+            f"--store 'local?root=/tmp/dedup-a' --max-jobs 0 "
+            f"--builders 'kubernix://root@127.0.0.1?port=2222 x86_64-linux' "
+            f"-f ${dedup} --no-link --print-out-paths "
+            ">/tmp/dedup-a.log 2>&1; echo $? >/tmp/dedup-a.exit"
+            ") & "
+            "("
+            f"NIX_SSHOPTS='{ssh_opts}' nix -L --plugin-files {plugin} build "
+            f"--store 'local?root=/tmp/dedup-b' --max-jobs 0 "
+            f"--builders 'kubernix://root@127.0.0.1?port=2222 x86_64-linux' "
+            f"-f ${dedup} --no-link --print-out-paths "
+            ">/tmp/dedup-b.log 2>&1; echo $? >/tmp/dedup-b.exit"
+            ") & "
+            "wait"
+        )
+        exit_a = machine.succeed("cat /tmp/dedup-a.exit").strip()
+        exit_b = machine.succeed("cat /tmp/dedup-b.exit").strip()
+        log_a = machine.succeed("cat /tmp/dedup-a.log")
+        log_b = machine.succeed("cat /tmp/dedup-b.log")
+        assert exit_a == "0", f"store a's build failed:\n{log_a}"
+        assert exit_b == "0", f"store b's build failed:\n{log_b}"
+        out_a = [l for l in log_a.splitlines() if l.startswith("/nix/store/")][-1].strip()
+        out_b = [l for l in log_b.splitlines() if l.startswith("/nix/store/")][-1].strip()
+        assert out_a == out_b, f"the two stores disagree on the output path: {out_a} vs {out_b}"
+        content_a = machine.succeed(f"cat /tmp/dedup-a{out_a}")
+        assert "built once" in content_a, f"unexpected output: {content_a}"
+
+        # The real assertion: exactly one `jobs` row for this derivation,
+        # despite two independent client-side build invocations -- the
+        # second attached to the first's in-flight job rather than
+        # dispatching its own.
+        job_count = machine.succeed(
+            "psql -U postgres -h 127.0.0.1 kubernix -tAc "
+            "\"SELECT count(*) FROM jobs WHERE derivation_path LIKE '%kubernix-dedup.drv'\""
+        ).strip()
+        assert job_count == "1", f"expected exactly one dispatched job, found {job_count}"
 
 
     with subtest("the built path is signed and the key is published"):
