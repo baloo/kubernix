@@ -1001,7 +1001,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 )));
             };
 
-            let job_id = Uuid::new_v4();
+            let job_id = Uuid::now_v7();
 
             // PLAN.md Phase 19: reserve `(tenant, path)` before dispatching
             // anything -- if another request for this exact derivation is
