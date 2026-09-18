@@ -541,7 +541,9 @@ impl MemoryStore {
     /// stores read this from the `tenants` table instead.
     #[cfg(test)]
     pub fn set_reject_unverified_pushes(&self, tenant: &TenantId, reject: bool) {
-        self.write(tenant, |inner| inner.reject_unverified_pushes = Some(reject));
+        self.write(tenant, |inner| {
+            inner.reject_unverified_pushes = Some(reject)
+        });
     }
 }
 
@@ -702,7 +704,9 @@ impl PathStore for MemoryStore {
     }
 
     async fn reject_unverified_pushes(&self, tenant: &TenantId) -> bool {
-        self.read(tenant, |inner| inner.reject_unverified_pushes.unwrap_or(true))
+        self.read(tenant, |inner| {
+            inner.reject_unverified_pushes.unwrap_or(true)
+        })
     }
 }
 
