@@ -12,13 +12,37 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+          diagnostic-endpoint: ""
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          diagnostic-endpoint: ""
+          use-flakehub: false
+           
+
+      # `just check`/`just test` run plain `cargo clippy --workspace`/`cargo
+      # test --workspace`, which (unlike the scoped `nix-build` derivations
+      # in nix/server.nix, nix/worker.nix, etc. -- see the comment atop
+      # nix/server.nix) does build the `guest-agent` crate too, whose
+      # build.rs (PLAN.md Phase 18) requires `KUBERNIX_GUEST_AGENT_EBPF` to
+      # point at a prebuilt `kubernix-guest-agent-ebpf` program. Built here,
+      # in CI only, rather than wired into shell.nix -- direnv would
+      # otherwise rebuild it (pinned nightly toolchain + bpf-linker) on
+      # every dev shell entry for a program the interactive shell itself
+      # never needs.
+      - name: Build guest-agent-ebpf
+        run: nix-build nix -A kubernix-guest-agent-ebpf -o result-guest-agent-ebpf
 
       - name: Lint (clippy + fmt)
-        run: nix-shell --run 'just check'
+        run: |
+          export KUBERNIX_GUEST_AGENT_EBPF="$(readlink -f result-guest-agent-ebpf)/program"
+          nix-shell --run 'just check'
 
       - name: Test
-        run: nix-shell --run 'just test'
+        run: |
+          export KUBERNIX_GUEST_AGENT_EBPF="$(readlink -f result-guest-agent-ebpf)/program"
+          nix-shell --run 'just test'
 
   build-and-push-images:
     runs-on: ubuntu-latest

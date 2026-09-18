@@ -21,9 +21,17 @@ let
   rustOverlay = import (fetchRepo rustOverlaySource.locked);
 in let
   overlay = self: super: {
-    lix = self.callPackage "${lix}/package.nix" {
+    lix = (self.callPackage "${lix}/package.nix" {
       stdenv = self.clangStdenv;
-    };
+    }).overrideAttrs (old: {
+      # `tests/functional2` fails under GitHub Actions CI (see .github/workflows/ci.yml,
+      # which builds this derivation via `nix-shell --run 'just check'`) -- drop just
+      # that subdir from the meson build so `tests/unit` and `tests/functional` (both
+      # also gated by `doCheck`/`enable-tests`) keep running.
+      postPatch = (old.postPatch or "") + ''
+        sed -i "\|subdir('tests/functional2')|d" meson.build
+      '';
+    });
   };
 in import nixpkgs ({
   overlays = [
