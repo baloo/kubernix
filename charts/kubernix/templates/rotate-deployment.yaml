@@ -21,7 +21,7 @@ spec:
       {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: rotate
-          image: "{{ .Values.image.server.repository }}:{{ .Values.image.server.tag }}"
+          image: "{{ .Values.image.server.repository }}:{{ .Values.image.server.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.server.pullPolicy }}
           command: ["/bin/kubernix-rotate-capability-secret"]
           env:

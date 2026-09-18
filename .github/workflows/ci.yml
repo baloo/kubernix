@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Lint (clippy + fmt)
+        run: nix-shell --run 'just check'
+
+      - name: Test
+        run: nix-shell --run 'just test'
+
+  build-and-push-images:
+    runs-on: ubuntu-latest
+    needs: test
+    # GitHub skips triggering this workflow again for a push whose commit
+    # message contains [skip ci] -- load-bearing here, since this job pushes
+    # its own commit back to main (bumping Chart.yaml's appVersion) and
+    # would otherwise trigger itself indefinitely.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # `Chart.yaml`'s appVersion is the tag both images ship under and the
+      # default a downstream consumer of the chart gets with no `tag`
+      # override set (see values.yaml/templates) -- so it has to move in
+      # lockstep with every image this job pushes, not just on manual
+      # releases.
+      - name: Bump Chart.yaml appVersion
+        id: version
+        run: |
+          version="0.1.${{ github.run_number }}"
+          sed -i "s/^appVersion:.*/appVersion: \"$version\"/" charts/kubernix/Chart.yaml
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build images
+        run: |
+          nix-build nix -A kubernix-server-image -o result-server-image
+          nix-build nix -A kubernix-worker-image -o result-worker-image
+
+      - name: Push images
+        run: |
+          nix-shell -p skopeo --run '
+            set -euo pipefail
+            skopeo login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+
+            policy=$(mktemp)
+            trap "rm -f $policy" EXIT
+            echo "{\"default\": [{\"type\": \"insecureAcceptAnything\"}]}" > "$policy"
+
+            for tag in "${{ steps.version.outputs.version }}" latest; do
+              skopeo --policy "$policy" copy docker-archive:result-server-image \
+                "docker://ghcr.io/baloo/kubernix/kubernix-server:$tag"
+              skopeo --policy "$policy" copy docker-archive:result-worker-image \
+                "docker://ghcr.io/baloo/kubernix/kubernix-worker:$tag"
+            done
+          '
+
+      - name: Commit bumped appVersion
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add charts/kubernix/Chart.yaml
+          git commit -m "chart: bump appVersion to ${{ steps.version.outputs.version }} [skip ci]"
+          git push

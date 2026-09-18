@@ -41,7 +41,7 @@ spec:
       {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
       containers:
         - name: worker
-          image: "{{ .Values.image.worker.repository }}:{{ .Values.image.worker.tag }}"
+          image: "{{ .Values.image.worker.repository }}:{{ .Values.image.worker.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.worker.pullPolicy }}
           securityContext:
             runAsUser: 0
