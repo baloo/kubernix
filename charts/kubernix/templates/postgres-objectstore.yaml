@@ -1,9 +1,12 @@
 {{- if and .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
+{{- $backupS3 := include "kubernix.postgresBackupS3" . | fromJson }}
 # Continuous WAL archiving + base backups, via the Barman Cloud CNPG-I
-# plugin (see Chart.yaml's plugin-barman-cloud dependency), to the same
-# S3-compatible store every Kubernix service already writes NARs/logs to —
-# just under its own prefix (values.postgres.backup.path), not a separate
-# bucket, so no new S3 credential/bucket to provision.
+# plugin (see Chart.yaml's plugin-barman-cloud dependency). Independently
+# configurable via postgres.backup.s3 (see values.yaml) — by default (that
+# block left empty) this falls back to the same S3-compatible store every
+# other Kubernix service writes NARs/logs to, under its own prefix
+# (values.postgres.backup.path), but can be pointed at a wholly separate
+# bucket/endpoint/credentials instead.
 apiVersion: barmancloud.cnpg.io/v1
 kind: ObjectStore
 metadata:
@@ -13,16 +16,16 @@ metadata:
 spec:
   retentionPolicy: {{ .Values.postgres.backup.retentionPolicy | quote }}
   configuration:
-    destinationPath: {{ printf "s3://%s/%s" .Values.s3.bucket .Values.postgres.backup.path | quote }}
-    endpointURL: {{ .Values.s3.endpoint | quote }}
+    destinationPath: {{ printf "s3://%s/%s" $backupS3.bucket .Values.postgres.backup.path | quote }}
+    endpointURL: {{ $backupS3.endpoint | quote }}
     s3Credentials:
       accessKeyId:
-        name: {{ .Values.s3.existingSecret | default (printf "%s-s3" (include "kubernix.fullname" .)) }}
+        name: {{ $backupS3.secretName }}
         key: accessKeyId
       secretAccessKey:
-        name: {{ .Values.s3.existingSecret | default (printf "%s-s3" (include "kubernix.fullname" .)) }}
+        name: {{ $backupS3.secretName }}
         key: secretAccessKey
       region:
-        name: {{ printf "%s-s3-region" (include "kubernix.fullname" .) }}
+        name: {{ $backupS3.regionSecretName }}
         key: region
 {{- end }}

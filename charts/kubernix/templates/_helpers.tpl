@@ -81,9 +81,8 @@ Service names (<cluster>-superuser, <cluster>-rw, ...) agrees on one value.
 
 {{/*
 env entries every server-image container needs to reach S3 — lifted from
-nix/module.nix's `s3Env`/`s3Options`. A single named template so sshd, cache,
-gc, and the db-role-passwords job (which reads the same Secret keys) can't
-drift from each other.
+nix/module.nix's `s3Env`/`s3Options`. A single named template so sshd, cache
+and gc can't drift from each other.
 */}}
 {{- define "kubernix.s3Env" -}}
 {{- $secretName := .Values.s3.existingSecret | default (printf "%s-s3" (include "kubernix.fullname" .)) }}
@@ -103,6 +102,48 @@ drift from each other.
     secretKeyRef:
       name: {{ $secretName }}
       key: secretAccessKey
+{{- end -}}
+
+{{/*
+Resolves postgres.backup.s3's per-field fallback onto the top-level s3:
+block (see values.yaml's comment on postgres.backup.s3), plus the two
+Secret names the backup ObjectStore and its own secret-postgres-backup-s3*
+templates need to agree on. Returned as a JSON-encoded dict (`include ... |
+fromJson`) since Helm templates can't return a plain map value.
+
+Credential-secret resolution and region-secret resolution are independent
+of each other and of the plain endpoint/bucket fallback, so overriding just
+one field (e.g. postgres.backup.s3.bucket alone) reuses the shared
+credentials/region secrets rather than spuriously duplicating them.
+*/}}
+{{- define "kubernix.postgresBackupS3" -}}
+{{- $s3 := .Values.s3 -}}
+{{- $backup := .Values.postgres.backup.s3 -}}
+{{- $ownCreds := or $backup.existingSecret $backup.accessKeyId $backup.secretAccessKey -}}
+{{- $secretName := "" -}}
+{{- if $backup.existingSecret -}}
+  {{- $secretName = $backup.existingSecret -}}
+{{- else if $ownCreds -}}
+  {{- $secretName = printf "%s-postgres-backup-s3" (include "kubernix.fullname" .) -}}
+{{- else -}}
+  {{- $secretName = $s3.existingSecret | default (printf "%s-s3" (include "kubernix.fullname" .)) -}}
+{{- end -}}
+{{- $regionSecretName := "" -}}
+{{- if $backup.region -}}
+  {{- $regionSecretName = printf "%s-postgres-backup-s3-region" (include "kubernix.fullname" .) -}}
+{{- else -}}
+  {{- $regionSecretName = printf "%s-s3-region" (include "kubernix.fullname" .) -}}
+{{- end -}}
+{{- dict
+    "endpoint" ($backup.endpoint | default $s3.endpoint)
+    "bucket" ($backup.bucket | default $s3.bucket)
+    "accessKeyId" ($backup.accessKeyId | default $s3.accessKeyId)
+    "secretAccessKey" ($backup.secretAccessKey | default $s3.secretAccessKey)
+    "secretName" $secretName
+    "regionSecretName" $regionSecretName
+    "createOwnSecret" (and (not $backup.existingSecret) $ownCreds)
+    "createOwnRegionSecret" (not (not $backup.region))
+  | toJson -}}
 {{- end -}}
 
 {{/*

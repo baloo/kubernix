@@ -29,9 +29,11 @@ image:
     tag: latest
     pullPolicy: Always
 
-# The object store every service reads/writes NARs, logs and (via the CNPG
-# backup plugin below, under a distinct prefix) database backups to. Stays
-# external — no MinIO subchart — matching nix/module.nix's `s3Options`.
+# The object store every service reads/writes NARs, logs and (by default,
+# via the CNPG backup plugin below, under a distinct prefix — see
+# postgres.backup.s3 to point database backups at a different store
+# entirely) database backups to. Stays external — no MinIO subchart —
+# matching nix/module.nix's `s3Options`.
 s3:
   endpoint: http://minio:9000
   bucket: kubernix
@@ -67,6 +69,30 @@ postgres:
     # Prefix under s3.bucket that WAL/base backups are written to.
     path: pgbackups
     retentionPolicy: "30d"
+    # Independently-configurable object store for CNPG's WAL archiving +
+    # base backups (the Barman Cloud `ObjectStore` CR in
+    # templates/postgres-objectstore.yaml), distinct from the top-level
+    # `s3:` block above that sshd/cache/gc use for NARs/logs/presigned
+    # uploads. Every field below falls back *independently* to the
+    # corresponding top-level `s3.*` value when left empty, so leaving this
+    # whole block untouched (the default) reuses the exact same
+    # bucket/endpoint/region/credentials as `s3:` above — this chart's
+    # previous single-store behaviour. Override only the fields you need
+    # (e.g. just `bucket`, to keep sharing credentials but write backups
+    # to a different bucket) to split off part or all of it.
+    s3:
+      endpoint: ""
+      bucket: ""
+      region: ""
+      # Same semantics as s3.existingSecret above (expects accessKeyId/
+      # secretAccessKey keys), but for the backup store specifically. If
+      # left empty and accessKeyId/secretAccessKey below are also both
+      # empty, the backup store reuses s3.existingSecret (or the chart's
+      # own generated <release>-s3 Secret) directly — no second Secret is
+      # created.
+      existingSecret: ""
+      accessKeyId: ""
+      secretAccessKey: ""
 
 nats:
   enabled: true
