@@ -69,6 +69,7 @@ let
     guestVmKernel = guest-vm.kernel;
     guestVmInitrd = guest-vm.initrd;
   };
+  kubernix-client-image = pkgs.callPackage ./client-image.nix { inherit kubernix-plugin; };
   # Diagnostic-only, not part of the Helm chart: runs `vm-encryption-test`'s
   # dm-crypt/mkfs round trip at container runtime instead of Nix build time,
   # so it can be deployed as a one-off Job on real cluster nodes to probe
@@ -82,6 +83,7 @@ in {
   inherit kubernix-server kubernix-worker kubernix-plugin kubernix-guest-agent kubernix-guest-init;
   inherit kubernix-guest-agent-ebpf;
   inherit (images) kubernix-server-image kubernix-worker-image;
+  inherit kubernix-client-image;
   inherit vm-encryption-test-image;
   kubernix-guest-vm-kernel = guest-vm.kernel;
   kubernix-guest-vm-initrd = guest-vm.initrd;

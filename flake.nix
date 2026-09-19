@@ -32,7 +32,8 @@
           kubernix-plugin
           kubernix-guest-agent
           kubernix-server-image
-          kubernix-worker-image;
+          kubernix-worker-image
+          kubernix-client-image;
         default = packages.kubernix-server;
       };
     };

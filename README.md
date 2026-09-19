@@ -5,8 +5,10 @@ A distributed remote builder for [Lix](https://lix.systems). A stock Lix client 
 one SSH-reachable box building locally, the build is fanned out to a pool of Kubernetes-hosted
 workers, each realising the derivation inside its own single-tenant VM.
 
-See [DESIGN.md](DESIGN.md) for the full architecture and wire-protocol writeup, and
-[charts/kubernix/README.md](charts/kubernix/README.md) for deploying it.
+See [DESIGN.md](DESIGN.md) for the full architecture and wire-protocol writeup,
+[charts/kubernix/README.md](charts/kubernix/README.md) for deploying it, and
+[docs/client-image.md](docs/client-image.md) for a ready-to-run client image if you'd rather not
+build Lix/the plugin yourself.
 
 ## Architecture
 
