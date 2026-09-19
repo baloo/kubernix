@@ -56,3 +56,32 @@ the plugin already configured, useful for `nix build`/`nix copy`/`nix store ping
 Each run starts from the image's own baked-in `/nix/store` — anything built or substituted during
 a run is discarded when the container exits, so there's nothing to mount for persistence across
 runs.
+
+## Running as a Zuul CI node {#zuul}
+
+The same image can double as a [Zuul](https://zuul-ci.org) Nodepool node — its own Nix closure has
+no FHS by default (no `/bin/sh`, `/usr/bin/env`, `/etc/passwd`, writable `/tmp`), which is what
+Ansible's module execution and the `zuul-jobs` base roles assume, so the image bakes in that
+scaffolding plus `python3`, `git`, and `tar`/`gzip` (for `kubectl cp`/`oc rsync`) alongside Lix.
+
+Use Nodepool's **Kubernetes or OpenShift pod driver**, not the SSH connection: `kubectl exec`
+needs no sshd, host keys, or login user, which this image doesn't provide. In the pod's Nodepool
+label:
+
+- Set `python-path: /bin/python3` — this pins Ansible's interpreter instead of relying on its FHS
+  discovery fallback list (`/usr/bin/python3`, `python3.7`, ...), none of which exist in this
+  image.
+- Set `shell-type: sh`.
+- Prefer the `prepare-workspace-git` (or `prepare-workspace-openshift`, using `oc rsync`)
+  `zuul-jobs` role over plain `prepare-workspace`, which uses `synchronize` (rsync) — not
+  guaranteed to work over the `kubectl` connection.
+- On the executor side: `kubectl` and `socat` installed, Nodepool ≥ 3.12.0, and the
+  `start-zuul-console` role in your base pre-playbook — all per the Zuul Kubernetes driver docs,
+  independent of this image.
+
+Note that Nodepool's pod spec sets its own container `command` to keep the pod alive (Zuul never
+runs a build through this image's `ENTRYPOINT`/`CMD` — jobs reach the container via `kubectl exec`
+instead), so `KUBERNIX_HOST` and friends above are irrelevant to the Zuul path unless a job
+explicitly wants to use `nix`/kubernix from inside its playbook — in which case set them as static
+env vars on the pod/label (not via this image's entrypoint, which those `kubectl exec` sessions
+don't go through).

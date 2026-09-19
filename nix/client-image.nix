@@ -11,6 +11,10 @@
   bashInteractive,
   coreutils,
   gnugrep,
+  gnutar,
+  gzip,
+  git,
+  python3,
   kubernix-plugin,
 }:
 
@@ -69,7 +73,26 @@ dockerTools.buildLayeredImage {
     coreutils
     gnugrep
     cacert
+    # Everything below this line exists only so this image can double as a
+    # Zuul (Nodepool Kubernetes/OpenShift pod driver) CI node, not for the
+    # `docker run`-a-build use case above -- see docs/client-image.md#zuul.
+    # A `dockerTools` closure has no FHS at all (no /bin/sh, /usr/bin/env,
+    # /etc/passwd, writable /tmp): Ansible's module execution and the
+    # `zuul-jobs` base roles (prepare-workspace*, interpreter discovery)
+    # assume all of that exists, so it's added deliberately rather than
+    # discovered.
+    dockerTools.binSh # /bin/sh -> bash, for `shell-type: sh` / `become`
+    dockerTools.usrBinEnv # /usr/bin/env, for `#!/usr/bin/env ...` shebangs
+    dockerTools.fakeNss # /etc/passwd, /etc/group, /etc/nsswitch.conf
+    python3 # pin the label's `python-path` to this instead of relying
+    # on Ansible's FHS interpreter-discovery fallback list
+    gnutar
+    gzip # `kubectl cp`/`oc rsync` shell out to tar on the pod side
+    git # for the `prepare-workspace-git` zuul-jobs role
   ];
+  extraCommands = ''
+    mkdir -p tmp && chmod 1777 tmp
+  '';
   config = {
     Entrypoint = [ "${entrypoint}/bin/kubernix-client-entrypoint" ];
     Cmd = [ "bash" ];
