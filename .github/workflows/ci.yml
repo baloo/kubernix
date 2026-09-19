@@ -88,7 +88,7 @@ jobs:
             trap "rm -f $policy" EXIT
             echo "{\"default\": [{\"type\": \"insecureAcceptAnything\"}]}" > "$policy"
 
-            for tag in "${{ steps.version.outputs.version }}" latest; do
+            for tag in "${{ steps.version.outputs.version }}" "${{ github.sha }}" latest; do
               skopeo --policy "$policy" copy docker-archive:result-server-image \
                 "docker://ghcr.io/baloo/kubernix/kubernix-server:$tag"
               skopeo --policy "$policy" copy docker-archive:result-worker-image \
