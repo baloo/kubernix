@@ -113,3 +113,27 @@ This creates a `ScaledObject` that scales the worker Deployment on `kubernix_job
 per-system consumer (`worker/src/main.rs`) — including down to `minReplicaCount: 0` when idle. That
 works because the consumer is *durable*: its pending-message count stays queryable via NATS'
 monitoring API with no worker pod running, which is what lets KEDA scale back up from zero.
+
+### Provisioning tenants (`kubernix-admin`)
+
+Tenants and their auth credentials (`server/src/admin.rs`) are managed with `kubernix-admin`, which
+ships in the same image as `kubernix-sshd`/`kubernix-cache`/`kubernix-gc`. There's no dedicated
+subcommand-taking Job for it — its arguments (a tenant id, an SSH public key) are decided per
+invocation, not at `helm install` time — so `admin.enabled: true` instead brings up an idle toolbox
+Deployment an operator `kubectl exec`s into:
+
+```console
+helm upgrade kubernix charts/kubernix -n kubernix --set admin.enabled=true
+
+# add-tenant takes a name, not an id -- the id is derived from it and
+# printed back, so there's nothing to hand-type or get wrong there.
+kubectl exec -it -n kubernix deploy/kubernix-admin -- \
+  kubernix-admin add-tenant some-customer
+# added tenant "some-customer" as name-some-customer-a1b2c3d4e5f60000
+
+kubectl exec -it -n kubernix deploy/kubernix-admin -- \
+  kubernix-admin add-credential name-some-customer-a1b2c3d4e5f60000 --type ssh "ssh-ed25519 AAAA... their-key"
+```
+
+Leave `admin.enabled` at its default `false` otherwise: it's a live path to a role that can create
+tenants and bind auth credentials, worth running only where and while it's actually needed.

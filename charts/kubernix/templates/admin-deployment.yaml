@@ -1,0 +1,57 @@
+{{- if .Values.admin.enabled }}
+# Not a Job: kubernix-admin's subcommands take operator-typed arguments
+# (a tenant id, an SSH key) decided at invocation time, not at `helm
+# install`/`upgrade` time, so there is no fixed `command:` a Job template
+# could bake in. This is an idle toolbox instead — same image, same
+# DATABASE_URL wiring every other server-image Deployment gets, sleeping
+# until an operator runs:
+#
+#   kubectl exec -it deploy/{{ include "kubernix.fullname" . }}-admin -- \
+#     kubernix-admin <list-tenants|add-tenant|list-credentials|add-credential|delete-credential> ...
+#
+# Disabled by default (`admin.enabled: false`): it grants a live path to
+# `kubernix_admin` (which can create tenants and bind auth credentials)
+# that should exist only where and while an operator actually needs it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-admin" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kubernix.selectorLabels" (dict "context" $ "component" "admin") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubernix.selectorLabels" (dict "context" $ "component" "admin") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      {{- include "kubernix.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: admin
+          image: "{{ .Values.image.server.repository }}:{{ .Values.image.server.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.server.pullPolicy }}
+          command: ["sleep", "infinity"]
+          env:
+            {{- include "kubernix.databaseUrlEnv" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.admin.resources | nindent 12 }}
+      {{- with .Values.admin.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.admin.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.admin.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
