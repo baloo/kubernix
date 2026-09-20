@@ -211,6 +211,19 @@ rotate:
   tolerations: []
   affinity: {}
 
+admin:
+  # An idle toolbox Deployment (server/src/bin/kubernix-admin.rs) an
+  # operator `kubectl exec`s into to list/add tenants and their
+  # credentials — see admin-deployment.yaml's own comment for why this is
+  # a Deployment rather than a Job. Off by default: it's a live path to a
+  # role that can create tenants and bind auth credentials, worth enabling
+  # only where and while it's actually needed.
+  enabled: false
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 worker:
   replicas: 1
   system: x86_64-linux

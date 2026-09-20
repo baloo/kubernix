@@ -165,6 +165,10 @@ pub enum ServingRole {
     /// these scan every tenant's rows by design — see `crate::gc`'s module
     /// doc.
     Gc,
+    /// kubernix-admin: `BYPASSRLS`, granted write access to `tenants` and
+    /// `tenant_auth_bindings` that neither `App` nor `Gc` has — see
+    /// `crate::admin`'s module doc and the role's own migration.
+    Admin,
 }
 
 impl ServingRole {
@@ -172,6 +176,7 @@ impl ServingRole {
         match self {
             ServingRole::App => "kubernix_app",
             ServingRole::Gc => "kubernix_gc",
+            ServingRole::Admin => "kubernix_admin",
         }
     }
 }

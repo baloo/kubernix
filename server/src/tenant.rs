@@ -80,7 +80,11 @@ impl Tenant {
     }
 }
 
-fn derive_id(identity: &str) -> TenantId {
+/// `pub(crate)`, not private: `crate::admin::add_tenant` reuses this same
+/// slug+hash scheme to derive an id from an operator-given name, so a
+/// manually-provisioned tenant's id has the same shape (and the same
+/// collision-avoidance properties) as one attributed from an SSH identity.
+pub(crate) fn derive_id(identity: &str) -> TenantId {
     let digest = Sha256::digest(identity.as_bytes());
     let hash: String = digest
         .iter()
