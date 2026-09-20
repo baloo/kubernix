@@ -8,6 +8,7 @@
   dockerTools,
   cacert,
   tzdata,
+  coreutils,
   lix,
   cloud-hypervisor,
   passt,
@@ -30,10 +31,16 @@
       kubernix-server
       cacert
       tzdata
+      # Only for `sleep infinity` in the chart's `admin-deployment.yaml`
+      # toolbox — an operator `kubectl exec`s into it to run `kubernix-admin`,
+      # and it needs *something* to sit idle on since this image otherwise
+      # ships no shell/coreutils at all.
+      coreutils
     ];
     # No `Cmd`: the chart's `command:`/`args:` selects one of
-    # kubernix-sshd/kubernix-server/kubernix-gc/kubernix-rotate-capability-secret
-    # per Deployment, all present in this one image's `/bin`.
+    # kubernix-sshd/kubernix-server/kubernix-gc/kubernix-rotate-capability-secret/
+    # `sleep` (the admin toolbox) per Deployment, all present in this one
+    # image's `/bin`.
     config = {
       Env = [ "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt" ];
     };
