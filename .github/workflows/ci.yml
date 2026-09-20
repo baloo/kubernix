@@ -44,6 +44,16 @@ jobs:
           export KUBERNIX_GUEST_AGENT_EBPF="$(readlink -f result-guest-agent-ebpf)/program"
           nix-shell --run 'just test'
 
+      # Built here too (not just in build-and-push-images below) so a PR that
+      # breaks an image build fails CI instead of only surfacing on merge to
+      # main -- magic-nix-cache-action above means build-and-push-images'
+      # own build of the same derivations is a cache hit, not a rebuild. No
+      # output links needed here, just that the build succeeds.
+      - name: Build images
+        run: |
+          nix-build nix --no-out-link \
+            -A kubernix-server-image -A kubernix-worker-image -A kubernix-client-image
+
   build-and-push-images:
     runs-on: ubuntu-latest
     needs: test
@@ -74,9 +84,13 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build images
+        id: build
         run: |
-          nix-build nix -A kubernix-server-image -o result-server-image
-          nix-build nix -A kubernix-worker-image -o result-worker-image
+          mapfile -t images < <(nix-build nix --no-out-link \
+            -A kubernix-server-image -A kubernix-worker-image -A kubernix-client-image)
+          echo "server=${images[0]}" >> "$GITHUB_OUTPUT"
+          echo "worker=${images[1]}" >> "$GITHUB_OUTPUT"
+          echo "client=${images[2]}" >> "$GITHUB_OUTPUT"
 
       - name: Push images
         run: |
@@ -89,10 +103,12 @@ jobs:
             echo "{\"default\": [{\"type\": \"insecureAcceptAnything\"}]}" > "$policy"
 
             for tag in "${{ steps.version.outputs.version }}" "${{ github.sha }}" latest; do
-              skopeo --policy "$policy" copy docker-archive:result-server-image \
+              skopeo --policy "$policy" copy docker-archive:${{ steps.build.outputs.server }} \
                 "docker://ghcr.io/baloo/kubernix/kubernix-server:$tag"
-              skopeo --policy "$policy" copy docker-archive:result-worker-image \
+              skopeo --policy "$policy" copy docker-archive:${{ steps.build.outputs.worker }} \
                 "docker://ghcr.io/baloo/kubernix/kubernix-worker:$tag"
+              skopeo --policy "$policy" copy docker-archive:${{ steps.build.outputs.client }} \
+                "docker://ghcr.io/baloo/kubernix/kubernix-client:$tag"
             done
           '
 
