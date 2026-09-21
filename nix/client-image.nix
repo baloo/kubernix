@@ -59,6 +59,13 @@ let
       # builders-use-substitutes lets the remote builder pull inputs from
       # substituters itself rather than the client uploading them first.
       max-jobs = 0
+      # No FHS /etc/group in this image (fakeNss's is baked in at build time
+      # and has no 'nixbld' entry) -- Lix otherwise warns on every invocation
+      # that build-users-group's default ('nixbld') doesn't exist. Harmless
+      # since max-jobs=0 means it's never actually used to sandbox a build,
+      # but silencing it here beats every consumer discovering and setting
+      # this themselves.
+      build-users-group =
       builders-use-substitutes = true
       plugin-files = ${kubernix-plugin}/lib/lix/plugins/kubernix.so
       builders = ''${builder} ''${KUBERNIX_SYSTEMS}"
