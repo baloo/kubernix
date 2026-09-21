@@ -63,10 +63,11 @@ jobs:
     # would otherwise trigger itself indefinitely.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
-      contents: write
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ADMIN_PATH }}
 
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
