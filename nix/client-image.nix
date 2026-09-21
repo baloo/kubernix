@@ -22,15 +22,35 @@ let
   entrypoint = writeShellApplication {
     name = "kubernix-client-entrypoint";
     text = ''
-      : "''${KUBERNIX_HOST:?KUBERNIX_HOST must be set to the kubernix frontend hostname/IP}"
+      : "''${KUBERNIX_SSH_HOST:?KUBERNIX_SSH_HOST must be set to the kubernix frontend SSH hostname/IP}"
       : "''${KUBERNIX_PORT:=22}"
       : "''${KUBERNIX_SSH_KEY:=/run/secrets/kubernix-ssh-key}"
       : "''${KUBERNIX_SYSTEMS:=x86_64-linux,aarch64-linux}"
       : "''${KUBERNIX_SUBSTITUTE:=1}"
+      # The SSH (builder) and HTTPS (substituter) endpoints are separate
+      # services and commonly live on different hostnames -- e.g. this
+      # cluster's own kubernix-ssh.sf.superbaloo.net vs.
+      # kubernix.sf.superbaloo.net. Defaulting to KUBERNIX_SSH_HOST only
+      # covers the (less common) case where one hostname serves both.
+      : "''${KUBERNIX_HTTP_HOST:=''${KUBERNIX_SSH_HOST}}"
 
       # `kubernix` is a fixed literal, not the consumer's own username -- the
       # frontend identifies the tenant by the SSH key's fingerprint (see
       # DESIGN.md's Multi-tenancy section), not by who connects as.
+      builder="kubernix://kubernix@''${KUBERNIX_SSH_HOST}?ssh-key=''${KUBERNIX_SSH_KEY}&port=''${KUBERNIX_PORT}"
+      if [ -n "''${KUBERNIX_SSH_HOST_KEY:-}" ]; then
+        # Without this, Lix's `SSH` class (plugin/src/plugin.cc) falls back to
+        # OpenSSH's normal known_hosts/StrictHostKeyChecking behaviour, which
+        # means an interactive prompt on first connect -- and since this image
+        # is meant to run non-interactively (`docker run ... nix build`), ssh
+        # just refuses instead of prompting. Pinning the host key here (the
+        # `base64-ssh-public-host-key` store setting, decoded and written to a
+        # throwaway UserKnownHostsFile by ssh.cc) skips that prompt entirely.
+        # Value is `base64 -w0` of the frontend's `host_ed25519.pub` file
+        # as-is (i.e. the whole "ssh-ed25519 AAAA... comment" line, base64'd).
+        builder="''${builder}&base64-ssh-public-host-key=''${KUBERNIX_SSH_HOST_KEY}"
+      fi
+
       conf="experimental-features = nix-command flakes
       # This image ships no compiler toolchain and (being an ordinary
       # container, not a Nix build sandbox host) can't run a sandboxed local
@@ -39,13 +59,20 @@ let
       # builders-use-substitutes lets the remote builder pull inputs from
       # substituters itself rather than the client uploading them first.
       max-jobs = 0
+      # No FHS /etc/group in this image (fakeNss's is baked in at build time
+      # and has no 'nixbld' entry) -- Lix otherwise warns on every invocation
+      # that build-users-group's default ('nixbld') doesn't exist. Harmless
+      # since max-jobs=0 means it's never actually used to sandbox a build,
+      # but silencing it here beats every consumer discovering and setting
+      # this themselves.
+      build-users-group =
       builders-use-substitutes = true
       plugin-files = ${kubernix-plugin}/lib/lix/plugins/kubernix.so
-      builders = kubernix://kubernix@''${KUBERNIX_HOST}?ssh-key=''${KUBERNIX_SSH_KEY}&port=''${KUBERNIX_PORT} ''${KUBERNIX_SYSTEMS}"
+      builders = ''${builder} ''${KUBERNIX_SYSTEMS}"
 
       if [ "''${KUBERNIX_SUBSTITUTE}" != "0" ]; then
         conf="''${conf}
-      substituters = https://''${KUBERNIX_HOST}"
+      substituters = https://''${KUBERNIX_HTTP_HOST}"
         if [ -n "''${KUBERNIX_TRUSTED_PUBLIC_KEY:-}" ]; then
           conf="''${conf}
       trusted-public-keys = ''${KUBERNIX_TRUSTED_PUBLIC_KEY}"

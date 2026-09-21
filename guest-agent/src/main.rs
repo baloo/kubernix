@@ -926,7 +926,52 @@ fn spawn_nix_daemon() -> Result<Child> {
         // directly is what actually makes the sandbox's `pivot_root`
         // work, since that needs its chroot directory on a real mount,
         // not wherever the default happened to land.
-        .env("NIX_CONFIG", "build-dir = /tmp")
+        //
+        // `pasta-path = ` (empty) turns off Lix's own per-build network
+        // sandbox (`LinuxLocalDerivationGoal::wantNetNS` in
+        // lix/libstore/platform/linux.cc, which ORs in `privateNetwork()`
+        // with `settings.pastaPath != ""` -- a non-empty compiled-in default
+        // makes it fire for every fixed-output derivation regardless).
+        // `pasta` needs `CAP_NET_ADMIN` for `TUNSETIFF`, which it only gets
+        // via `LocalDerivationGoal::sandboxUid()` returning 0 -- true only
+        // when the build has more than one allocated UID
+        // (`local-derivation-goal.cc:293`,
+        // `parsedDrv->useUidRange() ? 65536 : 1`), which in turn is gated
+        // on the *derivation itself* declaring
+        // `requiredSystemFeatures = [ "uid-range" ]` -- an immutable,
+        // client-eval-time property nothing server-side can force, and
+        // which essentially nothing in nixpkgs (`hex0-seed` included)
+        // declares. So `pasta` is fundamentally unusable here for ordinary
+        // builds regardless of `auto-allocate-uids`
+        // (confirmed live: still "TUNSETIFF ... Operation not permitted"
+        // with it enabled) short of patching Lix itself. This guest's own
+        // `passt` link (`worker/src/vm.rs`) is already the real network
+        // isolation boundary (one dedicated VM per build) that Lix's inner
+        // sandbox would otherwise redundantly, and here non-functionally,
+        // duplicate.
+        //
+        // `auto-allocate-uids`/`use-cgroups`: genuine, useful Lix features
+        // (per-build UID isolation and cgroup-scoped resource accounting)
+        // this guest can actually support -- `cgroup::setup()` already
+        // prepares and delegates the cgroup v2 hierarchy they need. Kept on
+        // even though disabling `pasta` (above) means they're no longer
+        // load-bearing for networking specifically: builds still benefit
+        // from real per-build UID separation instead of every build sharing
+        // the single static `nixbld1` (`nix/guest-vm.nix`'s `passwd`).
+        .env(
+            "NIX_CONFIG",
+            "build-dir = /tmp\n\
+             pasta-path =\n\
+             experimental-features = auto-allocate-uids cgroups\n\
+             auto-allocate-uids = true\n\
+             use-cgroups = true",
+        )
+        // `nix/guest-vm.nix` bakes a CA bundle in at this exact path --
+        // without pointing `SSL_CERT_FILE` at it, every HTTPS fetch inside
+        // the sandbox fails "unable to get local issuer certificate" (no
+        // `/etc/ssl/certs` at all otherwise exists in this guest for
+        // OpenSSL's own default search paths to find anything at).
+        .env("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

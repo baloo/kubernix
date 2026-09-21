@@ -16,6 +16,10 @@ edition = "2024"
 aya = "0.14"
 color-eyre.workspace = true
 eyre.workspace = true
+# `setxattr(2)` only -- to mark the cgroup root as delegated for Lix's own
+# cgroup driver (`cgroup.rs`'s `setup()`), since there's no `xattr`-crate
+# equivalent this minimal and this is the one place that's needed.
+libc = "0.2"
 tokio.workspace = true
 tokio-vsock = "0.7.2"
 tracing.workspace = true

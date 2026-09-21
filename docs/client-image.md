@@ -18,16 +18,22 @@ Two things, both at `docker run` time:
   [README.md](../README.md#multi-tenancy) — the frontend identifies your tenant by this key's
   fingerprint). Mount it read-only into the container. By default the image looks for it at
   `/run/secrets/kubernix-ssh-key`; override the path with `KUBERNIX_SSH_KEY`.
-- **The frontend endpoint**, via the `KUBERNIX_HOST` environment variable (e.g.
-  `kubernix.host`). This is required — the container refuses to start without it.
+- **The frontend's SSH endpoint**, via the `KUBERNIX_SSH_HOST` environment variable (e.g.
+  `kubernix-ssh.host`). This is required — the container refuses to start without it.
+
+The SSH (builder) and HTTPS (substituter) endpoints are separate services and commonly live on
+different hostnames — set `KUBERNIX_HTTP_HOST` too if yours do (it defaults to
+`KUBERNIX_SSH_HOST`, which only works if one hostname serves both).
 
 ## Environment variables
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `KUBERNIX_HOST` | *(required)* | Frontend hostname/IP to build against. |
+| `KUBERNIX_SSH_HOST` | *(required)* | Frontend's SSH hostname/IP — used for the `kubernix://` builder. |
+| `KUBERNIX_HTTP_HOST` | `KUBERNIX_SSH_HOST` | Frontend's HTTPS hostname/IP — used as the substituter URL. Set this explicitly whenever it differs from the SSH endpoint. |
 | `KUBERNIX_SSH_KEY` | `/run/secrets/kubernix-ssh-key` | Path (inside the container) to your tenant's SSH private key. |
 | `KUBERNIX_PORT` | `22` | SSH port the frontend listens on. |
+| `KUBERNIX_SSH_HOST_KEY` | *(unset)* | The frontend's SSH host public key, base64-encoded (`base64 -w0 host_ed25519.pub`), so the plugin can pin it instead of relying on interactive host-key prompting/`known_hosts`. See below. |
 | `KUBERNIX_SYSTEMS` | `x86_64-linux,aarch64-linux` | Systems advertised for this builder entry. |
 | `KUBERNIX_SUBSTITUTE` | `1` | Set to `0` to skip configuring the frontend as a substituter (build-only, no cache pulls). |
 | `KUBERNIX_TRUSTED_PUBLIC_KEY` | *(unset)* | The cluster's narinfo signing key, e.g. `builder.example.org:<base64 key>` — set this to let Lix trust substituted outputs without `--no-check-sigs`. |
@@ -45,7 +51,8 @@ rather than you uploading them), so builds go exclusively through the remote bui
 docker run --rm \
   -v "$PWD":/work -w /work \
   -v ~/.ssh/id_kubernix:/run/secrets/kubernix-ssh-key:ro \
-  -e KUBERNIX_HOST=kubernix.host \
+  -e KUBERNIX_SSH_HOST=kubernix-ssh.host \
+  -e KUBERNIX_HTTP_HOST=kubernix.host \
   ghcr.io/baloo/kubernix/kubernix-client:latest \
   nix build .#foo
 ```
@@ -81,7 +88,7 @@ label:
 
 Note that Nodepool's pod spec sets its own container `command` to keep the pod alive (Zuul never
 runs a build through this image's `ENTRYPOINT`/`CMD` — jobs reach the container via `kubectl exec`
-instead), so `KUBERNIX_HOST` and friends above are irrelevant to the Zuul path unless a job
+instead), so `KUBERNIX_SSH_HOST` and friends above are irrelevant to the Zuul path unless a job
 explicitly wants to use `nix`/kubernix from inside its playbook — in which case set them as static
 env vars on the pod/label (not via this image's entrypoint, which those `kubectl exec` sessions
 don't go through).

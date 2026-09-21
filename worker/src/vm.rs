@@ -320,10 +320,39 @@ pub trait VmLauncher: Send + Sync {
 /// default of "whatever the *host's* `/etc/resolv.conf` currently says" —
 /// that default varies per host/node and a statically-configured guest (see
 /// `guest-agent`'s `configure_network`/`resolv.conf`) has no way to learn it
-/// at boot. `passt` still forwards the actual query to the real resolver
-/// itself; only the address the guest sends queries *to* is fixed.
-fn passt_args(net_socket: &Path) -> Vec<String> {
-    vec![
+/// at boot.
+///
+/// `--dns` alone does not make `passt` forward queries anywhere real; it
+/// only sets the address the guest sends queries *to*. Two more, entirely
+/// separate settings (confirmed against `passt`'s own source -- `conf.c`'s
+/// CLI parsing, `fwd.c`'s `fwd_nat_from_tap`) govern what actually happens
+/// to a query once it arrives there, and skipping either leaves DNS
+/// silently broken:
+///
+/// - `dns_match` (`--dns-forward`) is the address a query must be *addressed
+///   to* for `passt` to intercept and forward it at all --
+///   `fwd_nat_from_tap` only takes the DNS-rewrite path when the packet's
+///   destination equals this. It defaults to `map_host_loopback`, nothing to
+///   do with `NET_GATEWAY` -- without `--dns-forward` set to `NET_GATEWAY`
+///   (the same address `--dns` already advertises), every query the guest
+///   sends there just falls through to ordinary NAT instead, addressed at a
+///   private guest-only IP nothing real ever answers.
+/// - `dns_host` (`--dns-host`) is *where* an intercepted query then actually
+///   goes. Without it, `passt` tries to auto-detect one from *this worker
+///   process's own* `/etc/resolv.conf` -- confirmed live (both inside the
+///   deployed pod and in a bare local repro) that this auto-detection simply
+///   does not work under `--vhost-user` mode: it logs "Couldn't get any
+///   nameserver address".
+///
+/// Both together are what fixed fixed-output derivation fetches failing to
+/// resolve any hostname at all. `dns_host`'s value, read fresh from this
+/// process's own `/etc/resolv.conf` (`host_nameserver`), is the only piece
+/// that can't be a fixed constant like `NET_GATEWAY` -- `None` (nothing
+/// parseable there) omits both flags and falls back to `passt`'s own
+/// (non-functional, per the above) auto-detection rather than failing the
+/// whole VM boot over it.
+fn passt_args(net_socket: &Path, dns_host: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "--foreground".to_string(),
         "--vhost-user".to_string(),
         "--socket".to_string(),
@@ -336,7 +365,29 @@ fn passt_args(net_socket: &Path) -> Vec<String> {
         NET_GATEWAY.to_string(),
         "--dns".to_string(),
         NET_GATEWAY.to_string(),
-    ]
+    ];
+    if let Some(host) = dns_host {
+        args.push("--dns-forward".to_string());
+        args.push(NET_GATEWAY.to_string());
+        args.push("--dns-host".to_string());
+        args.push(host.to_string());
+    }
+    args
+}
+
+/// The first `nameserver` address in `/etc/resolv.conf` -- this worker
+/// process's own upstream resolver (e.g. the cluster's CoreDNS ClusterIP),
+/// which is what `passt_args` needs to hand `passt` explicitly since it
+/// cannot reliably auto-detect it itself. `None` on any read/parse failure;
+/// `passt_args` treats that as "no override" rather than this being fatal to
+/// booting the VM at all.
+fn host_nameserver() -> Option<String> {
+    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    contents.lines().find_map(|line| {
+        let rest = line.strip_prefix("nameserver")?;
+        let addr = rest.split_whitespace().next()?;
+        Some(addr.to_string())
+    })
 }
 
 /// The `cloud-hypervisor --net` value for connecting to `passt`'s
@@ -514,7 +565,7 @@ impl VmLauncher for CloudHypervisorLauncher {
             .wrap_err("cloning the passt log file handle")?;
         let mut passt_command = Command::new(&self.config.passt);
         passt_command
-            .args(passt_args(&net_socket))
+            .args(passt_args(&net_socket, host_nameserver().as_deref()))
             .stdin(Stdio::null())
             .stdout(Stdio::from(passt_stdout))
             .stderr(Stdio::from(passt_stderr))
@@ -1522,7 +1573,10 @@ mod tests {
 
     #[test]
     fn passt_args_wire_up_the_fixed_address_plan() {
-        let args = passt_args(Path::new("/var/lib/kubernix-worker/tenants/acme/net.sock"));
+        let args = passt_args(
+            Path::new("/var/lib/kubernix-worker/tenants/acme/net.sock"),
+            None,
+        );
         assert_eq!(
             args,
             vec![
@@ -1538,6 +1592,35 @@ mod tests {
                 NET_GATEWAY,
                 "--dns",
                 NET_GATEWAY,
+            ]
+        );
+    }
+
+    #[test]
+    fn passt_args_pass_through_an_explicit_dns_host() {
+        let args = passt_args(
+            Path::new("/var/lib/kubernix-worker/tenants/acme/net.sock"),
+            Some("10.43.0.10"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--foreground",
+                "--vhost-user",
+                "--socket",
+                "/var/lib/kubernix-worker/tenants/acme/net.sock",
+                "--address",
+                NET_GUEST_ADDR,
+                "--netmask",
+                NET_PREFIX,
+                "--gateway",
+                NET_GATEWAY,
+                "--dns",
+                NET_GATEWAY,
+                "--dns-forward",
+                NET_GATEWAY,
+                "--dns-host",
+                "10.43.0.10",
             ]
         );
     }
