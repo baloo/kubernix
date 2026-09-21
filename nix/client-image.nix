@@ -22,15 +22,23 @@ let
   entrypoint = writeShellApplication {
     name = "kubernix-client-entrypoint";
     text = ''
-      : "''${KUBERNIX_HOST:?KUBERNIX_HOST must be set to the kubernix frontend hostname/IP}"
+      : "''${KUBERNIX_SSH_HOST:?KUBERNIX_SSH_HOST must be set to the kubernix frontend SSH hostname/IP}"
       : "''${KUBERNIX_PORT:=22}"
       : "''${KUBERNIX_SSH_KEY:=/run/secrets/kubernix-ssh-key}"
       : "''${KUBERNIX_SYSTEMS:=x86_64-linux,aarch64-linux}"
       : "''${KUBERNIX_SUBSTITUTE:=1}"
+      # The SSH (builder) and HTTPS (substituter) endpoints are separate
+      # services and commonly live on different hostnames -- e.g. this
+      # cluster's own kubernix-ssh.sf.superbaloo.net vs.
+      # kubernix.sf.superbaloo.net. Defaulting to KUBERNIX_SSH_HOST only
+      # covers the (less common) case where one hostname serves both.
+      : "''${KUBERNIX_HTTP_HOST:=''${KUBERNIX_SSH_HOST}}"
 
       # `kubernix` is a fixed literal, not the consumer's own username -- the
       # frontend identifies the tenant by the SSH key's fingerprint (see
       # DESIGN.md's Multi-tenancy section), not by who connects as.
+      builder="kubernix://kubernix@''${KUBERNIX_SSH_HOST}?ssh-key=''${KUBERNIX_SSH_KEY}&port=''${KUBERNIX_PORT}"
+
       conf="experimental-features = nix-command flakes
       # This image ships no compiler toolchain and (being an ordinary
       # container, not a Nix build sandbox host) can't run a sandboxed local
@@ -41,11 +49,11 @@ let
       max-jobs = 0
       builders-use-substitutes = true
       plugin-files = ${kubernix-plugin}/lib/lix/plugins/kubernix.so
-      builders = kubernix://kubernix@''${KUBERNIX_HOST}?ssh-key=''${KUBERNIX_SSH_KEY}&port=''${KUBERNIX_PORT} ''${KUBERNIX_SYSTEMS}"
+      builders = ''${builder} ''${KUBERNIX_SYSTEMS}"
 
       if [ "''${KUBERNIX_SUBSTITUTE}" != "0" ]; then
         conf="''${conf}
-      substituters = https://''${KUBERNIX_HOST}"
+      substituters = https://''${KUBERNIX_HTTP_HOST}"
         if [ -n "''${KUBERNIX_TRUSTED_PUBLIC_KEY:-}" ]; then
           conf="''${conf}
       trusted-public-keys = ''${KUBERNIX_TRUSTED_PUBLIC_KEY}"
