@@ -34,6 +34,15 @@
 //!                             the worker's own copy of this value
 //!                             (`KUBERNIX_JOB_RESULTS_RETENTION` there too),
 //!                             see `jobs::JobQueue::connect`'s doc comment
+//!   `KUBERNIX_DEFAULT_SUBSTITUTER_URL`/`_KEY`
+//!                             seeded into every tenant's trusted
+//!                             substituters on first creation (both must be
+//!                             set; unset means no default at all) -- see
+//!                             `crate::substitute`
+//!   `KUBERNIX_SUBSTITUTER_NEGATIVE_CACHE_TTL`
+//!                             seconds a trusted substituter's "not found"
+//!                             answer is cached before being re-checked
+//!                             (default 600)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,7 +123,23 @@ async fn main() -> color_eyre::eyre::Result<()> {
     // instead.
     match std::env::var("DATABASE_URL") {
         Ok(url) => match PostgresStore::connect(&url, ServingRole::App).await {
-            Ok(store) => rpc_config.store = store,
+            Ok(store) => {
+                // Seeded into every tenant this process creates from here on
+                // (`PostgresStore::ensure_tenant`) — unset means new tenants
+                // get no default substituter, not that seeding silently
+                // no-ops in a surprising way.
+                if let (Ok(url), Ok(key)) = (
+                    std::env::var("KUBERNIX_DEFAULT_SUBSTITUTER_URL"),
+                    std::env::var("KUBERNIX_DEFAULT_SUBSTITUTER_KEY"),
+                ) {
+                    store.set_default_substituter(url, key);
+                }
+                store.set_negative_cache_ttl(env_secs(
+                    "KUBERNIX_SUBSTITUTER_NEGATIVE_CACHE_TTL",
+                    Duration::from_secs(600),
+                ));
+                rpc_config.store = store;
+            }
             Err(e) => {
                 tracing::error!(error = %e, "could not reach PostgreSQL");
                 return Err(e.into());
