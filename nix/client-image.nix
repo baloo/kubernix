@@ -38,6 +38,18 @@ let
       # frontend identifies the tenant by the SSH key's fingerprint (see
       # DESIGN.md's Multi-tenancy section), not by who connects as.
       builder="kubernix://kubernix@''${KUBERNIX_SSH_HOST}?ssh-key=''${KUBERNIX_SSH_KEY}&port=''${KUBERNIX_PORT}"
+      if [ -n "''${KUBERNIX_SSH_HOST_KEY:-}" ]; then
+        # Without this, Lix's `SSH` class (plugin/src/plugin.cc) falls back to
+        # OpenSSH's normal known_hosts/StrictHostKeyChecking behaviour, which
+        # means an interactive prompt on first connect -- and since this image
+        # is meant to run non-interactively (`docker run ... nix build`), ssh
+        # just refuses instead of prompting. Pinning the host key here (the
+        # `base64-ssh-public-host-key` store setting, decoded and written to a
+        # throwaway UserKnownHostsFile by ssh.cc) skips that prompt entirely.
+        # Value is `base64 -w0` of the frontend's `host_ed25519.pub` file
+        # as-is (i.e. the whole "ssh-ed25519 AAAA... comment" line, base64'd).
+        builder="''${builder}&base64-ssh-public-host-key=''${KUBERNIX_SSH_HOST_KEY}"
+      fi
 
       conf="experimental-features = nix-command flakes
       # This image ships no compiler toolchain and (being an ordinary

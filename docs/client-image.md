@@ -33,6 +33,7 @@ different hostnames — set `KUBERNIX_HTTP_HOST` too if yours do (it defaults to
 | `KUBERNIX_HTTP_HOST` | `KUBERNIX_SSH_HOST` | Frontend's HTTPS hostname/IP — used as the substituter URL. Set this explicitly whenever it differs from the SSH endpoint. |
 | `KUBERNIX_SSH_KEY` | `/run/secrets/kubernix-ssh-key` | Path (inside the container) to your tenant's SSH private key. |
 | `KUBERNIX_PORT` | `22` | SSH port the frontend listens on. |
+| `KUBERNIX_SSH_HOST_KEY` | *(unset)* | The frontend's SSH host public key, base64-encoded (`base64 -w0 host_ed25519.pub`), so the plugin can pin it instead of relying on interactive host-key prompting/`known_hosts`. See below. |
 | `KUBERNIX_SYSTEMS` | `x86_64-linux,aarch64-linux` | Systems advertised for this builder entry. |
 | `KUBERNIX_SUBSTITUTE` | `1` | Set to `0` to skip configuring the frontend as a substituter (build-only, no cache pulls). |
 | `KUBERNIX_TRUSTED_PUBLIC_KEY` | *(unset)* | The cluster's narinfo signing key, e.g. `builder.example.org:<base64 key>` — set this to let Lix trust substituted outputs without `--no-check-sigs`. |
