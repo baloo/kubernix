@@ -57,6 +57,18 @@ pub async fn setup() -> Result<()> {
         .await
         .wrap_err("enabling the memory controller on the cgroup2 root")?;
 
+    // Lix's own cgroup driver (`lix/libutil/cgroup.cc`'s `isCgroupDelegated`,
+    // needed for `use-cgroups`/`auto-allocate-uids` -- see
+    // `spawn_nix_daemon`'s doc comment) refuses to create its own per-build
+    // child cgroups under `nix-daemon`'s cgroup (`build`, below) unless the
+    // cgroup *above* that (this root) carries a `user.delegate` xattr set to
+    // `"1"` -- systemd's own convention for marking a cgroup subtree handed
+    // off to a subordinate manager (`Delegate=yes`), which is exactly what's
+    // happening here, just without systemd to set it automatically. Without
+    // this, builds fail outright: "Running a build with cgroups requires the
+    // parent cgroup tree to be delegated." Confirmed live.
+    set_delegate_xattr(CGROUP_ROOT)?;
+
     tokio::fs::create_dir_all(BUILD_CGROUP)
         .await
         .wrap_err_with(|| format!("creating {BUILD_CGROUP}"))?;
@@ -66,6 +78,32 @@ pub async fn setup() -> Result<()> {
         .await
         .wrap_err("setting the build cgroup's memory.max")?;
     eprintln!("guest-agent: build cgroup ready, memory.max={memory_max}");
+    Ok(())
+}
+
+/// `setxattr(2)` isn't exposed by `std::fs` at all (no path-based xattr
+/// support in std, Unix or otherwise) -- this is a plain wrapper around the
+/// one call `setup()` needs, not a general-purpose xattr API.
+fn set_delegate_xattr(path: &str) -> Result<()> {
+    let path = std::ffi::CString::new(path).wrap_err("path contains a NUL byte")?;
+    let name = c"user.delegate";
+    let value = b"1";
+    // SAFETY: `path`/`name` are NUL-terminated C strings backed by their own
+    // owned buffers for the duration of this call, and `value` is a valid
+    // `value.len()`-byte buffer.
+    let ret = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error())
+            .wrap_err("setxattr(user.delegate) on the cgroup root");
+    }
     Ok(())
 }
 

@@ -949,7 +949,23 @@ fn spawn_nix_daemon() -> Result<Child> {
         // isolation boundary (one dedicated VM per build) that Lix's inner
         // sandbox would otherwise redundantly, and here non-functionally,
         // duplicate.
-        .env("NIX_CONFIG", "build-dir = /tmp\npasta-path =")
+        //
+        // `auto-allocate-uids`/`use-cgroups`: genuine, useful Lix features
+        // (per-build UID isolation and cgroup-scoped resource accounting)
+        // this guest can actually support -- `cgroup::setup()` already
+        // prepares and delegates the cgroup v2 hierarchy they need. Kept on
+        // even though disabling `pasta` (above) means they're no longer
+        // load-bearing for networking specifically: builds still benefit
+        // from real per-build UID separation instead of every build sharing
+        // the single static `nixbld1` (`nix/guest-vm.nix`'s `passwd`).
+        .env(
+            "NIX_CONFIG",
+            "build-dir = /tmp\n\
+             pasta-path =\n\
+             experimental-features = auto-allocate-uids cgroups\n\
+             auto-allocate-uids = true\n\
+             use-cgroups = true",
+        )
         // `nix/guest-vm.nix` bakes a CA bundle in at this exact path --
         // without pointing `SSL_CERT_FILE` at it, every HTTPS fetch inside
         // the sandbox fails "unable to get local issuer certificate" (no
