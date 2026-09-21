@@ -950,6 +950,12 @@ fn spawn_nix_daemon() -> Result<Child> {
         // sandbox would otherwise redundantly, and here non-functionally,
         // duplicate.
         .env("NIX_CONFIG", "build-dir = /tmp\npasta-path =")
+        // `nix/guest-vm.nix` bakes a CA bundle in at this exact path --
+        // without pointing `SSL_CERT_FILE` at it, every HTTPS fetch inside
+        // the sandbox fails "unable to get local issuer certificate" (no
+        // `/etc/ssl/certs` at all otherwise exists in this guest for
+        // OpenSSL's own default search paths to find anything at).
+        .env("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

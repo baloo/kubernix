@@ -430,6 +430,17 @@ let
         source = resolvConf;
         target = "/etc/resolv.conf";
       }
+      # For `builtin:fetchurl`'s (and any external `curl`/`wget` builder's)
+      # own TLS verification -- without this, every HTTPS fetch inside the
+      # sandbox fails "SSL certificate ... unable to get local issuer
+      # certificate", confirmed live once the network path itself (`--dns-
+      # forward`/`--dns-host` in `worker/src/vm.rs`) actually started
+      # working. `guest-agent`'s `spawn_nix_daemon` points `SSL_CERT_FILE`
+      # at this same path.
+      {
+        source = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        target = "/etc/ssl/certs/ca-bundle.crt";
+      }
     ]
     # `nix-daemon`'s sandboxed build path execs a handful of its own
     # `libexec/lix` helpers (`check-namespace-support`, `launch-builder`,
