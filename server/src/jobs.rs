@@ -93,6 +93,12 @@ pub struct BuildJob {
     /// declared feature, not just the one the subject routed on. PLAN.md
     /// Phase 17.
     pub required_features: Vec<String>,
+    /// This tenant's configured trusted substituters, as `(url, public_key)`
+    /// pairs — see `crate::substitute`/`crate::tenant_view::TenantView::
+    /// trusted_substituters`. Sent with every job so the build VM's guest
+    /// `nix.conf` can point at kubernix's own per-substituter mirror routes
+    /// instead of substituting directly from anywhere external.
+    pub trusted_substituters: Vec<(String, String)>,
 }
 
 /// Per-output metadata the worker reports, which is what `narinfo` is generated
@@ -253,6 +259,15 @@ impl JobQueue {
                 .init_required_features(job.required_features.len() as u32);
             for (i, feature) in job.required_features.iter().enumerate() {
                 features.set(i as u32, feature.as_str());
+            }
+
+            let mut substituters = req
+                .reborrow()
+                .init_trusted_substituters(job.trusted_substituters.len() as u32);
+            for (i, (url, public_key)) in job.trusted_substituters.iter().enumerate() {
+                let mut entry = substituters.reborrow().get(i as u32);
+                entry.set_url(url.as_str());
+                entry.set_public_key(public_key.as_str());
             }
 
             let mut inputs = req.reborrow().init_inputs(job.inputs.len() as u32);
