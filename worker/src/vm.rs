@@ -789,6 +789,57 @@ impl VmLauncher for CloudHypervisorLauncher {
     }
 }
 
+/// Push a tenant's currently configured trusted substituters to
+/// `guest-agent`'s control channel, so its *next* `nix-daemon` spawn
+/// (`spawn_nix_daemon`, one per `NIX_DAEMON_PORT` connection) picks them up
+/// as `substituters`/`trusted-public-keys` lines. Unlike
+/// [`VmLauncher::push_key`] this is sent on *every* job, not just a
+/// fresh/reused boot: a warm, already-running guest-agent process would
+/// otherwise never learn about a tenant's most recently added or removed
+/// substituter. A free function rather than a `VmLauncher` method since it
+/// has nothing to do with booting — it only needs the vsock socket path a
+/// `VmHandle` already carries.
+///
+/// Wire shape — one line, matching every other control verb (the framing in
+/// `handle_control`/`guest-agent/src/main.rs` reads exactly one line before
+/// dispatching): `SUBST <url1> <key1> <url2> <key2> …\n`. Safe to
+/// space-separate flatly, with no count prefix or other delimiter needed,
+/// because both a URL and a `name:base64` narinfo key are already
+/// whitespace-free by construction, so consecutive pairs can never be
+/// confused with each other.
+pub async fn push_substituters(
+    vsock_socket: &Path,
+    substituters: &[(String, String)],
+) -> eyre::Result<()> {
+    let mut stream = dial_control_port(vsock_socket).await?;
+
+    let mut message = "SUBST".to_string();
+    for (url, public_key) in substituters {
+        message.push(' ');
+        message.push_str(url);
+        message.push(' ');
+        message.push_str(public_key);
+    }
+    message.push('\n');
+    stream
+        .write_all(message.as_bytes())
+        .await
+        .wrap_err("sending the SUBST control message")?;
+
+    let mut reply = Vec::new();
+    stream
+        .read_to_end(&mut reply)
+        .await
+        .wrap_err("reading the SUBST control reply")?;
+    if !reply.starts_with(b"OK") {
+        return Err(eyre!(
+            "guest-agent rejected trusted substituters: {:?}",
+            String::from_utf8_lossy(&reply)
+        ));
+    }
+    Ok(())
+}
+
 /// Dial `vsock_socket`'s control-channel port and complete cloud-hypervisor's
 /// own `CONNECT <port>\n` -> `OK...` vsock proxy handshake, returning the
 /// still-open stream ready for a guest-agent control verb. Shared by

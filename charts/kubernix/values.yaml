@@ -152,6 +152,32 @@ cert-manager:
 jobs:
   resultsRetention: 86400 # 24h
 
+# Seeded into every tenant's trusted substituters on first creation
+# (kubernix-sshd's `KUBERNIX_DEFAULT_SUBSTITUTER_URL`/`_KEY`) -- see
+# `server/src/substitute.rs`. Both empty means new tenants get no default at
+# all; an operator can still add one later via `kubernix-admin
+# add-substituter`. A real per-cluster override (an internal mirror, say)
+# belongs in values.local.yaml, same as other private deployment details.
+substituters:
+  defaultUrl: "https://cache.nixos.org"
+  defaultPublicKey: "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+  # How long a trusted substituter's "not found" answer is cached before
+  # being re-checked (server/migrations/20260921000000_trusted_substituters.sql).
+  negativeCacheTtl: 600 # 10m
+  # This deployment's own externally-reachable HTTP cache hostname -- the
+  # same one an external client is told to set as `KUBERNIX_HTTP_HOST`
+  # (nix/client-image.nix). Read by kubernix-sshd
+  # (`daemon_rpc::kubernix_http_host`) to build the `/<tenant>/upstream/
+  # <slug>` mirror URLs a build VM's own guest nix.conf gets configured
+  # with (`server/src/jobs.rs`'s `BuildJob.trusted_substituters`) -- without
+  # this set, a build VM has no substituters at all, and any input a
+  # client's own local substitution already resolved (but did not upload,
+  # since `builders-use-substitutes = true` tells it not to) will be
+  # reported as a missing dependency instead. Empty means new tenants'
+  # build VMs get no substituters; set this to match `cache.ingress`'s own
+  # host below in a real deployment.
+  httpHost: ""
+
 sshd:
   replicas: 1
   listen: "0.0.0.0:2222"

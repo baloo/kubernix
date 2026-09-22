@@ -71,11 +71,81 @@ let
       builders = ''${builder} ''${KUBERNIX_SYSTEMS}"
 
       if [ "''${KUBERNIX_SUBSTITUTE}" != "0" ]; then
+        substituters=""
+        trusted_public_keys=""
+
+        # Ask kubernix-sshd for this tenant's own id/key and its configured
+        # trusted substituters (server/src/ssh.rs's `kubernix-whoami` exec) --
+        # a plain SSH request, no Lix/capnp involved, run *before* nix.conf
+        # is even written. This is what lets a client automatically benefit
+        # from server-side `trusted_substituters` (server/src/substitute.rs)
+        # -- those live in kubernix's own database, invisible to any client-
+        # side config, and are served from their own `/<tenant>/upstream/
+        # <slug>/…` mirror route (server/src/http.rs), never the tenant's own
+        # narinfo namespace. Best-effort: a client that cannot reach this (a
+        # firewalled host, an older server without this exec, or simply no
+        # pinned host key to authenticate the request non-interactively)
+        # falls back to the old, manually-configured behaviour below rather
+        # than failing the whole entrypoint.
+        whoami_output=""
+        if [ -n "''${KUBERNIX_SSH_HOST_KEY:-}" ]; then
+          known_hosts="$(mktemp)"
+          trap 'rm -f "''${known_hosts}"' EXIT
+          # `KUBERNIX_SSH_HOST_KEY` decodes to a bare `<keytype> <key>
+          # <comment>` line (the same one Lix's own `base64-ssh-public-
+          # host-key` handling above takes as-is) -- but a plain `ssh`
+          # invocation's `known_hosts` format requires a leading hostname
+          # field, which that value never carried. OpenSSH stores (and
+          # matches) the *default* port 22 as a bare hostname and only
+          # every other port bracketed as `[host]:port` -- confirmed
+          # against a real `ssh`, which refuses to match a bracketed
+          # `[host]:22` entry at all.
+          if [ "''${KUBERNIX_PORT}" = "22" ]; then
+            host_entry="''${KUBERNIX_SSH_HOST}"
+          else
+            host_entry="[''${KUBERNIX_SSH_HOST}]:''${KUBERNIX_PORT}"
+          fi
+          echo "''${host_entry} $(echo "''${KUBERNIX_SSH_HOST_KEY}" | base64 -d)" \
+            > "''${known_hosts}"
+          whoami_output="$(ssh -i "''${KUBERNIX_SSH_KEY}" -p "''${KUBERNIX_PORT}" \
+            -o BatchMode=yes -o UserKnownHostsFile="''${known_hosts}" -o StrictHostKeyChecking=yes \
+            "kubernix@''${KUBERNIX_SSH_HOST}" kubernix-whoami 2>/dev/null || true)"
+        fi
+
+        tenant_id=""
+        while IFS=' ' read -r kind a _url c; do
+          case "''${kind}" in
+            tenant) tenant_id="''${a}" ;;
+            key) trusted_public_keys="''${trusted_public_keys} ''${a}" ;;
+            # `substituter <slug> <url> <public-key>` -- the url is rebuilt
+            # from the slug rather than trusted verbatim from the wire, same
+            # reasoning as every other tenant-prefixed path in this codebase.
+            substituter)
+              substituters="''${substituters} https://''${KUBERNIX_HTTP_HOST}/''${tenant_id}/upstream/''${a}"
+              trusted_public_keys="''${trusted_public_keys} ''${c}"
+              ;;
+            *) ;;
+          esac
+        done <<< "''${whoami_output}"
+
+        if [ -n "''${tenant_id}" ]; then
+          substituters="https://''${KUBERNIX_HTTP_HOST}/''${tenant_id}''${substituters}"
+        else
+          # Discovery failed or was skipped -- the pre-discovery behaviour,
+          # unchanged: a bare host (an operator-set `KUBERNIX_HTTP_HOST`
+          # already including a tenant path, if that's how this deployment
+          # was configured) and whatever key was configured by hand.
+          substituters="https://''${KUBERNIX_HTTP_HOST}"
+          if [ -n "''${KUBERNIX_TRUSTED_PUBLIC_KEY:-}" ]; then
+            trusted_public_keys="''${KUBERNIX_TRUSTED_PUBLIC_KEY}"
+          fi
+        fi
+
         conf="''${conf}
-      substituters = https://''${KUBERNIX_HTTP_HOST}"
-        if [ -n "''${KUBERNIX_TRUSTED_PUBLIC_KEY:-}" ]; then
+      substituters = ''${substituters}"
+        if [ -n "''${trusted_public_keys# }" ]; then
           conf="''${conf}
-      trusted-public-keys = ''${KUBERNIX_TRUSTED_PUBLIC_KEY}"
+      trusted-public-keys = ''${trusted_public_keys}"
         fi
       fi
 

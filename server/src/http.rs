@@ -24,6 +24,20 @@
 //! | `GET /<tenant>/nar/<hash>.nar.zst` | the NAR itself, as a redirect to the object store |
 //! | `GET /<tenant>/log/<drv hash>` | a build log, plain text |
 //! | `GET /<tenant>/public-key` | this tenant's `trusted-public-keys` entry (not a Nix route) |
+//! | `GET /<tenant>/upstream/<slug>/…` | a mirror of one trusted substituter — see below |
+//!
+//! ## `/<tenant>/upstream/<slug>/…`
+//!
+//! `Tier::Substituted` content — pulled through from one of the tenant's
+//! configured trusted substituters (`crate::substitute`) — is deliberately
+//! **not** served from the tenant's own narinfo namespace above: that
+//! namespace is what a tenant signs, and mixing in un-re-signed upstream
+//! content would blur what a client is actually trusting. Instead each
+//! configured substituter gets its own mirror, `<slug>` derived from its URL
+//! host (`crate::substitute::slug_for`), serving the original, untouched
+//! `Sig:` line(s) it was fetched with — kubernix never re-signs this
+//! content. A client trusts it the same way it would trust the substituter
+//! directly: by configuring that substituter's own public key.
 
 use std::sync::Arc;
 
@@ -71,6 +85,12 @@ fn tenant_router() -> Router<HttpState> {
         .route("/public-key", get(public_key))
         .route("/nar/{file}", get(nar))
         .route("/log/{drv_hash}", get(log))
+        .route(
+            "/upstream/{slug}/nix-cache-info",
+            get(upstream_nix_cache_info),
+        )
+        .route("/upstream/{slug}/nar/{file}", get(upstream_nar))
+        .route("/upstream/{slug}/{file}", get(upstream_narinfo))
         // Last, and a bare parameter: `{hash}.narinfo` is not a legal route
         // because axum allows one parameter per path segment, so the suffix is
         // stripped in the handler. The literal routes above still win — matchit
@@ -278,6 +298,150 @@ async fn nar(
     }
 }
 
+/// Resolve `<tenant>`'s configured substituter named by `slug`, or `None` if
+/// no currently-configured entry matches — covers both "never configured"
+/// and "configured once, since removed".
+async fn resolve_substituter(
+    state: &HttpState,
+    tenant: &TenantId,
+    slug: &str,
+) -> Option<(String, String)> {
+    state
+        .store
+        .trusted_substituters(tenant)
+        .await
+        .into_iter()
+        .find(|(url, _)| crate::substitute::slug_for(url) == slug)
+}
+
+async fn upstream_nix_cache_info(
+    State(state): State<HttpState>,
+    Path((tenant, slug)): Path<(String, String)>,
+) -> Response {
+    let tenant = match tenant_of(&tenant) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    if resolve_substituter(&state, &tenant, &slug).await.is_none() {
+        return (StatusCode::NOT_FOUND, "unknown substituter\n").into_response();
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/x-nix-cache-info")],
+        format!(
+            "StoreDir: {}\nWantMassQuery: 1\nPriority: {}\n",
+            state.store_dir, state.priority
+        ),
+    )
+        .into_response()
+}
+
+async fn upstream_narinfo(
+    State(state): State<HttpState>,
+    Path((tenant, slug, file)): Path<(String, String, String)>,
+) -> Response {
+    let tenant = match tenant_of(&tenant) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    let Some(hash) = file.strip_suffix(".narinfo") else {
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    };
+    let Some((url, public_key)) = resolve_substituter(&state, &tenant, &slug).await else {
+        return (StatusCode::NOT_FOUND, "unknown substituter\n").into_response();
+    };
+
+    // Already cached for this tenant from this exact substituter? Serve it
+    // without a network round trip. A path recorded against a *different*
+    // substituter (even one this tenant also trusts) is deliberately not
+    // served here — see the module doc comment.
+    let cached = if let Some(path) = state.store.query_path_from_hash_part(&tenant, hash).await
+        && state.store.substituted_source(&tenant, &path).await
+            == Some((url.clone(), public_key.clone()))
+    {
+        match (
+            state.store.query_path_info(&tenant, &path).await,
+            state.store.output_object(&tenant, &path).await,
+        ) {
+            (Some(info), Some(remote)) => Some((info, remote)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let (info, remote) = match cached {
+        Some(hit) => hit,
+        None => {
+            let Some(uploader) = &state.uploader else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "no object store\n").into_response();
+            };
+            match crate::substitute::resolve_from_one(
+                state.store.as_ref(),
+                uploader,
+                &tenant,
+                hash,
+                &state.store_dir,
+                &url,
+                &public_key,
+            )
+            .await
+            {
+                Some(hit) => hit,
+                None => return (StatusCode::NOT_FOUND, "not found\n").into_response(),
+            }
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
+        // The original `sigs` ride along unmodified inside `info` -- this is
+        // the same renderer the tenant's own namespace uses, but nothing
+        // here calls `sign_if_vouchable`/re-signs anything first.
+        render_narinfo(
+            &info,
+            &remote.key,
+            remote.file_size,
+            &remote.file_hash,
+            &state.store_dir,
+        ),
+    )
+        .into_response()
+}
+
+/// Redirect to a pre-signed object URL for a substituted path — mirrors
+/// [`nar`], but rebuilds the key from `slug` rather than the tenant (same
+/// shape `crate::store::substituted_nar_key` computes), since
+/// `Tier::Substituted` objects are keyed by source substituter, not tenant.
+async fn upstream_nar(
+    State(state): State<HttpState>,
+    Path((tenant, slug, file)): Path<(String, String, String)>,
+) -> Response {
+    let tenant = match tenant_of(&tenant) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    if resolve_substituter(&state, &tenant, &slug).await.is_none() {
+        return (StatusCode::NOT_FOUND, "unknown substituter\n").into_response();
+    }
+    let Some(uploader) = &state.uploader else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no object store\n").into_response();
+    };
+    if file.contains('/') || file.contains("..") {
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    }
+    let key = ObjectKey::new(format!("substituted/{slug}/nar/{file}"));
+
+    match uploader.presign_get(&key).await {
+        Ok(url) => Redirect::temporary(&url).into_response(),
+        Err(e) => {
+            tracing::error!(%key, error = ?e, "could not presign a substituted nar url");
+            (StatusCode::INTERNAL_SERVER_ERROR, "cannot serve\n").into_response()
+        }
+    }
+}
+
 /// Build logs, which `nix log` fetches as plain text.
 ///
 /// Proxied rather than redirected: logs are small, and `nix log` follows this
@@ -319,6 +483,7 @@ async fn log(
 mod tests {
     use super::*;
     use crate::store::{Hash, HashType};
+    use sha2::Digest;
 
     fn info() -> PathInfo {
         PathInfo {
@@ -442,6 +607,132 @@ mod tests {
             store_dir: "/nix/store".to_string(),
             priority: 50,
         });
+    }
+
+    fn state_with(store: Arc<crate::store::MemoryStore>) -> HttpState {
+        HttpState {
+            store,
+            uploader: None,
+            store_dir: "/nix/store".to_string(),
+            priority: 50,
+        }
+    }
+
+    fn tenant() -> TenantId {
+        crate::tenant::Tenant::from_ssh("upstream-http-test", None, false).id
+    }
+
+    #[tokio::test]
+    async fn upstream_narinfo_404s_for_an_unknown_slug() {
+        let store = crate::store::MemoryStore::new();
+        let t = tenant();
+        let state = state_with(store);
+
+        let resp = upstream_narinfo(
+            State(state),
+            Path((
+                t.to_string(),
+                "cache.nixos.org".to_string(),
+                format!("{}.narinfo", "0".repeat(32)),
+            )),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn upstream_narinfo_serves_a_cached_path_with_its_original_signature() {
+        let store = crate::store::MemoryStore::new();
+        let t = tenant();
+        let (url, key) = (
+            "https://cache.nixos.org".to_string(),
+            "cache.nixos.org-1:AAAA".to_string(),
+        );
+        store.set_trusted_substituters(&t, vec![(url.clone(), key.clone())]);
+
+        let mut path_info = info();
+        path_info.sigs = vec![key.clone()];
+        store
+            .record_substituted_path(
+                &t,
+                path_info,
+                crate::store::RemoteObject {
+                    key: ObjectKey::new("substituted/cache.nixos.org/nar/x.nar.zst"),
+                    file_size: 10,
+                    file_hash: sha2::Sha256::digest([0u8; 1]),
+                },
+                &url,
+                &key,
+            )
+            .await
+            .unwrap();
+
+        let state = state_with(store);
+        let resp = upstream_narinfo(
+            State(state),
+            Path((
+                t.to_string(),
+                "cache.nixos.org".to_string(),
+                "00000000000000000000000000000000.narinfo".to_string(),
+            )),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        // Carries the original signature verbatim -- never re-signed.
+        assert!(body.contains(&format!("Sig: {key}")));
+    }
+
+    #[tokio::test]
+    async fn a_path_recorded_against_one_substituter_does_not_read_back_as_sourced_from_another() {
+        // The invariant `upstream_narinfo` relies on to refuse serving a
+        // path recorded against a *different* substituter than the one
+        // named in the route -- exercised at the store level, since driving
+        // the handler's live-refetch fallback needs a real `UploadSigner`
+        // and a mock HTTP substituter, out of scope for this unit test.
+        let store = crate::store::MemoryStore::new();
+        let t = tenant();
+        let (url_a, key_a) = (
+            "https://cache.nixos.org".to_string(),
+            "cache.nixos.org-1:AAAA".to_string(),
+        );
+        let (url_b, key_b) = (
+            "https://mirror.example".to_string(),
+            "mirror.example-1:BBBB".to_string(),
+        );
+        store.set_trusted_substituters(
+            &t,
+            vec![(url_a.clone(), key_a.clone()), (url_b.clone(), key_b)],
+        );
+        store
+            .record_substituted_path(
+                &t,
+                info(),
+                crate::store::RemoteObject {
+                    key: ObjectKey::new("substituted/cache.nixos.org/nar/x.nar.zst"),
+                    file_size: 10,
+                    file_hash: sha2::Sha256::digest([0u8; 1]),
+                },
+                &url_a,
+                &key_a,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.substituted_source(&t, &info().path).await,
+            Some((url_a, key_a))
+        );
+        assert_ne!(
+            store.substituted_source(&t, &info().path).await,
+            Some((url_b, "mirror.example-1:BBBB".to_string()))
+        );
     }
 
     #[test]

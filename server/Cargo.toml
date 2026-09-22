@@ -21,6 +21,10 @@ jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust
 kubernix-signing.workspace = true
 kubernix-types.workspace = true
 rand = "0.10"
+# For `crate::substitute`'s pull-through fetches from a tenant's trusted
+# substituters -- same version/feature set `worker` already uses for its own
+# outbound HTTP.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "stream"] }
 russh = { version = "0.62.5", features = ["async-trait"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

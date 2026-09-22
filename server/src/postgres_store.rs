@@ -103,6 +103,24 @@ pub struct PostgresStore {
     /// here rather than run inline — see [`DbRequest`] and the module doc
     /// comment for why.
     db_tx: mpsc::UnboundedSender<DbRequest>,
+    /// The `(url, public_key)` seeded into a brand-new tenant's
+    /// `tenant_substituters`, if any — set once at startup via
+    /// [`Self::set_default_substituter`] from
+    /// `KUBERNIX_DEFAULT_SUBSTITUTER_URL`/`_KEY`. `None` means new tenants
+    /// get no default substituter at all, not that seeding is skipped
+    /// silently: whichever binary can create tenants (`kubernix-sshd`,
+    /// `kubernix-admin`) is expected to set this before serving.
+    ///
+    /// `pub(crate)`, not private: `crate::admin::add_tenant` seeds the same
+    /// default over its own bare `INSERT` (a BYPASSRLS role, so it does not
+    /// go through [`Self::ensure_tenant`]'s tenant-scoped transaction) and
+    /// needs to read this directly.
+    pub(crate) default_substituter: std::sync::Mutex<Option<(String, String)>>,
+    /// TTL for `substituter_negative_cache` entries — see
+    /// [`Self::set_negative_cache_ttl`]/`KUBERNIX_SUBSTITUTER_NEGATIVE_CACHE_TTL`.
+    /// Bound as a parameter in every query that uses it, never
+    /// string-formatted into SQL.
+    negative_cache_ttl: std::sync::Mutex<Duration>,
 }
 
 /// Positive cache for capability secrets. Safe to hold stale for a while:
@@ -117,6 +135,10 @@ struct CapabilitySecretCache {
 }
 
 const CAPABILITY_SECRET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Unset-env-var default for `substituter_negative_cache` entries — see
+/// `PostgresStore::set_negative_cache_ttl`.
+const DEFAULT_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// `<32-char hash>-<name>` → `<32-char hash>`.
 ///
@@ -228,9 +250,27 @@ impl PostgresStore {
             pool,
             capability_secrets: std::sync::Mutex::new(CapabilitySecretCache::default()),
             db_tx,
+            default_substituter: std::sync::Mutex::new(None),
+            negative_cache_ttl: std::sync::Mutex::new(DEFAULT_NEGATIVE_CACHE_TTL),
         });
         spawn_db_actor(Arc::clone(&store), db_rx);
         Ok(store)
+    }
+
+    /// Set the `(url, public_key)` seeded into every brand-new tenant's
+    /// `tenant_substituters` from here on — called once at startup by
+    /// whichever binary can create tenants, from
+    /// `KUBERNIX_DEFAULT_SUBSTITUTER_URL`/`_KEY`. Does not touch any
+    /// already-provisioned tenant: seeding only ever happens at the moment a
+    /// tenant is first created (`ensure_tenant`/`crate::admin::add_tenant`).
+    pub fn set_default_substituter(&self, url: String, public_key: String) {
+        *self.default_substituter.lock().unwrap() = Some((url, public_key));
+    }
+
+    /// Override [`DEFAULT_NEGATIVE_CACHE_TTL`] — called once at startup from
+    /// `KUBERNIX_SUBSTITUTER_NEGATIVE_CACHE_TTL`, if set.
+    pub fn set_negative_cache_ttl(&self, ttl: Duration) {
+        *self.negative_cache_ttl.lock().unwrap() = ttl;
     }
 
     /// Begin a transaction with `app.current_tenant` set to `tenant` for its
@@ -274,6 +314,20 @@ impl PostgresStore {
         Ok(tx)
     }
 
+    /// The `Tier::Substituted` analogue of
+    /// [`Self::cross_tenant_verified_read_scoped`] — see
+    /// `cross_tenant_substituted_read` in
+    /// `server/migrations/20260921000000_trusted_substituters.sql`.
+    async fn cross_tenant_substituted_read_scoped(
+        &self,
+    ) -> sqlx::Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('app.allow_cross_tenant_substituted_read', 'true', true)")
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
+    }
+
     /// Record a tenant so the foreign keys on `store_paths` and `jobs` resolve.
     ///
     /// Called before every write rather than once at connect: a tenant is
@@ -291,7 +345,45 @@ impl PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+
+        self.seed_default_substituter(&tenant.id).await;
         Ok(())
+    }
+
+    /// Insert [`Self::default_substituter`] (if any) into `tenant`'s
+    /// `tenant_substituters`, `ON CONFLICT (tenant, url) DO NOTHING` — so an
+    /// operator's later edit/removal is never silently re-inserted, only a
+    /// tenant that has never had this url configured gets it. Best-effort:
+    /// this seeding is a convenience default, not something the serving path
+    /// depends on for correctness, so a failure here is logged rather than
+    /// propagated.
+    async fn seed_default_substituter(&self, tenant: &TenantId) {
+        let Some((url, public_key)) = self.default_substituter.lock().unwrap().clone() else {
+            return;
+        };
+        let mut tx = match self.tenant_scoped(tenant).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(error = %e, %tenant, "could not open a tenant-scoped transaction to seed the default substituter");
+                return;
+            }
+        };
+        if let Err(e) = sqlx::query(
+            "INSERT INTO tenant_substituters (tenant, url, public_key) VALUES ($1, $2, $3)
+             ON CONFLICT (tenant, url) DO NOTHING",
+        )
+        .bind(tenant.as_str())
+        .bind(&url)
+        .bind(&public_key)
+        .execute(&mut *tx)
+        .await
+        {
+            tracing::warn!(error = %e, %tenant, "could not seed the default substituter");
+            return;
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::warn!(error = %e, %tenant, "could not commit the default substituter seed");
+        }
     }
 
     /// Insert the tenant id alone, for the write paths that only have an id.
@@ -347,6 +439,40 @@ impl PostgresStore {
         object: &RemoteObject,
         tier: Tier,
     ) -> Result<()> {
+        self.upsert_path_inner(tenant, info, object, tier, None)
+            .await
+    }
+
+    /// [`Self::upsert_path`], plus recording provenance for a
+    /// `Tier::Substituted` row — see `substituted_from_url`/
+    /// `substituted_from_key` in
+    /// `server/migrations/20260921000000_trusted_substituters.sql`.
+    async fn upsert_substituted_path(
+        &self,
+        tenant: &TenantId,
+        info: &PathInfo,
+        object: &RemoteObject,
+        source_url: &str,
+        source_key: &str,
+    ) -> Result<()> {
+        self.upsert_path_inner(
+            tenant,
+            info,
+            object,
+            Tier::Substituted,
+            Some((source_url, source_key)),
+        )
+        .await
+    }
+
+    async fn upsert_path_inner(
+        &self,
+        tenant: &TenantId,
+        info: &PathInfo,
+        object: &RemoteObject,
+        tier: Tier,
+        substituted_from: Option<(&str, &str)>,
+    ) -> Result<()> {
         self.ensure_tenant_id(tenant).await?;
 
         let mut txn = self.tenant_scoped(tenant).await.map_err(db_err)?;
@@ -363,12 +489,17 @@ impl PostgresStore {
         .map_err(db_err)?;
 
         let references: Vec<&str> = info.references.iter().map(StorePath::as_str).collect();
+        let (substituted_from_url, substituted_from_key) = match substituted_from {
+            Some((url, key)) => (Some(url), Some(key)),
+            None => (None, None),
+        };
 
         sqlx::query(
             "INSERT INTO store_paths (
                  tenant, path, hash_part, deriver, nar_hash_algo, nar_hash, nar_size,
-                 registration_time, ultimate, refs, sigs, object_key, tier
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                 registration_time, ultimate, refs, sigs, object_key, tier,
+                 substituted_from_url, substituted_from_key
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
              ON CONFLICT (tenant, path) DO UPDATE SET
                  deriver = EXCLUDED.deriver,
                  nar_hash_algo = EXCLUDED.nar_hash_algo,
@@ -380,6 +511,8 @@ impl PostgresStore {
                  sigs = EXCLUDED.sigs,
                  object_key = EXCLUDED.object_key,
                  tier = EXCLUDED.tier,
+                 substituted_from_url = EXCLUDED.substituted_from_url,
+                 substituted_from_key = EXCLUDED.substituted_from_key,
                  -- A path being (re-)recorded is evidence it is wanted right
                  -- now — most commonly a worker rebuilding an output GC had
                  -- already marked. Without this the row would stay 'marked'
@@ -403,6 +536,8 @@ impl PostgresStore {
         .bind(&info.sigs)
         .bind(object.key.as_str())
         .bind(tier.as_str())
+        .bind(substituted_from_url)
+        .bind(substituted_from_key)
         .execute(&mut *txn)
         .await
         .map_err(db_err)?;
@@ -748,6 +883,161 @@ impl PostgresStore {
         // Infallible: unrecognised text is treated as `Quarantined`, per
         // `Tier`'s `FromStr` impl, never as a parse error.
         .map(|s| s.parse().unwrap())
+    }
+
+    async fn trusted_substituters_db(&self, tenant: &TenantId) -> Vec<(String, String)> {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, "could not open a tenant-scoped transaction");
+            return Vec::new();
+        };
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT url, public_key FROM tenant_substituters WHERE tenant = $1 ORDER BY created_at",
+        )
+        .bind(tenant.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, %tenant, "trusted_substituters lookup failed");
+            Vec::new()
+        })
+    }
+
+    async fn record_substituted_path_db(
+        &self,
+        tenant: &TenantId,
+        info: PathInfo,
+        object: RemoteObject,
+        source_url: String,
+        source_key: String,
+    ) -> Result<()> {
+        tracing::info!(
+            %tenant,
+            path = %info.path,
+            key = %object.key,
+            substituter = %source_url,
+            "recorded substituted path"
+        );
+        self.upsert_substituted_path(tenant, &info, &object, &source_url, &source_key)
+            .await
+    }
+
+    async fn find_substituted_by_hash_part_db(
+        &self,
+        hash_part: &str,
+    ) -> Option<(PathInfo, RemoteObject, String, String)> {
+        // No `tenant` predicate, mirroring `find_verified_by_hash_part_db` --
+        // the narrow, audited exception to row-level security's tenant
+        // isolation for this tier, `cross_tenant_substituted_read` (see the
+        // trusted-substituters migration and
+        // `Self::cross_tenant_substituted_read_scoped`). Unlike `Verified`,
+        // finding a row here is not itself proof the caller's own tenant may
+        // use it -- see `crate::substitute`, which checks the returned
+        // `(url, public_key)` against the caller's own configured
+        // `tenant_substituters` before treating this as a hit.
+        let mut tx = self
+            .cross_tenant_substituted_read_scoped()
+            .await
+            .inspect_err(|e| tracing::error!(error = %e, %hash_part, "could not open a cross-tenant-read transaction"))
+            .ok()?;
+        let row = sqlx::query(
+            "SELECT sp.*, o.key AS obj_key, o.file_size AS obj_file_size,
+                    o.file_hash AS obj_file_hash
+               FROM store_paths_live sp JOIN objects o ON o.key = sp.object_key
+              WHERE sp.tier = 'substituted' AND sp.hash_part = $1
+              LIMIT 1",
+        )
+        .bind(hash_part)
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, %hash_part, "cross-tenant substituted lookup failed");
+            None
+        })?;
+
+        let object = RemoteObject {
+            key: ObjectKey::new(row.get::<String, _>("obj_key")),
+            file_size: row.get::<i64, _>("obj_file_size") as u64,
+            file_hash: Output::<Sha256>::try_from(
+                row.get::<Vec<u8>, _>("obj_file_hash").as_slice(),
+            )
+            .expect("file_hash column is always a sha256 digest"),
+        };
+        let url: String = row.get("substituted_from_url");
+        let key: String = row.get("substituted_from_key");
+        Some((Self::row_to_info(&row), object, url, key))
+    }
+
+    async fn substituted_source_db(
+        &self,
+        tenant: &TenantId,
+        path: &StorePath,
+    ) -> Option<(String, String)> {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, %path, "could not open a tenant-scoped transaction");
+            return None;
+        };
+        sqlx::query(
+            "SELECT substituted_from_url, substituted_from_key FROM store_paths_live
+              WHERE tenant = $1 AND path = $2 AND tier = 'substituted'",
+        )
+        .bind(tenant.as_str())
+        .bind(path.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, %path, "substituted_source lookup failed");
+            None
+        })
+        .and_then(|row| {
+            let url: Option<String> = row.get("substituted_from_url");
+            let key: Option<String> = row.get("substituted_from_key");
+            Some((url?, key?))
+        })
+    }
+
+    async fn substituter_negative_cache_hit_db(&self, tenant: &TenantId, hash_part: &str) -> bool {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, "could not open a tenant-scoped transaction");
+            return false;
+        };
+        let ttl_secs = self.negative_cache_ttl.lock().unwrap().as_secs_f64();
+        sqlx::query(
+            "SELECT 1 FROM substituter_negative_cache
+              WHERE tenant = $1 AND hash_part = $2
+                AND checked_at > now() - make_interval(secs => $3)",
+        )
+        .bind(tenant.as_str())
+        .bind(hash_part)
+        .bind(ttl_secs)
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, %tenant, "negative-cache lookup failed");
+            None
+        })
+        .is_some()
+    }
+
+    async fn mark_substituter_miss_db(&self, tenant: &TenantId, hash_part: &str) {
+        let Ok(mut tx) = self.tenant_scoped(tenant).await else {
+            tracing::error!(%tenant, "could not open a tenant-scoped transaction");
+            return;
+        };
+        if let Err(e) = sqlx::query(
+            "INSERT INTO substituter_negative_cache (tenant, hash_part) VALUES ($1, $2)
+             ON CONFLICT (tenant, hash_part) DO UPDATE SET checked_at = now()",
+        )
+        .bind(tenant.as_str())
+        .bind(hash_part)
+        .execute(&mut *tx)
+        .await
+        {
+            tracing::warn!(error = %e, %tenant, %hash_part, "recording a substituter miss failed");
+            return;
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::warn!(error = %e, %tenant, %hash_part, "committing a substituter miss failed");
+        }
     }
 
     async fn reject_unverified_pushes_db(&self, tenant: &TenantId) -> bool {
@@ -1254,6 +1544,37 @@ enum DbRequest {
         tenant: TenantId,
         reply: oneshot::Sender<bool>,
     },
+    TrustedSubstituters {
+        tenant: TenantId,
+        reply: oneshot::Sender<Vec<(String, String)>>,
+    },
+    RecordSubstitutedPath {
+        tenant: TenantId,
+        info: PathInfo,
+        object: RemoteObject,
+        source_url: String,
+        source_key: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    FindSubstitutedByHashPart {
+        hash_part: String,
+        reply: oneshot::Sender<Option<(PathInfo, RemoteObject, String, String)>>,
+    },
+    SubstitutedSource {
+        tenant: TenantId,
+        path: StorePath,
+        reply: oneshot::Sender<Option<(String, String)>>,
+    },
+    SubstituterNegativeCacheHit {
+        tenant: TenantId,
+        hash_part: String,
+        reply: oneshot::Sender<bool>,
+    },
+    MarkSubstituterMiss {
+        tenant: TenantId,
+        hash_part: String,
+        reply: oneshot::Sender<()>,
+    },
     RecordAccess {
         tenant: TenantId,
         path: StorePath,
@@ -1389,6 +1710,52 @@ impl DbRequest {
             }
             DbRequest::RejectUnverifiedPushes { tenant, reply } => {
                 let _ = reply.send(store.reject_unverified_pushes_db(&tenant).await);
+            }
+            DbRequest::TrustedSubstituters { tenant, reply } => {
+                let _ = reply.send(store.trusted_substituters_db(&tenant).await);
+            }
+            DbRequest::RecordSubstitutedPath {
+                tenant,
+                info,
+                object,
+                source_url,
+                source_key,
+                reply,
+            } => {
+                let _ = reply.send(
+                    store
+                        .record_substituted_path_db(&tenant, info, object, source_url, source_key)
+                        .await,
+                );
+            }
+            DbRequest::FindSubstitutedByHashPart { hash_part, reply } => {
+                let _ = reply.send(store.find_substituted_by_hash_part_db(&hash_part).await);
+            }
+            DbRequest::SubstitutedSource {
+                tenant,
+                path,
+                reply,
+            } => {
+                let _ = reply.send(store.substituted_source_db(&tenant, &path).await);
+            }
+            DbRequest::SubstituterNegativeCacheHit {
+                tenant,
+                hash_part,
+                reply,
+            } => {
+                let _ = reply.send(
+                    store
+                        .substituter_negative_cache_hit_db(&tenant, &hash_part)
+                        .await,
+                );
+            }
+            DbRequest::MarkSubstituterMiss {
+                tenant,
+                hash_part,
+                reply,
+            } => {
+                store.mark_substituter_miss_db(&tenant, &hash_part).await;
+                let _ = reply.send(());
             }
             DbRequest::ReserveJob {
                 tenant,
@@ -1647,6 +2014,84 @@ impl PathStore for PostgresStore {
         self.call(|reply| DbRequest::RejectUnverifiedPushes { tenant, reply })
             .await
             .unwrap_or(true)
+    }
+
+    async fn trusted_substituters(&self, tenant: &TenantId) -> Vec<(String, String)> {
+        let tenant = tenant.clone();
+        self.call(|reply| DbRequest::TrustedSubstituters { tenant, reply })
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn record_substituted_path(
+        &self,
+        tenant: &TenantId,
+        info: PathInfo,
+        object: RemoteObject,
+        source_url: &str,
+        source_key: &str,
+    ) -> Result<()> {
+        let (tenant, source_url, source_key) = (
+            tenant.clone(),
+            source_url.to_string(),
+            source_key.to_string(),
+        );
+        self.call(|reply| DbRequest::RecordSubstitutedPath {
+            tenant,
+            info,
+            object,
+            source_url,
+            source_key,
+            reply,
+        })
+        .await
+        .unwrap_or_else(|| Err(StoreError::Other("db request actor unavailable".into())))
+    }
+
+    async fn find_substituted_by_hash_part(
+        &self,
+        hash_part: &str,
+    ) -> Option<(PathInfo, RemoteObject, String, String)> {
+        let hash_part = hash_part.to_string();
+        self.call(|reply| DbRequest::FindSubstitutedByHashPart { hash_part, reply })
+            .await
+            .flatten()
+    }
+
+    async fn substituted_source(
+        &self,
+        tenant: &TenantId,
+        path: &StorePath,
+    ) -> Option<(String, String)> {
+        let (tenant, path) = (tenant.clone(), path.clone());
+        self.call(|reply| DbRequest::SubstitutedSource {
+            tenant,
+            path,
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    async fn substituter_negative_cache_hit(&self, tenant: &TenantId, hash_part: &str) -> bool {
+        let (tenant, hash_part) = (tenant.clone(), hash_part.to_string());
+        self.call(|reply| DbRequest::SubstituterNegativeCacheHit {
+            tenant,
+            hash_part,
+            reply,
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn mark_substituter_miss(&self, tenant: &TenantId, hash_part: &str) {
+        let (tenant, hash_part) = (tenant.clone(), hash_part.to_string());
+        self.call(|reply| DbRequest::MarkSubstituterMiss {
+            tenant,
+            hash_part,
+            reply,
+        })
+        .await;
     }
 
     async fn record_access(&self, tenant: &TenantId, path: &StorePath) {
@@ -2649,6 +3094,66 @@ mod tests {
             .unwrap();
 
         assert!(!store.reject_unverified_pushes(&t.id).await);
+    }
+
+    #[tokio::test]
+    async fn trusted_substituters_is_empty_for_a_new_tenant_with_no_default_configured() {
+        let Some(store) = db().await else { return };
+        let t = Tenant::from_ssh("substituters-no-default", None, false);
+        store.register_tenant(&t).await.unwrap();
+
+        assert!(store.trusted_substituters(&t.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_tenant_is_seeded_with_the_configured_default_substituter() {
+        let Some(store) = db().await else { return };
+        store.set_default_substituter(
+            "https://cache.nixos.org".to_string(),
+            "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=".to_string(),
+        );
+        let t = Tenant::from_ssh("substituters-default", None, false);
+        store.register_tenant(&t).await.unwrap();
+
+        let substituters = store.trusted_substituters(&t.id).await;
+        assert_eq!(
+            substituters,
+            vec![(
+                "https://cache.nixos.org".to_string(),
+                "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=".to_string(),
+            )]
+        );
+
+        // A second `register_tenant` call (e.g. a reconnect) must not
+        // duplicate the seed.
+        store.register_tenant(&t).await.unwrap();
+        assert_eq!(store.trusted_substituters(&t.id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn substituted_paths_round_trip_with_their_source() {
+        let Some(store) = db().await else { return };
+        let t = tenant("substituted-roundtrip");
+
+        store
+            .record_substituted_path(
+                &t,
+                info(P),
+                object("substituted/cache.nixos.org/nar/x"),
+                "https://cache.nixos.org",
+                "cache.nixos.org-1:key",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.tier(&t, &p()).await, Some(Tier::Substituted));
+        let (found_info, _object, url, key) = store
+            .find_substituted_by_hash_part("00000000000000000000000000000000")
+            .await
+            .expect("recorded");
+        assert_eq!(found_info.path, p());
+        assert_eq!(url, "https://cache.nixos.org");
+        assert_eq!(key, "cache.nixos.org-1:key");
     }
 
     #[tokio::test]

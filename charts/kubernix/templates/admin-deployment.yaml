@@ -40,6 +40,14 @@ spec:
           command: ["sleep", "infinity"]
           env:
             {{- include "kubernix.databaseUrlEnv" . | nindent 12 }}
+            {{- with .Values.substituters.defaultUrl }}
+            - name: KUBERNIX_DEFAULT_SUBSTITUTER_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.substituters.defaultPublicKey }}
+            - name: KUBERNIX_DEFAULT_SUBSTITUTER_KEY
+              value: {{ . | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.admin.resources | nindent 12 }}
       {{- with .Values.admin.nodeSelector }}

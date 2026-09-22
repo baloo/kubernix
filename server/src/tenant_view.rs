@@ -119,6 +119,10 @@ impl TenantView {
         self.store.reject_unverified_pushes(&self.tenant).await
     }
 
+    pub async fn trusted_substituters(&self) -> Vec<(String, String)> {
+        self.store.trusted_substituters(&self.tenant).await
+    }
+
     pub async fn record_access(&self, path: &StorePath) {
         self.store.record_access(&self.tenant, path).await
     }

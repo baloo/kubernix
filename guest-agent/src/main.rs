@@ -301,9 +301,12 @@ async fn main() -> Result<()> {
         .wrap_err("binding log vsock listener")?;
     eprintln!("guest-agent listening on log vsock port {LOG_PORT}");
 
+    let substituters: Substituters = Arc::new(Mutex::new(Vec::new()));
+
     let control_detection = detection.clone();
+    let control_substituters = substituters.clone();
     tokio::spawn(async move {
-        control_accept_loop(control_listener, control_detection).await;
+        control_accept_loop(control_listener, control_detection, control_substituters).await;
     });
 
     tokio::spawn(async move {
@@ -324,8 +327,9 @@ async fn main() -> Result<()> {
         // Unix-socket accept loop. Errors here are per-connection, not fatal
         // to the agent: a build worth retrying dials again.
         let detection = detection.clone();
+        let substituters = substituters.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve(stream, detection).await {
+            if let Err(err) = serve(stream, detection, substituters).await {
                 eprintln!("guest-agent: connection handling failed: {err}");
             }
         });
@@ -355,6 +359,7 @@ fn log_dev_contents() {
 async fn control_accept_loop(
     listener: VsockListener,
     detection: Option<Arc<Mutex<DetectionState>>>,
+    substituters: Substituters,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -366,8 +371,9 @@ async fn control_accept_loop(
         };
         eprintln!("guest-agent: accepted control connection from {peer:?}");
         let detection = detection.clone();
+        let substituters = substituters.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_control(stream, detection).await {
+            if let Err(err) = handle_control(stream, detection, substituters).await {
                 eprintln!("guest-agent: control connection failed: {err}");
             }
         });
@@ -435,6 +441,7 @@ async fn log_accept_loop(listener: VsockListener, tx: broadcast::Sender<Vec<u8>>
 async fn handle_control(
     mut stream: VsockStream,
     detection: Option<Arc<Mutex<DetectionState>>>,
+    substituters: Substituters,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
@@ -444,7 +451,7 @@ async fn handle_control(
         .await
         .wrap_err("reading control line")?;
 
-    let reply = match dispatch_control(line.trim_end(), detection).await {
+    let reply = match dispatch_control(line.trim_end(), detection, substituters).await {
         Ok(ControlReply::Ok) => "OK\n".to_string(),
         Ok(ControlReply::OkWithData(n)) => format!("OK {n}\n"),
         Ok(ControlReply::OkWithStatus(status)) => format!("OK {}\n", format_status(status)),
@@ -497,12 +504,25 @@ fn format_status(status: FailureStatus) -> String {
 async fn dispatch_control(
     line: &str,
     detection: Option<Arc<Mutex<DetectionState>>>,
+    substituters: Substituters,
 ) -> Result<ControlReply> {
     let mut parts = line.split(' ');
     let cmd = parts.next().ok_or_else(|| eyre!("empty control line"))?;
     match cmd {
         "KEY" => {
             unlock_and_mount(parts).await?;
+            Ok(ControlReply::Ok)
+        }
+        "SUBST" => {
+            let tokens: Vec<&str> = parts.filter(|s| !s.is_empty()).collect();
+            if tokens.len() % 2 != 0 {
+                return Err(eyre!("SUBST needs an even number of url/key tokens"));
+            }
+            let parsed: Vec<(String, String)> = tokens
+                .chunks_exact(2)
+                .map(|pair| (pair[0].to_string(), pair[1].to_string()))
+                .collect();
+            *substituters.lock().await = parsed;
             Ok(ControlReply::Ok)
         }
         "CAPS?" => Ok(ControlReply::OkWithData(count_nested_virt_flags()?)),
@@ -813,9 +833,11 @@ async fn run_with_stdin(bin: &str, args: &[&str], stdin: &[u8]) -> Result<()> {
 async fn serve(
     mut stream: VsockStream,
     detection: Option<Arc<Mutex<DetectionState>>>,
+    substituters: Substituters,
 ) -> Result<()> {
     tracing::info!("spawning nix-daemon for a new connection");
-    let mut child = spawn_nix_daemon()?;
+    let current_substituters = substituters.lock().await.clone();
+    let mut child = spawn_nix_daemon(&current_substituters)?;
     // PLAN.md Phase 18: scope this nix-daemon instance (and everything it
     // forks for the sandboxed build) into the memory-capped build cgroup --
     // best-effort, same as `cgroup::setup()` itself: a guest where this
@@ -917,7 +939,37 @@ where
     }
 }
 
-fn spawn_nix_daemon() -> Result<Child> {
+/// This tenant's currently configured trusted substituters — nothing at
+/// boot, then kept current by the `SUBST` control verb
+/// (`worker::vm::push_substituters`, sent on every job, not just a
+/// fresh/reused boot). Read by [`spawn_nix_daemon`] on each new
+/// `NIX_DAEMON_PORT` connection, so a `nix-daemon` spawned for a later job
+/// always sees whatever was pushed most recently, even on a VM whose
+/// process has stayed warm across several jobs.
+type Substituters = Arc<Mutex<Vec<(String, String)>>>;
+
+fn spawn_nix_daemon(substituters: &[(String, String)]) -> Result<Child> {
+    let mut nix_config = "build-dir = /tmp\n\
+             pasta-path =\n\
+             experimental-features = auto-allocate-uids cgroups\n\
+             auto-allocate-uids = true\n\
+             use-cgroups = true"
+        .to_string();
+    // Deliberately the *only* substituters this guest ever has: it never
+    // reaches an external URL directly (`crate::substitute` doesn't exist
+    // here -- that's the frontend's own pull-through cache), so every
+    // substitution goes through kubernix, uniformly, and therefore always
+    // ends up correctly tiered (Built vs Substituted) on the frontend side.
+    if !substituters.is_empty() {
+        let urls: Vec<&str> = substituters.iter().map(|(url, _)| url.as_str()).collect();
+        let keys: Vec<&str> = substituters.iter().map(|(_, key)| key.as_str()).collect();
+        nix_config.push_str(&format!(
+            "\nsubstituters = {}\ntrusted-public-keys = {}",
+            urls.join(" "),
+            keys.join(" ")
+        ));
+    }
+
     Command::new(NIX_DAEMON_BIN)
         .arg("--stdio")
         // `build-dir`'s compiled-in default (`<nixStateDir>/b`) resolves
@@ -958,14 +1010,19 @@ fn spawn_nix_daemon() -> Result<Child> {
         // load-bearing for networking specifically: builds still benefit
         // from real per-build UID separation instead of every build sharing
         // the single static `nixbld1` (`nix/guest-vm.nix`'s `passwd`).
-        .env(
-            "NIX_CONFIG",
-            "build-dir = /tmp\n\
-             pasta-path =\n\
-             experimental-features = auto-allocate-uids cgroups\n\
-             auto-allocate-uids = true\n\
-             use-cgroups = true",
-        )
+        .env("NIX_CONFIG", &nix_config)
+        // A substituter (any of them, including the tenant's own namespace
+        // -- not just the new `/upstream/…` mirrors) needs somewhere
+        // writable for its local metadata cache
+        // (`~/.cache/nix/binary-cache-v6.sqlite`) before it can be used at
+        // all. `$HOME` otherwise defaults to `/root`, which -- like the
+        // rest of this guest's root filesystem -- is the read-only EROFS
+        // image (`nix/guest-vm.nix`), so every substituter's setup failed
+        // outright with "creating directory '/root/.cache': Read-only file
+        // system" before this. `/tmp` is already a real, writable `tmpfs`
+        // (mounted in `main()`, and already where `build-dir` points, just
+        // above) -- reusing it here needs no new mount.
+        .env("HOME", "/tmp")
         // `nix/guest-vm.nix` bakes a CA bundle in at this exact path --
         // without pointing `SSL_CERT_FILE` at it, every HTTPS fetch inside
         // the sandbox fails "unable to get local issuer certificate" (no
@@ -1014,11 +1071,17 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
         assert_eq!(count_nested_virt_flags_str(cpuinfo), 1);
     }
 
+    /// A fresh, empty `Substituters` for tests that don't care about it --
+    /// every `dispatch_control` call needs one now.
+    fn no_substituters() -> Substituters {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
     #[tokio::test]
     async fn dispatch_control_caps_returns_data() {
         // Real /proc/cpuinfo on the machine running the test -- whatever it
         // reports, dispatch should surface it as OkWithData, not Ok/Err.
-        match dispatch_control("CAPS?", None).await {
+        match dispatch_control("CAPS?", None, no_substituters()).await {
             Ok(ControlReply::OkWithData(_)) => {}
             other => panic!("expected OkWithData, got {other:?}"),
         }
@@ -1026,13 +1089,15 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
 
     #[tokio::test]
     async fn dispatch_control_unrecognised_verb_errors() {
-        let err = dispatch_control("WAT", None).await.unwrap_err();
+        let err = dispatch_control("WAT", None, no_substituters())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("unrecognised control command"));
     }
 
     #[tokio::test]
     async fn dispatch_control_empty_line_errors() {
-        assert!(dispatch_control("", None).await.is_err());
+        assert!(dispatch_control("", None, no_substituters()).await.is_err());
     }
 
     // PLAN.md Phase 18: STATUS?/RESET without a real eBPF-backed
@@ -1043,14 +1108,54 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
     // an unknown verb.
     #[tokio::test]
     async fn dispatch_control_status_without_detection_errors() {
-        let err = dispatch_control("STATUS?", None).await.unwrap_err();
+        let err = dispatch_control("STATUS?", None, no_substituters())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("eBPF detection not available"));
     }
 
     #[tokio::test]
     async fn dispatch_control_reset_without_detection_errors() {
-        let err = dispatch_control("RESET", None).await.unwrap_err();
+        let err = dispatch_control("RESET", None, no_substituters())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("eBPF detection not available"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_subst_updates_the_shared_state() {
+        let substituters = no_substituters();
+        dispatch_control(
+            "SUBST https://cache.nixos.org cache.nixos.org-1:AAAA",
+            None,
+            substituters.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *substituters.lock().await,
+            vec![(
+                "https://cache.nixos.org".to_string(),
+                "cache.nixos.org-1:AAAA".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_subst_with_no_pairs_clears_it() {
+        let substituters = no_substituters();
+        dispatch_control("SUBST", None, substituters.clone())
+            .await
+            .unwrap();
+        assert!(substituters.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_subst_rejects_an_odd_token_count() {
+        let err = dispatch_control("SUBST https://cache.nixos.org", None, no_substituters())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("even number"));
     }
 
     #[test]

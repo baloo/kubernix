@@ -2685,6 +2685,7 @@ dependencies = [
  "kubernix-types",
  "proptest",
  "rand 0.10.2",
+ "reqwest",
  "russh",
  "serde",
  "serde_json",

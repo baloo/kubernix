@@ -63,6 +63,12 @@ struct Job {
     /// (e.g. it's subscribed to the kvm subject but wasn't deployed with
     /// big-parallel too). See `worker_capabilities_satisfy`. PLAN.md Phase 17.
     required_features: Vec<String>,
+    /// This tenant's configured trusted substituters, as `(url, public_key)`
+    /// pairs. Pushed to the guest's control channel so its `nix.conf` points
+    /// at kubernix's own per-substituter mirror routes rather than
+    /// substituting from anywhere external directly — see
+    /// `vm::push_substituters`.
+    trusted_substituters: Vec<(String, String)>,
 }
 
 struct InputRef {
@@ -400,6 +406,22 @@ async fn main() -> color_eyre::eyre::Result<()> {
                         vsock = %handle.vsock_socket.display(),
                         "tenant VM ready"
                     );
+                    // Every job, not just a fresh/reused boot — see
+                    // `vm::push_substituters`'s own doc comment for why a
+                    // warm VM still needs this on each connection.
+                    match vm::push_substituters(&handle.vsock_socket, &job.trusted_substituters)
+                        .await
+                    {
+                        Ok(()) => tracing::info!(
+                            job_id = %job.job_id, tenant = %job.tenant,
+                            count = job.trusted_substituters.len(),
+                            "pushed trusted substituters to the guest"
+                        ),
+                        Err(e) => tracing::warn!(
+                            job_id = %job.job_id, tenant = %job.tenant, error = %e,
+                            "could not push trusted substituters to the guest; it will substitute from none"
+                        ),
+                    }
                     match handle.connect().await {
                         Ok(stream) => VmConn::open(stream)
                             .await
@@ -660,6 +682,14 @@ fn decode_job(payload: &[u8]) -> eyre::Result<Job> {
         required_features.push(feature?.to_string()?);
     }
 
+    let mut trusted_substituters = Vec::new();
+    for substituter in request.get_trusted_substituters()?.iter() {
+        trusted_substituters.push((
+            substituter.get_url()?.to_string()?,
+            substituter.get_public_key()?.to_string()?,
+        ));
+    }
+
     Ok(Job {
         job_id: request.get_job_id()?.to_string()?,
         derivation_path: StorePath::new(request.get_derivation_path()?.to_string()?),
@@ -668,6 +698,7 @@ fn decode_job(payload: &[u8]) -> eyre::Result<Job> {
         drv: request.get_drv()?.to_vec(),
         token: CapabilityToken::new(request.get_token()?.to_vec()),
         required_features,
+        trusted_substituters,
     })
 }
 

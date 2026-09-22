@@ -104,6 +104,47 @@ pub fn default_system() -> System {
     System::new(std::env::var("KUBERNIX_SYSTEM").unwrap_or_else(|_| "x86_64-linux".to_string()))
 }
 
+/// This deployment's own externally-reachable HTTP cache host (e.g.
+/// `cache.kubernix.example`), the same one an external client is told to
+/// configure (`nix/client-image.nix`'s `KUBERNIX_HTTP_HOST`). Read directly
+/// here, like [`default_system`], rather than threaded through [`Config`]:
+/// its only use is building the URLs a build VM's guest `nix.conf` gets
+/// (below) — nothing else on the serving path needs to know its own public
+/// address. `None` means a build VM gets no substituters configured at all
+/// (never a guess at the URL, and never the unsafe fallback of pointing the
+/// guest at an external substituter directly).
+fn kubernix_http_host() -> Option<String> {
+    std::env::var("KUBERNIX_HTTP_HOST").ok()
+}
+
+/// The `(url, public_key)` pairs a build VM's guest `nix.conf` should be
+/// configured with for `tenant` — see `crate::substitute` and
+/// `guest-agent::spawn_nix_daemon`. Everything here points at *this*
+/// deployment's own HTTP cache, never at an external substituter directly:
+/// the tenant's own namespace (for `Built`/`Verified`/pushed content,
+/// signed with the tenant's own key) plus one entry per configured trusted
+/// substituter, pointing at its `/upstream/<slug>` mirror route and
+/// carrying *that substituter's own* key verbatim (kubernix never re-signs
+/// that content — see `crate::substitute`'s module doc).
+async fn substituters_for_guest(store: &TenantView, http_host: &str) -> Vec<(String, String)> {
+    let tenant = store.tenant();
+    let mut out = Vec::new();
+    if let Some(signer) = store.signer().await {
+        out.push((
+            format!("https://{http_host}/{tenant}"),
+            signer.public_key_string(),
+        ));
+    }
+    for (url, public_key) in store.trusted_substituters().await {
+        let slug = crate::substitute::slug_for(&url);
+        out.push((
+            format!("https://{http_host}/{tenant}/upstream/{slug}"),
+            public_key,
+        ));
+    }
+    out
+}
+
 /// Realise one derived path.
 ///
 /// An *opaque* path is only a request that the path already exist — no build, no
@@ -469,6 +510,13 @@ impl LegacyProtocolImpl {
     /// an opaque `buildPaths` dependency) both need this, not just the RPC entry
     /// point — an opaque dependency that only another tenant has pushed is
     /// exactly the case sharing exists for.
+    ///
+    /// Also falls back to `crate::substitute::exists` — a cheap `HEAD`
+    /// against this tenant's configured trusted substituters, nothing
+    /// downloaded or recorded (see that module's own doc comment) — so a
+    /// path a trusted upstream already has doesn't read as missing here,
+    /// which is what `query_missing` (and therefore job dispatch) ultimately
+    /// depends on this method to get right.
     async fn is_valid_path_anywhere(&self, path: &StorePath) -> bool {
         if self.tenant_view().is_valid_path(path).await {
             return true;
@@ -476,7 +524,74 @@ impl LegacyProtocolImpl {
         let Some(hash_part) = path.hash_part() else {
             return false;
         };
-        self.resolve_verified(hash_part).await.as_ref() == Some(path)
+        if self.resolve_verified(hash_part).await.as_ref() == Some(path) {
+            return true;
+        }
+        crate::substitute::exists(self.store.as_ref(), &self.tenant.id, hash_part).await
+    }
+
+    /// The `Tier::Substituted` counterpart of [`Self::resolve_verified`]:
+    /// materialize this tenant's own row for `hash_part` by pulling it
+    /// through from a configured trusted substituter, if any has it. `None`
+    /// (rather than materializing anything) if there is no object store
+    /// configured — mirrors every other route that needs `self.uploader`.
+    async fn resolve_substituted(&self, hash_part: &str) -> Option<StorePath> {
+        let uploader = self.uploader.as_deref()?;
+        let (info, _object) = crate::substitute::resolve(
+            self.store.as_ref(),
+            uploader,
+            &self.tenant.id,
+            hash_part,
+            &self.store_dir,
+        )
+        .await?;
+        Some(info.path)
+    }
+
+    /// Whether every one of a `buildDerivation` call's `expected_outputs` is
+    /// already available — locally, or by pulling each one through from a
+    /// trusted substituter — so [`legacy_protocol::Server::build_derivation`]
+    /// can skip dispatching a real job.
+    ///
+    /// This matters specifically for a client using kubernix as a
+    /// `--builders=` remote builder rather than as a `--store`: in that mode
+    /// the client's *own* local substituters (which know nothing about
+    /// kubernix's server-side `trusted_substituters` — those are per-tenant
+    /// database state, not something a client's `nix.conf` can see) already
+    /// decided this output was missing before ever calling `buildDerivation`,
+    /// so by the time this runs it is kubernix's only remaining chance to
+    /// notice a real build is avoidable.
+    ///
+    /// All-or-nothing, checked with a cheap [`crate::substitute::exists`]
+    /// pass before any [`Self::resolve_substituted`] (a real fetch + S3
+    /// upload) is attempted for any of them — a derivation that only
+    /// *partially* resolves this way still needs a real build for its other
+    /// outputs, and there is no way to hand a client half-substituted,
+    /// half-built results for one `buildDerivation` call.
+    async fn all_outputs_available(&self, expected_outputs: &[(String, StorePath)]) -> bool {
+        if !self.options.borrow().use_substitutes {
+            return false;
+        }
+        let store = self.tenant_view();
+        let mut missing_hash_parts = Vec::with_capacity(expected_outputs.len());
+        for (_, path) in expected_outputs {
+            if store.is_valid_path(path).await {
+                continue;
+            }
+            let Some(hash_part) = path.hash_part() else {
+                return false;
+            };
+            if !crate::substitute::exists(self.store.as_ref(), &self.tenant.id, hash_part).await {
+                return false;
+            }
+            missing_hash_parts.push(hash_part.to_string());
+        }
+        for hash_part in missing_hash_parts {
+            if self.resolve_substituted(&hash_part).await.is_none() {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -595,6 +710,12 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             {
                 info = store.query_path_info(&path).await;
             }
+            if info.is_none()
+                && let Some(hash_part) = path.hash_part()
+                && this.resolve_substituted(hash_part).await.is_some()
+            {
+                info = store.query_path_info(&path).await;
+            }
             match info {
                 Some(info) => {
                     // A narinfo is the earlier half of "fetch metadata, then
@@ -683,6 +804,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
     ) -> impl Future<Output = Result<(), capnp::Error>> + 'static {
         let store = self.tenant_view();
         let store_dir = self.store_dir.clone();
+        let this = self.clone();
         async move {
             // DerivedPath is a union of opaque/built; both name a store path.
             let mut targets = Vec::new();
@@ -701,7 +823,29 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 }
             }
 
-            let missing = store.query_missing(&targets).await;
+            let mut missing = store.query_missing(&targets).await;
+            // A target reported as needing a build might already be
+            // available from a trusted substituter -- re-classify it as
+            // `will_substitute` rather than dispatching a worker for it.
+            // Cheap: `crate::substitute::exists` is a `HEAD`, nothing
+            // downloaded or recorded.
+            let mut still_will_build = Vec::with_capacity(missing.will_build.len());
+            for target in missing.will_build {
+                let exists = match target.hash_part() {
+                    Some(hash_part) => {
+                        crate::substitute::exists(this.store.as_ref(), &this.tenant.id, hash_part)
+                            .await
+                    }
+                    None => false,
+                };
+                if exists {
+                    missing.will_substitute.push(target);
+                } else {
+                    still_will_build.push(target);
+                }
+            }
+            missing.will_build = still_will_build;
+
             let mut result = results.get().init_result();
             result
                 .reborrow()
@@ -994,6 +1138,21 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 expected_outputs.push((output.name.clone(), verified_path));
             }
 
+            // A `--builders=` client already decided (using its own local
+            // substituters, which cannot see kubernix's server-side
+            // `trusted_substituters`) that this needs building before ever
+            // calling us — this is kubernix's own chance to notice it can
+            // pull the outputs through instead. Checked before requiring a
+            // job queue at all: a build satisfied this way needs no worker.
+            if this.all_outputs_available(&expected_outputs).await {
+                tracing::info!(%path, "build satisfied via a trusted substituter; no job dispatched");
+                results
+                    .get()
+                    .init_result()
+                    .set_status(legacy_protocol::build_result::Status::Built);
+                return Ok(());
+            }
+
             let Some(queue) = queue else {
                 tracing::warn!(%path, "build requested but no job queue is configured");
                 return Err(rpc_error::unimplemented(format!(
@@ -1036,6 +1195,16 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                     // `store`.
                     let (kid, secret) = store.store().current_capability_secret().await;
                     let token = capability.sign(kid, &secret);
+                    let trusted_substituters = match kubernix_http_host() {
+                        Some(host) => substituters_for_guest(&store, &host).await,
+                        None => Vec::new(),
+                    };
+                    tracing::info!(
+                        %path, tenant = %tenant,
+                        count = trusted_substituters.len(),
+                        urls = ?trusted_substituters.iter().map(|(u, _)| u.as_str()).collect::<Vec<_>>(),
+                        "trusted substituters for build VM"
+                    );
 
                     let job = BuildJob {
                         job_id,
@@ -1046,6 +1215,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                         tenant: tenant.clone(),
                         token,
                         required_features,
+                        trusted_substituters,
                     };
 
                     let outcome = queue
@@ -1680,6 +1850,67 @@ mod tests {
                 .resolve_verified(&hash_part)
                 .await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn all_outputs_available_is_false_when_use_substitutes_is_disabled() {
+        // `for_test` leaves `ClientOptions` at its default (`use_substitutes:
+        // false`) -- a client that has not opted in must never have a build
+        // silently swapped for a substitution, even if one is possible.
+        let store = MemoryStore::new();
+        let t = bob();
+        store
+            .record_path(&t, info(OUT), object("k"), Tier::Built)
+            .await
+            .unwrap();
+        let protocol = LegacyProtocolImpl::for_test(store.clone(), t);
+
+        assert!(
+            !protocol
+                .all_outputs_available(&[("out".to_string(), StorePath::new(OUT))])
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn all_outputs_available_is_true_when_every_output_is_already_valid() {
+        let store = MemoryStore::new();
+        let t = bob();
+        store
+            .record_path(&t, info(OUT), object("k"), Tier::Built)
+            .await
+            .unwrap();
+        let protocol = LegacyProtocolImpl::for_test(store.clone(), t);
+        *protocol.options.borrow_mut() = ClientOptions {
+            use_substitutes: true,
+            ..Default::default()
+        };
+
+        assert!(
+            protocol
+                .all_outputs_available(&[("out".to_string(), StorePath::new(OUT))])
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn all_outputs_available_is_false_when_nothing_can_substitute_it() {
+        // `use_substitutes: true`, but no path recorded and no substituters
+        // configured for this tenant (and no uploader in the test harness) --
+        // must fall through to a real build rather than hang or panic.
+        let store = MemoryStore::new();
+        let t = bob();
+        let protocol = LegacyProtocolImpl::for_test(store.clone(), t);
+        *protocol.options.borrow_mut() = ClientOptions {
+            use_substitutes: true,
+            ..Default::default()
+        };
+
+        assert!(
+            !protocol
+                .all_outputs_available(&[("out".to_string(), StorePath::new(OUT))])
+                .await
         );
     }
 

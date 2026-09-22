@@ -46,6 +46,20 @@ spec:
               value: {{ .Values.sshd.listen | quote }}
             - name: KUBERNIX_SSH_HOST_KEY
               value: /etc/kubernix/ssh/host_ed25519
+            {{- with .Values.substituters.defaultUrl }}
+            - name: KUBERNIX_DEFAULT_SUBSTITUTER_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.substituters.defaultPublicKey }}
+            - name: KUBERNIX_DEFAULT_SUBSTITUTER_KEY
+              value: {{ . | quote }}
+            {{- end }}
+            - name: KUBERNIX_SUBSTITUTER_NEGATIVE_CACHE_TTL
+              value: {{ .Values.substituters.negativeCacheTtl | quote }}
+            {{- with .Values.substituters.httpHost }}
+            - name: KUBERNIX_HTTP_HOST
+              value: {{ . | quote }}
+            {{- end }}
             - name: RUST_LOG
               value: debug
           volumeMounts:

@@ -174,13 +174,21 @@ where
         // keepFailed, keepGoing, tryFallback, verbosity, maxBuildJobs,
         // maxSilentTime, useBuildHook(obsolete, must be `true`), buildVerbosity,
         // obsolete logType, obsolete printBuildTrace, buildCores, useSubstitutes
-        // — see `remote-store.cc:120-133`. All conservative defaults; nothing
-        // downstream of this client depends on daemon-side settings.
-        for v in [0u64, 0, 0, 0, 1, 0] {
+        // — see `remote-store.cc:120-133`.
+        //
+        // `verbosity`/`buildVerbosity` are `lvlInfo` (3), not `lvlError`
+        // (0): at `lvlError` the daemon never sends the "substituting …" /
+        // "don't know how to build …" activity lines that are the only way
+        // to see *why* a dependency ended up missing rather than
+        // substituted — those are exactly what a caller needs surfaced,
+        // both for a human staring at `nix-build`'s own output and for
+        // `worker/src/main.rs`'s `log` capture/archival. Nothing downstream
+        // of this client depends on daemon-side settings otherwise.
+        for v in [0u64, 0, 0, 3, 1, 0] {
             self.stream.write_wire_u64(v).await?;
         }
         self.stream.write_wire_bool(true).await?; // obsolete useBuildHook
-        self.stream.write_wire_u64(0).await?; // buildVerbosity (lvlError)
+        self.stream.write_wire_u64(3).await?; // buildVerbosity (lvlInfo)
         self.stream.write_wire_u64(0).await?; // obsolete log type
         self.stream.write_wire_u64(0).await?; // obsolete print build trace
         self.stream.write_wire_u64(1).await?; // buildCores

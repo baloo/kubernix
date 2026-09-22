@@ -81,6 +81,19 @@ pub enum Tier {
     /// **Never signed and never publicly served.** Confined to the tenant that
     /// pushed it, so the blast radius of a lie is that tenant's own builds.
     Quarantined,
+    /// Pulled through from one of the tenant's configured trusted
+    /// substituters and cached with its **original signature carried
+    /// through unmodified** — see `crate::substitute`.
+    ///
+    /// Kubernix never checks that signature and never re-signs this content
+    /// under its own per-tenant key: trust stays with whichever
+    /// `nix-daemon` actually consumes the path, exactly as it would if it
+    /// had fetched from that substituter directly. That is why this is
+    /// **not** vouchable, unlike `Verified`/`Built` — "vouchable" means
+    /// kubernix will sign it / serve it from the tenant's own signed
+    /// narinfo namespace, and this content is neither. It is instead served
+    /// from its own per-substituter route (`server/src/http.rs`).
+    Substituted,
 }
 
 impl Tier {
@@ -89,7 +102,7 @@ impl Tier {
     pub fn is_vouchable(self) -> bool {
         match self {
             Tier::Verified | Tier::Built => true,
-            Tier::Quarantined => false,
+            Tier::Quarantined | Tier::Substituted => false,
         }
     }
 
@@ -98,6 +111,7 @@ impl Tier {
             Tier::Verified => "verified",
             Tier::Built => "built",
             Tier::Quarantined => "quarantined",
+            Tier::Substituted => "substituted",
         }
     }
 }
@@ -118,6 +132,7 @@ impl std::str::FromStr for Tier {
         Ok(match s {
             "verified" => Tier::Verified,
             "built" => Tier::Built,
+            "substituted" => Tier::Substituted,
             _ => Tier::Quarantined,
         })
     }
@@ -261,6 +276,54 @@ pub trait PathStore: Send + Sync {
     async fn find_verified_by_hash_part(&self, hash_part: &str)
     -> Option<(PathInfo, RemoteObject)>;
 
+    /// Record a path fetched from a trusted substituter — `crate::substitute`'s
+    /// only writer. A separate method rather than a `Tier::Substituted` call
+    /// to [`Self::record_path`], because this is the one write that also
+    /// needs to persist *which* substituter sourced it (`source_url`/
+    /// `source_key`) — nothing else about a `Substituted` row differs from
+    /// any other tier. The default delegates to `record_path`, dropping the
+    /// source (fine for a store with no substituters concept at all).
+    async fn record_substituted_path(
+        &self,
+        tenant: &TenantId,
+        info: PathInfo,
+        object: RemoteObject,
+        _source_url: &str,
+        _source_key: &str,
+    ) -> Result<()> {
+        self.record_path(tenant, info, object, Tier::Substituted)
+            .await
+    }
+
+    /// Any tenant's `Substituted` row for this hash part, plus which
+    /// `(url, public_key)` sourced it. Tenant-agnostic like
+    /// [`Self::find_verified_by_hash_part`], but for a *policy* reason
+    /// rather than a cryptographic one: the caller (`crate::substitute`)
+    /// still has to check that its own tenant's `trusted_substituters`
+    /// includes the returned `(url, public_key)` before treating this as
+    /// its own — unlike `Verified`, content here is not self-certifying.
+    /// `None` if nobody has ever pulled this hash part through.
+    async fn find_substituted_by_hash_part(
+        &self,
+        _hash_part: &str,
+    ) -> Option<(PathInfo, RemoteObject, String, String)> {
+        None
+    }
+
+    /// Which `(url, public_key)` sourced `tenant`'s own `Substituted` row
+    /// for `path`, if any. Unlike [`Self::find_substituted_by_hash_part`],
+    /// this is tenant-scoped: it answers for the row `tenant` actually has,
+    /// not any tenant's. Used by `server/src/http.rs`'s per-substituter
+    /// route to refuse serving a path that exists for this tenant but was
+    /// sourced from a *different* substituter than the one the route names.
+    async fn substituted_source(
+        &self,
+        _tenant: &TenantId,
+        _path: &StorePath,
+    ) -> Option<(String, String)> {
+        None
+    }
+
     async fn add_signatures(
         &self,
         tenant: &TenantId,
@@ -294,6 +357,29 @@ pub trait PathStore: Send + Sync {
     async fn reject_unverified_pushes(&self, _tenant: &TenantId) -> bool {
         true
     }
+
+    /// This tenant's configured trusted substituters, as `(url, public_key)`
+    /// pairs — see `crate::substitute`. Empty by default: a store with no
+    /// tenant-settings concept (`MemoryStore`, absent an explicit test
+    /// setter) simply has nothing configured, unlike
+    /// [`Self::reject_unverified_pushes`]'s stricter-by-default bool, since
+    /// there is no "safe" non-empty default to assume here.
+    async fn trusted_substituters(&self, _tenant: &TenantId) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Whether a trusted substituter recently answered "not found" for this
+    /// hash part, within `crate::substitute`'s TTL — see
+    /// `substituter_negative_cache`. `false` by default: a store with no
+    /// negative-cache concept never short-circuits a lookup.
+    async fn substituter_negative_cache_hit(&self, _tenant: &TenantId, _hash_part: &str) -> bool {
+        false
+    }
+
+    /// Record that every one of `tenant`'s trusted substituters answered
+    /// "not found" for `hash_part`, so `crate::substitute` does not
+    /// re-query them again until the entry ages out.
+    async fn mark_substituter_miss(&self, _tenant: &TenantId, _hash_part: &str) {}
 
     /// Note that a path was read — either its metadata (`queryPathInfo`, a
     /// narinfo) or its bytes (`narFromPath`, a NAR fetch). PLAN.md Phase 12:
@@ -467,7 +553,23 @@ struct Inner {
     /// trait's own default (`true`) applies; tests flip this to exercise the
     /// quarantine path.
     reject_unverified_pushes: Option<bool>,
+    /// Override for [`PathStore::trusted_substituters`]. Empty (the trait's
+    /// own default) unless a test sets it via
+    /// [`MemoryStore::set_trusted_substituters`].
+    substituters: Vec<(String, String)>,
+    /// Which `(url, public_key)` sourced each `Tier::Substituted` path in
+    /// this partition — what `find_substituted_by_hash_part` reports back.
+    substituted_from: HashMap<StorePath, (String, String)>,
+    /// Hash parts every trusted substituter recently answered "not found"
+    /// for, and when — mirrors `substituter_negative_cache`.
+    negative_cache: HashMap<String, std::time::Instant>,
 }
+
+/// Matches the Postgres backing's own default
+/// (`KUBERNIX_SUBSTITUTER_NEGATIVE_CACHE_TTL`'s unset value) — kept as one
+/// constant here since `MemoryStore` has no env-configuration path of its
+/// own.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// Object key for a path's compressed NAR.
 ///
@@ -486,13 +588,50 @@ struct Inner {
 /// one object rather than paying for it twice. Sharing the bytes is not
 /// sharing validity: each tenant's `store_paths` row is unaffected, and
 /// `key_is_permitted` still decides who may fetch this key.
+///
+/// `Substituted` is **not** given `Verified`'s bare, unprefixed key, even
+/// though it is also meant to be shared across tenants — see
+/// [`substituted_nar_key`] instead. `Verified`'s sharing is safe *because*
+/// that tier is content-addressed (the path name is a function of the
+/// bytes); a `Substituted` path is an ordinary, typically input-addressed
+/// store path fetched from a substituter whose signature kubernix
+/// deliberately does not check (`crate::substitute`), so nothing here
+/// guarantees two fetches of the same hash part are the same bytes unless
+/// they came from the *same configured source*. Using the bare key would
+/// let one source's (possibly wrong or malicious) claim for a hash part
+/// silently win over another's via `objects`' `ON CONFLICT (key) DO
+/// NOTHING` — exactly the cache-poisoning shape this type's own tiers exist
+/// to prevent.
 pub fn nar_key(tenant: &TenantId, tier: Tier, store_path: &StorePath) -> Option<ObjectKey> {
     let hash = store_path.hash_part()?;
     Some(ObjectKey::new(match tier {
         Tier::Verified => format!("nar/{hash}.nar.zst"),
         Tier::Built => format!("{tenant}/nar/{hash}.nar.zst"),
         Tier::Quarantined => format!("{tenant}/untrusted/nar/{hash}.nar.zst"),
+        // Never actually reached: `Substituted` objects are always keyed via
+        // `substituted_nar_key` instead, which needs the source substituter
+        // as well as the tenant. Kept as an explicit, tenant-scoped fallback
+        // (not `unreachable!()`) so a caller that mistakenly reaches this
+        // path fails safely — no cross-tenant sharing by accident — rather
+        // than panicking.
+        Tier::Substituted => format!("{tenant}/untrusted-substituted/nar/{hash}.nar.zst"),
     }))
+}
+
+/// Object key for a `Tier::Substituted` path, shared across every tenant
+/// configured with the same source substituter — `source_slug` is the same
+/// per-substituter slug `server/src/http.rs`'s `/upstream/<slug>/…` route
+/// uses (derived from the substituter's URL host), so two tenants trusting
+/// `cache.nixos.org` share one object even though they never see each
+/// other's `store_paths` rows directly. A different source (even one that
+/// happens to answer for the same hash part) gets a different prefix, so it
+/// can never silently collide with another source's claim for that path —
+/// see [`nar_key`]'s own doc comment for why that matters here specifically.
+pub fn substituted_nar_key(source_slug: &str, store_path: &StorePath) -> Option<ObjectKey> {
+    let hash = store_path.hash_part()?;
+    Some(ObjectKey::new(format!(
+        "substituted/{source_slug}/nar/{hash}.nar.zst"
+    )))
 }
 
 /// Object key for a job's archived build log — mirrors the formula
@@ -543,6 +682,24 @@ impl MemoryStore {
     pub fn set_reject_unverified_pushes(&self, tenant: &TenantId, reject: bool) {
         self.write(tenant, |inner| {
             inner.reject_unverified_pushes = Some(reject)
+        });
+    }
+
+    /// Test-only override for [`PathStore::trusted_substituters`]. Real
+    /// stores read this from the `tenant_substituters` table instead.
+    #[cfg(test)]
+    pub fn set_trusted_substituters(&self, tenant: &TenantId, substituters: Vec<(String, String)>) {
+        self.write(tenant, |inner| inner.substituters = substituters);
+    }
+
+    /// Test-only: back-date a negative-cache entry so it reads as expired,
+    /// without actually sleeping past [`NEGATIVE_CACHE_TTL`] in a test.
+    #[cfg(test)]
+    pub fn expire_negative_cache_entry(&self, tenant: &TenantId, hash_part: &str) {
+        self.write(tenant, |inner| {
+            if let Some(at) = inner.negative_cache.get_mut(hash_part) {
+                *at = std::time::Instant::now() - NEGATIVE_CACHE_TTL - Duration::from_secs(1);
+            }
         });
     }
 }
@@ -708,6 +865,81 @@ impl PathStore for MemoryStore {
             inner.reject_unverified_pushes.unwrap_or(true)
         })
     }
+
+    async fn trusted_substituters(&self, tenant: &TenantId) -> Vec<(String, String)> {
+        self.read(tenant, |inner| inner.substituters.clone())
+    }
+
+    async fn record_substituted_path(
+        &self,
+        tenant: &TenantId,
+        info: PathInfo,
+        object: RemoteObject,
+        source_url: &str,
+        source_key: &str,
+    ) -> Result<()> {
+        let path = info.path.clone();
+        self.record_path(tenant, info, object, Tier::Substituted)
+            .await?;
+        self.write(tenant, |inner| {
+            inner
+                .substituted_from
+                .insert(path, (source_url.to_string(), source_key.to_string()))
+        });
+        Ok(())
+    }
+
+    async fn find_substituted_by_hash_part(
+        &self,
+        hash_part: &str,
+    ) -> Option<(PathInfo, RemoteObject, String, String)> {
+        let inner = self.inner.lock().unwrap();
+        for partition in inner.values() {
+            let Some((path, info)) = partition
+                .paths
+                .iter()
+                .find(|(p, _)| p.hash_part() == Some(hash_part))
+            else {
+                continue;
+            };
+            if partition.tiers.get(path) != Some(&Tier::Substituted) {
+                continue;
+            }
+            let Some(object) = partition.remote.get(path).cloned() else {
+                continue;
+            };
+            let Some((url, key)) = partition.substituted_from.get(path).cloned() else {
+                continue;
+            };
+            return Some((info.clone(), object, url, key));
+        }
+        None
+    }
+
+    async fn substituted_source(
+        &self,
+        tenant: &TenantId,
+        path: &StorePath,
+    ) -> Option<(String, String)> {
+        self.read(tenant, |inner| inner.substituted_from.get(path).cloned())
+    }
+
+    async fn substituter_negative_cache_hit(&self, tenant: &TenantId, hash_part: &str) -> bool {
+        self.read(tenant, |inner| {
+            inner
+                .negative_cache
+                .get(hash_part)
+                .is_some_and(|at| at.elapsed() < NEGATIVE_CACHE_TTL)
+        })
+    }
+
+    async fn mark_substituter_miss(&self, tenant: &TenantId, hash_part: &str) {
+        self.write(tenant, |inner| {
+            inner
+                .negative_cache
+                .insert(hash_part.to_string(), std::time::Instant::now())
+        });
+    }
 }
 
 #[async_trait::async_trait]
@@ -751,10 +983,23 @@ mod tests {
 
     #[test]
     fn tier_round_trips_through_display_and_from_str() {
-        for tier in [Tier::Verified, Tier::Built, Tier::Quarantined] {
+        for tier in [
+            Tier::Verified,
+            Tier::Built,
+            Tier::Quarantined,
+            Tier::Substituted,
+        ] {
             let parsed: Tier = tier.to_string().parse().unwrap();
             assert_eq!(parsed, tier);
         }
+    }
+
+    #[test]
+    fn substituted_is_not_vouchable() {
+        // Unlike Verified/Built: kubernix never signs or re-attests
+        // substituted content, so it must not be treated as vouchable even
+        // though it is, unlike Quarantined, trusted enough to serve.
+        assert!(!Tier::Substituted.is_vouchable());
     }
 
     #[test]
@@ -780,6 +1025,85 @@ mod tests {
         assert!(!store.reject_unverified_pushes(&alice).await);
         // Untouched tenants keep the stricter default.
         assert!(store.reject_unverified_pushes(&bob).await);
+    }
+
+    #[tokio::test]
+    async fn trusted_substituters_is_empty_by_default() {
+        let store = MemoryStore::new();
+        assert!(
+            store
+                .trusted_substituters(&tenant("alice"))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_substituters_can_be_set_per_tenant() {
+        let store = MemoryStore::new();
+        let (alice, bob) = (tenant("alice"), tenant("bob"));
+        store.set_trusted_substituters(
+            &alice,
+            vec![(
+                "https://cache.nixos.org".to_string(),
+                "cache.nixos.org-1:key".to_string(),
+            )],
+        );
+
+        assert_eq!(store.trusted_substituters(&alice).await.len(), 1);
+        // Untouched tenants keep the empty default -- no cross-tenant leak.
+        assert!(store.trusted_substituters(&bob).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn substituted_paths_are_found_across_tenants_with_their_source() {
+        let store = MemoryStore::new();
+        let alice = tenant("alice");
+        store
+            .record_substituted_path(
+                &alice,
+                info(P),
+                object("substituted/cache.nixos.org/nar/x"),
+                "https://cache.nixos.org",
+                "cache.nixos.org-1:key",
+            )
+            .await
+            .unwrap();
+
+        let (found_info, _object, url, key) = store
+            .find_substituted_by_hash_part(&"0".repeat(32))
+            .await
+            .expect("alice's substituted row");
+        assert_eq!(found_info.path, p());
+        assert_eq!(url, "https://cache.nixos.org");
+        assert_eq!(key, "cache.nixos.org-1:key");
+
+        assert!(
+            store
+                .find_substituted_by_hash_part("deadbeef")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_cache_hits_until_it_expires() {
+        let store = MemoryStore::new();
+        let t = tenant("alice");
+        assert!(!store.substituter_negative_cache_hit(&t, "abc").await);
+
+        store.mark_substituter_miss(&t, "abc").await;
+        assert!(store.substituter_negative_cache_hit(&t, "abc").await);
+        // Untouched hash parts and tenants are unaffected.
+        assert!(!store.substituter_negative_cache_hit(&t, "xyz").await);
+        assert!(
+            !store
+                .substituter_negative_cache_hit(&tenant("bob"), "abc")
+                .await
+        );
+
+        store.expire_negative_cache_entry(&t, "abc");
+        assert!(!store.substituter_negative_cache_hit(&t, "abc").await);
     }
 
     fn info(path: &str) -> PathInfo {

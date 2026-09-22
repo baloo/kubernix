@@ -59,6 +59,19 @@ struct BuildRequest {
   # Nak the message instead of building it -- see `worker/src/main.rs`.
   # PLAN.md Phase 17.
   requiredFeatures @8 :List(Text);
+  # This tenant's configured trusted substituters (server/src/substitute.rs),
+  # baked into the build VM's guest nix.conf so its own nix-daemon substitutes
+  # only through kubernix -- never directly from an external URL -- and
+  # therefore always ends up correctly tiered (Built vs Substituted) rather
+  # than kubernix having to guess after the fact. Sent with every job, not
+  # just at VM boot, since a warm VM's already-running guest-agent might
+  # otherwise miss a tenant's most recently added/removed substituter.
+  trustedSubstituters @9 :List(TrustedSubstituter);
+}
+
+struct TrustedSubstituter {
+  url       @0 :Text;
+  publicKey @1 :Text;
 }
 
 struct BuildResponse {

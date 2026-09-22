@@ -43,6 +43,7 @@ pub mod rpc_error;
 pub mod ssh;
 pub mod store;
 pub mod store_path;
+pub mod substitute;
 pub mod tenant;
 pub mod tenant_view;
 pub mod uploads;
