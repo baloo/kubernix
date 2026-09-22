@@ -15,7 +15,8 @@ use russh::{Channel, ChannelId};
 
 use crate::daemon_capnp::bootstrap;
 use crate::daemon_rpc::{BootstrapImpl, Config as RpcConfig};
-use crate::tenant::{KeyType, Tenant};
+use crate::store::Store;
+use crate::tenant::{KeyType, Tenant, TenantId};
 
 /// Whether a client that offers no key at all may still connect.
 ///
@@ -226,6 +227,34 @@ impl Handler for SshHandler {
         let command = String::from_utf8_lossy(data).to_string();
         let handle = session.handle();
 
+        // A small, deliberately non-`--stdio` exec a plain `ssh` invocation
+        // can use (no Lix/capnp needed) to learn this tenant's own signing
+        // key and configured trusted substituters before ever starting Nix —
+        // see `nix/client-image.nix`'s entrypoint, which runs this to build
+        // its own `nix.conf` `substituters`/`trusted-public-keys` rather
+        // than requiring an operator to hand-configure `KUBERNIX_TRUSTED_
+        // PUBLIC_KEY` and knowing nothing at all about per-tenant mirrors.
+        // Matched *before* `is_stdio_request` since it is intentionally a
+        // different exec entirely, not a daemon-protocol variant.
+        if command.trim() == "kubernix-whoami" {
+            self.channels.remove(&channel_id);
+            let Some(tenant) = self.tenant.clone() else {
+                tracing::error!("exec before authentication");
+                session.channel_failure(channel_id)?;
+                return Ok(());
+            };
+            session.channel_success(channel_id)?;
+            let store = self.rpc_config.store.clone();
+            tokio::spawn(async move {
+                let body = whoami_response(store.as_ref(), &tenant.id).await;
+                let _ = handle.data(channel_id, body.into_bytes()).await;
+                let _ = handle.eof(channel_id).await;
+                let _ = handle.exit_status_request(channel_id, 0).await;
+                let _ = handle.close(channel_id).await;
+            });
+            return Ok(());
+        }
+
         // `remote-program` is a client-side setting, so the binary name is not
         // reliably `nix-daemon`. Match on the `--stdio` flag instead.
         if !is_stdio_request(&command) {
@@ -361,9 +390,37 @@ fn is_stdio_request(command: &str) -> bool {
     command.split_whitespace().any(|arg| arg == "--stdio")
 }
 
+/// The `kubernix-whoami` exec's response body: one fact per line, space-
+/// separated fields, no quoting needed (a tenant id, a `name:base64` key,
+/// and a URL are all whitespace-free by construction) — trivial for a plain
+/// shell script to parse with `read -r`.
+///
+/// ```text
+/// tenant <tenant-id>
+/// key <this tenant's own trusted-public-keys entry>
+/// substituter <slug> <url> <public-key>
+/// substituter <slug> <url> <public-key>
+/// ```
+///
+/// `<slug>` is the same one `server/src/http.rs`'s `/<tenant>/upstream/
+/// <slug>/…` route answers to (`crate::substitute::slug_for`) — handed over
+/// ready-to-use rather than making every consumer re-derive it.
+async fn whoami_response(store: &dyn Store, tenant: &TenantId) -> String {
+    let mut out = format!("tenant {tenant}\n");
+    if let Some(signer) = store.signer(tenant).await {
+        out.push_str(&format!("key {}\n", signer.public_key_string()));
+    }
+    for (url, public_key) in store.trusted_substituters(tenant).await {
+        let slug = crate::substitute::slug_for(&url);
+        out.push_str(&format!("substituter {slug} {url} {public_key}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::PathStore;
 
     const OFFERED: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z";
@@ -424,5 +481,37 @@ mod tests {
         assert!(!is_stdio_request(""));
         // must be a distinct argument, not a substring
         assert!(!is_stdio_request("evil --stdiofoo"));
+    }
+
+    #[tokio::test]
+    async fn whoami_response_lists_the_tenants_own_key_and_substituters() {
+        let store = crate::store::MemoryStore::new();
+        let t = Tenant::from_ssh("whoami-test", None, false).id;
+        store.set_trusted_substituters(
+            &t,
+            vec![(
+                "https://cache.nixos.org".to_string(),
+                "cache.nixos.org-1:AAAA".to_string(),
+            )],
+        );
+        // Establishes this tenant's signing key, mirroring how a real
+        // connection's first path-recording call would.
+        let own_key = store.signer(&t).await.unwrap().public_key_string();
+
+        let body = whoami_response(store.as_ref(), &t).await;
+
+        assert!(body.starts_with(&format!("tenant {t}\n")));
+        assert!(body.contains(&format!("key {own_key}\n")));
+        assert!(body.contains(
+            "substituter cache.nixos.org https://cache.nixos.org cache.nixos.org-1:AAAA\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn whoami_response_has_no_substituter_lines_when_none_are_configured() {
+        let store = crate::store::MemoryStore::new();
+        let t = Tenant::from_ssh("whoami-no-subs", None, false).id;
+        let body = whoami_response(store.as_ref(), &t).await;
+        assert!(!body.contains("substituter"));
     }
 }
