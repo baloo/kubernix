@@ -53,6 +53,18 @@ enum Command {
         r#type: CliKeyType,
         key_id: String,
     },
+    /// List a tenant's trusted substituters.
+    ListSubstituters { tenant: TenantIdArg },
+    /// Add a trusted substituter to a tenant.
+    AddSubstituter {
+        tenant: TenantIdArg,
+        url: String,
+        /// A `trusted-public-keys`-shaped entry, e.g.
+        /// `cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=`.
+        public_key: String,
+    },
+    /// Remove a trusted substituter from a tenant.
+    RemoveSubstituter { tenant: TenantIdArg, url: String },
 }
 
 /// A separate enum from `KeyType`, not that type reused with `#[derive(ValueEnum)]`:
@@ -110,6 +122,17 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let store = PostgresStore::connect(&database_url, ServingRole::Admin)
         .await
         .wrap_err("connecting to PostgreSQL")?;
+    // Seeded into every tenant `add-tenant` creates from here on — see
+    // `admin::add_tenant`'s own doc comment. Unset means no default, not
+    // that seeding silently no-ops in a surprising way: an operator running
+    // `add-tenant` without these set simply gets a tenant with no
+    // substituters configured, same as before this feature existed.
+    if let (Ok(url), Ok(key)) = (
+        std::env::var("KUBERNIX_DEFAULT_SUBSTITUTER_URL"),
+        std::env::var("KUBERNIX_DEFAULT_SUBSTITUTER_KEY"),
+    ) {
+        store.set_default_substituter(url, key);
+    }
 
     match cli.command {
         Command::ListTenants => list_tenants(&store).await,
@@ -122,6 +145,15 @@ async fn main() -> color_eyre::eyre::Result<()> {
         } => add_credential(&store, &tenant.0, r#type.into(), &material).await,
         Command::DeleteCredential { r#type, key_id } => {
             delete_credential(&store, r#type.into(), &key_id).await
+        }
+        Command::ListSubstituters { tenant } => list_substituters(&store, &tenant.0).await,
+        Command::AddSubstituter {
+            tenant,
+            url,
+            public_key,
+        } => add_substituter(&store, &tenant.0, &url, &public_key).await,
+        Command::RemoveSubstituter { tenant, url } => {
+            remove_substituter(&store, &tenant.0, &url).await
         }
     }
 }
@@ -179,6 +211,44 @@ async fn delete_credential(
         println!("deleted credential {key_id}");
     } else {
         bail!("no such credential: {key_id}");
+    }
+    Ok(())
+}
+
+async fn list_substituters(store: &PostgresStore, tenant: &TenantId) -> eyre::Result<()> {
+    let substituters = admin::list_substituters(store, tenant).await?;
+    if substituters.is_empty() {
+        println!("no substituters");
+        return Ok(());
+    }
+    println!("{:<40} public_key", "url");
+    for s in substituters {
+        println!("{:<40} {}", s.url, s.public_key);
+    }
+    Ok(())
+}
+
+async fn add_substituter(
+    store: &PostgresStore,
+    tenant: &TenantId,
+    url: &str,
+    public_key: &str,
+) -> eyre::Result<()> {
+    admin::add_substituter(store, tenant, url, public_key).await?;
+    println!("added substituter {url:?} for tenant {tenant}");
+    Ok(())
+}
+
+async fn remove_substituter(
+    store: &PostgresStore,
+    tenant: &TenantId,
+    url: &str,
+) -> eyre::Result<()> {
+    let removed = admin::remove_substituter(store, tenant, url).await?;
+    if removed {
+        println!("removed substituter {url:?} from tenant {tenant}");
+    } else {
+        bail!("no such substituter: {url:?}");
     }
     Ok(())
 }

@@ -33,6 +33,8 @@ pub enum AdminError {
     CredentialExists { key_type: KeyType, key_id: String },
     #[error("parsing the SSH public key: {0}")]
     InvalidSshKey(String),
+    #[error("tenant {tenant:?} already has substituter {url:?} configured")]
+    SubstituterExists { tenant: TenantId, url: String },
 }
 
 type Result<T> = std::result::Result<T, AdminError>;
@@ -102,10 +104,108 @@ pub async fn add_tenant(store: &PostgresStore, name: &str) -> Result<TenantId> {
         .await;
 
     match result {
-        Ok(_) => Ok(id),
+        Ok(_) => {
+            seed_default_substituter(store, &id).await?;
+            Ok(id)
+        }
         Err(e) if is_code(&e, UNIQUE_VIOLATION) => Err(AdminError::TenantExists(id)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Insert `store`'s configured default substituter (if any) for a
+/// freshly-created tenant — the `kubernix-admin` counterpart of
+/// `PostgresStore::ensure_tenant`'s own seeding, needed because this path
+/// writes `tenants` directly rather than through `ensure_tenant`. `ON
+/// CONFLICT DO NOTHING` for the same reason as there: idempotent against a
+/// retried call, and never re-inserted if an operator has since edited or
+/// removed it.
+async fn seed_default_substituter(store: &PostgresStore, tenant: &TenantId) -> Result<()> {
+    let Some((url, public_key)) = store.default_substituter.lock().unwrap().clone() else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO tenant_substituters (tenant, url, public_key) VALUES ($1, $2, $3)
+         ON CONFLICT (tenant, url) DO NOTHING",
+    )
+    .bind(tenant.as_str())
+    .bind(&url)
+    .bind(&public_key)
+    .execute(&store.pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct SubstituterSummary {
+    pub url: String,
+    pub public_key: String,
+}
+
+/// Every trusted substituter configured for `tenant`, oldest first.
+pub async fn list_substituters(
+    store: &PostgresStore,
+    tenant: &TenantId,
+) -> Result<Vec<SubstituterSummary>> {
+    let rows = sqlx::query(
+        "SELECT url, public_key FROM tenant_substituters WHERE tenant = $1 ORDER BY created_at",
+    )
+    .bind(tenant.as_str())
+    .fetch_all(&store.pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SubstituterSummary {
+            url: row.get("url"),
+            public_key: row.get("public_key"),
+        })
+        .collect())
+}
+
+/// Add a trusted substituter to `tenant`.
+pub async fn add_substituter(
+    store: &PostgresStore,
+    tenant: &TenantId,
+    url: &str,
+    public_key: &str,
+) -> Result<()> {
+    let result = sqlx::query(
+        "INSERT INTO tenant_substituters (tenant, url, public_key) VALUES ($1, $2, $3)",
+    )
+    .bind(tenant.as_str())
+    .bind(url)
+    .bind(public_key)
+    .execute(&store.pool)
+    .await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) if is_code(&e, UNIQUE_VIOLATION) => Err(AdminError::SubstituterExists {
+            tenant: tenant.clone(),
+            url: url.to_string(),
+        }),
+        Err(e) if is_code(&e, FOREIGN_KEY_VIOLATION) => {
+            Err(AdminError::NoSuchTenant(tenant.clone()))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Remove a trusted substituter from `tenant`. Returns whether a row
+/// actually existed to remove.
+pub async fn remove_substituter(
+    store: &PostgresStore,
+    tenant: &TenantId,
+    url: &str,
+) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM tenant_substituters WHERE tenant = $1 AND url = $2")
+        .bind(tenant.as_str())
+        .bind(url)
+        .execute(&store.pool)
+        .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +456,100 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AdminError::CredentialExists { .. }));
+
+        cleanup_tenant(&id).await;
+    }
+
+    #[tokio::test]
+    async fn add_substituter_for_an_unknown_tenant_is_rejected() {
+        let Some(store) = db().await else { return };
+        let id = tenant("no-such-tenant-sub");
+
+        let err = add_substituter(
+            &store,
+            &id,
+            "https://cache.nixos.org",
+            "cache.nixos.org-1:key",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AdminError::NoSuchTenant(_)));
+    }
+
+    #[tokio::test]
+    async fn add_list_then_remove_a_substituter() {
+        let Some(store) = db().await else { return };
+        let id = add_tenant(&store, "test-admin-sub-lifecycle")
+            .await
+            .unwrap();
+
+        add_substituter(
+            &store,
+            &id,
+            "https://cache.nixos.org",
+            "cache.nixos.org-1:key",
+        )
+        .await
+        .unwrap();
+
+        let subs = list_substituters(&store, &id).await.unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].url, "https://cache.nixos.org");
+
+        let removed = remove_substituter(&store, &id, "https://cache.nixos.org")
+            .await
+            .unwrap();
+        assert!(removed);
+
+        let subs = list_substituters(&store, &id).await.unwrap();
+        assert!(subs.is_empty());
+
+        let removed_again = remove_substituter(&store, &id, "https://cache.nixos.org")
+            .await
+            .unwrap();
+        assert!(!removed_again, "already gone");
+
+        cleanup_tenant(&id).await;
+    }
+
+    #[tokio::test]
+    async fn adding_the_same_substituter_twice_is_rejected() {
+        let Some(store) = db().await else { return };
+        let id = add_tenant(&store, "test-admin-sub-dup").await.unwrap();
+
+        add_substituter(
+            &store,
+            &id,
+            "https://cache.nixos.org",
+            "cache.nixos.org-1:key",
+        )
+        .await
+        .unwrap();
+        let err = add_substituter(
+            &store,
+            &id,
+            "https://cache.nixos.org",
+            "cache.nixos.org-1:key",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AdminError::SubstituterExists { .. }));
+
+        cleanup_tenant(&id).await;
+    }
+
+    #[tokio::test]
+    async fn add_tenant_seeds_the_configured_default_substituter() {
+        let Some(store) = db().await else { return };
+        store.set_default_substituter(
+            "https://cache.nixos.org".to_string(),
+            "cache.nixos.org-1:key".to_string(),
+        );
+
+        let id = add_tenant(&store, "test-admin-default-sub").await.unwrap();
+        let subs = list_substituters(&store, &id).await.unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].url, "https://cache.nixos.org");
 
         cleanup_tenant(&id).await;
     }
