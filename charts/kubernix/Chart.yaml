@@ -6,7 +6,7 @@ description: >-
   (via CloudNativePG) and NATS JetStream.
 type: application
 version: 0.1.0
-appVersion: "0.1.23"
+appVersion: "0.1.25"
 home: https://github.com/baloo/kubernix
 dependencies:
   # Installs the CloudNativePG operator (cluster-scoped CRDs + controller).
