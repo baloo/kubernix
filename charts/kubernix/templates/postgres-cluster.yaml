@@ -1,4 +1,4 @@
-{{- if and .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
+{{- if and (eq (include "kubernix.postgresOperator" .) "cnpg") .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
 # Streaming replication: `instances` PostgreSQL pods, one primary and
 # (instances - 1) synchronous/async standbys, managed entirely by the CNPG
 # operator (failover, switchover, replica reattachment). See

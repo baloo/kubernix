@@ -8,12 +8,14 @@ JetStream.
 
 ## Dependencies
 
-- **PostgreSQL**, via the [CloudNativePG](https://cloudnative-pg.io/) operator
-  and its [Barman Cloud plugin](https://github.com/cloudnative-pg/plugin-barman-cloud)
-  — gives the `Cluster` this chart creates streaming replication
-  (`postgres.instances`, 1 primary + N standbys) and continuous WAL archiving
-  + scheduled base backups to the same S3-compatible store Kubernix already
-  uses (`postgres.backup.*`).
+- **PostgreSQL**, via either the [CloudNativePG](https://cloudnative-pg.io/)
+  operator and its [Barman Cloud plugin](https://github.com/cloudnative-pg/plugin-barman-cloud)
+  (`postgres.operator: cnpg`, the default), or an already-installed Zalando
+  Postgres Operator (`postgres.operator: zalando`). CNPG mode creates
+  `Cluster`/`ObjectStore`/`ScheduledBackup` resources and can bundle the
+  operator dependencies below. Zalando mode creates an `acid.zalan.do/v1`
+  `postgresql` resource and expects that operator to already be installed
+  cluster-wide.
 - **[cert-manager](https://cert-manager.io/)**, bundled alongside the two
   above under its own `certManager.enabled` condition: `plugin-barman-cloud`
   always creates a self-signed `Issuer`/`Certificate` for its webhook/CNPG-I
@@ -51,6 +53,12 @@ install, not something every application release should bring its own copy of.
   `kubernix_app`/`kubernix_gc`'s passwords — it expects cert-manager, the operator, and the plugin
   to already be running cluster-wide. With `keda` false, it expects KEDA's CRDs/controller to
   already be registered before `worker.autoscaling.enabled` is turned on.
+- **Shared cluster with Zalando Postgres Operator**: set `postgres.operator: zalando`,
+  `certManager.enabled: false`, and `cnpg.enabled: false`. The chart creates only a namespaced
+  Zalando `postgresql` resource plus the Kubernix app resources; it reads the bootstrap credentials
+  from the Zalando-generated `<user>.<cluster>.credentials.postgresql.acid.zalan.do` Secret. WAL-G
+  backups use the same `postgres.backup.s3` endpoint/bucket/credentials block as CNPG mode, with
+  the Zalando-specific schedule and retention count under `postgres.zalando.backup`.
 
 ## Known v1 limitations
 

@@ -53,6 +53,11 @@ s3:
   secretAccessKey: minioadmin
 
 postgres:
+  # Which operator-specific Postgres custom resource this chart should render.
+  # `cnpg` keeps the chart's original CloudNativePG behaviour. `zalando` uses
+  # the Zalando Postgres Operator's acid.zalan.do/v1 `postgresql` resource and
+  # expects that operator/CRD to already exist cluster-wide.
+  operator: cnpg
   cluster:
     # Gates the Cluster/ObjectStore/ScheduledBackup CRs themselves,
     # independently of cnpg.enabled (which gates the operator/plugin/
@@ -69,6 +74,17 @@ postgres:
   storage:
     size: 10Gi
     storageClass: ""
+  zalando:
+    teamId: ""
+    version: "16"
+    superuser: kubernix
+    parameters: {}
+    backup:
+      # Spilo/Zalando uses a plain 5-field cron expression for BACKUP_SCHEDULE,
+      # unlike CNPG's seconds-first schedule above.
+      schedule: "00 02 * * *"
+      numberToRetain: 7
+      s3ForcePathStyle: true
   backup:
     # CNPG ScheduledBackup cron (note: seconds-first, like
     # github.com/robfig/cron, not a plain 5-field k8s CronJob schedule).

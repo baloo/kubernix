@@ -1,0 +1,63 @@
+{{- if and (eq (include "kubernix.postgresOperator" .) "zalando") .Values.postgres.cluster.enabled }}
+{{- $backupS3 := include "kubernix.postgresBackupS3" . | fromJson }}
+{{- $backupPath := .Values.postgres.backup.path | trimAll "/" }}
+apiVersion: acid.zalan.do/v1
+kind: postgresql
+metadata:
+  name: {{ include "kubernix.postgresCluster" . }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+spec:
+  teamId: {{ .Values.postgres.zalando.teamId | default .Release.Name | quote }}
+  numberOfInstances: {{ .Values.postgres.instances }}
+  volume:
+    size: {{ .Values.postgres.storage.size | quote }}
+    {{- with .Values.postgres.storage.storageClass }}
+    storageClass: {{ . | quote }}
+    {{- end }}
+  users:
+    {{ .Values.postgres.zalando.superuser }}:
+      - superuser
+  databases:
+    kubernix: {{ .Values.postgres.zalando.superuser }}
+  env:
+    - name: WAL_S3_BUCKET
+      value: {{ $backupS3.bucket | quote }}
+    - name: WAL_BUCKET_SCOPE_PREFIX
+      value: {{ ternary (printf "%s/" $backupPath) "" (ne $backupPath "") | quote }}
+    - name: AWS_ENDPOINT
+      value: {{ $backupS3.endpoint | quote }}
+    - name: AWS_REGION
+      valueFrom:
+        secretKeyRef:
+          name: {{ $backupS3.regionSecretName }}
+          key: region
+    - name: AWS_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: {{ $backupS3.secretName }}
+          key: accessKeyId
+    - name: AWS_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: {{ $backupS3.secretName }}
+          key: secretAccessKey
+    - name: AWS_S3_FORCE_PATH_STYLE
+      value: {{ .Values.postgres.zalando.backup.s3ForcePathStyle | quote }}
+    - name: USE_WALG_BACKUP
+      value: "true"
+    - name: USE_WALG_RESTORE
+      value: "true"
+    - name: CLONE_USE_WALG_RESTORE
+      value: "true"
+    - name: BACKUP_SCHEDULE
+      value: {{ .Values.postgres.zalando.backup.schedule | quote }}
+    - name: BACKUP_NUM_TO_RETAIN
+      value: {{ .Values.postgres.zalando.backup.numberToRetain | quote }}
+  postgresql:
+    version: {{ .Values.postgres.zalando.version | quote }}
+    {{- with .Values.postgres.zalando.parameters }}
+    parameters:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}

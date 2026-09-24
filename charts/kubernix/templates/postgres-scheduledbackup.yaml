@@ -1,4 +1,4 @@
-{{- if and .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
+{{- if and (eq (include "kubernix.postgresOperator" .) "cnpg") .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
 apiVersion: postgresql.cnpg.io/v1
 kind: ScheduledBackup
 metadata:

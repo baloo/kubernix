@@ -1,4 +1,4 @@
-{{- if and .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
+{{- if and (eq (include "kubernix.postgresOperator" .) "cnpg") .Values.cnpg.enabled .Values.postgres.cluster.enabled }}
 {{- $backupS3 := include "kubernix.postgresBackupS3" . | fromJson }}
 # Continuous WAL archiving + base backups, via the Barman Cloud CNPG-I
 # plugin (see Chart.yaml's plugin-barman-cloud dependency). Independently

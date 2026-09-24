@@ -79,6 +79,10 @@ Service names (<cluster>-superuser, <cluster>-rw, ...) agrees on one value.
 {{- printf "%s-postgres" (include "kubernix.fullname" .) -}}
 {{- end -}}
 
+{{- define "kubernix.postgresOperator" -}}
+{{- .Values.postgres.operator | default "cnpg" -}}
+{{- end -}}
+
 {{/*
 env entries every server-image container needs to reach S3 — lifted from
 nix/module.nix's `s3Env`/`s3Options`. A single named template so sshd, cache
@@ -170,6 +174,8 @@ false, true)`, zero symbols), so no URI-escaping concern either place.
 */}}
 {{- define "kubernix.databaseUrlEnv" -}}
 {{- $cluster := include "kubernix.postgresCluster" . }}
+{{- $operator := include "kubernix.postgresOperator" . }}
+{{- if eq $operator "cnpg" }}
 - name: PGSUPERUSER
   valueFrom:
     secretKeyRef:
@@ -187,4 +193,22 @@ false, true)`, zero symbols), so no URI-escaping concern either place.
       key: host
 - name: DATABASE_URL
   value: "postgresql://$(PGSUPERUSER):$(PGSUPERPASSWORD)@$(PGSUPERHOST):5432/kubernix"
+{{- else if eq $operator "zalando" }}
+- name: PGSUPERUSER
+  valueFrom:
+    secretKeyRef:
+      name: {{ printf "%s.%s.credentials.postgresql.acid.zalan.do" .Values.postgres.zalando.superuser $cluster }}
+      key: username
+- name: PGSUPERPASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ printf "%s.%s.credentials.postgresql.acid.zalan.do" .Values.postgres.zalando.superuser $cluster }}
+      key: password
+- name: PGSUPERHOST
+  value: {{ $cluster | quote }}
+- name: DATABASE_URL
+  value: "postgresql://$(PGSUPERUSER):$(PGSUPERPASSWORD)@$(PGSUPERHOST):5432/kubernix"
+{{- else }}
+{{- fail (printf "postgres.operator must be one of cnpg or zalando, got %q" $operator) }}
+{{- end }}
 {{- end -}}
