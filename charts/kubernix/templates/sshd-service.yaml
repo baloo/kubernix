@@ -4,6 +4,10 @@ metadata:
   name: {{ printf "%s-sshd" (include "kubernix.fullname" .) }}
   labels:
     {{- include "kubernix.labels" . | nindent 4 }}
+  {{- with .Values.sshd.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   # TCP passthrough only — SSH/daemon-protocol has no HTTP semantics for an
   # Ingress controller to route on, hence LoadBalancer/NodePort rather than

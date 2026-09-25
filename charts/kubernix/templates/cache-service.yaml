@@ -4,6 +4,10 @@ metadata:
   name: {{ printf "%s-cache" (include "kubernix.fullname" .) }}
   labels:
     {{- include "kubernix.labels" . | nindent 4 }}
+  {{- with .Values.cache.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.cache.service.type }}
   selector:
