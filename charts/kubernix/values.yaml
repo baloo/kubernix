@@ -203,6 +203,7 @@ sshd:
   service:
     type: LoadBalancer
     port: 22
+    annotations: {}
   resources: {}
   nodeSelector: {}
   tolerations: []
@@ -215,6 +216,7 @@ cache:
   service:
     type: ClusterIP
     port: 3000
+    annotations: {}
   ingress:
     enabled: false
     className: ""
