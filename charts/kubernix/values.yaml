@@ -52,6 +52,43 @@ s3:
   accessKeyId: minioadmin
   secretAccessKey: minioadmin
 
+# Extra CA trust for outbound TLS to the S3 endpoint (e.g. one on a private
+# PKI), applied to every component that talks to it: worker, sshd, cache,
+# gc. The chart doesn't render or opinionate on the cert material itself --
+# supply exactly one volume + matching volumeMount (any source: configMap,
+# secret, an `image` volume mounting an OCI image directly (k8s 1.31+),
+# csi, ...), and the chart splices them into each pod/container as-is and
+# points SSL_CERT_DIR at extraCaCertsPath, which combines with the Mozilla
+# bundle already baked into every image (nix/images.nix's SSL_CERT_FILE)
+# via rustls-native-certs -- both the worker's reqwest client and server's
+# aws-sdk-s3 client resolve trust through that same crate. Leave
+# extraCaVolumes empty (the default) to change nothing.
+tls:
+  extraCaCertsPath: /etc/kubernix/extra-ca-certs
+  extraCaVolumes: []
+  extraCaVolumeMounts: []
+  # Example using a consumer-managed ConfigMap:
+  # extraCaVolumes:
+  #   - name: extra-ca-certs
+  #     configMap:
+  #       name: my-private-ca-certs
+  # extraCaVolumeMounts:
+  #   - name: extra-ca-certs
+  #     mountPath: /etc/kubernix/extra-ca-certs
+  #     readOnly: true
+  #
+  # Example using a native `image` volume (k8s 1.31+), if the CA bundle is
+  # packaged as its own OCI image:
+  # extraCaVolumes:
+  #   - name: extra-ca-certs
+  #     image:
+  #       reference: registry.example.com/private-ca-bundle:latest
+  #       pullPolicy: IfNotPresent
+  # extraCaVolumeMounts:
+  #   - name: extra-ca-certs
+  #     mountPath: /etc/kubernix/extra-ca-certs
+  #     readOnly: true
+
 postgres:
   # Which operator-specific Postgres custom resource this chart should render.
   # `cnpg` keeps the chart's original CloudNativePG behaviour. `zalando` uses

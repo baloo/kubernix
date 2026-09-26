@@ -106,6 +106,9 @@ spec:
               value: {{ .Values.worker.systemFeatures | join "," | quote }}
             - name: RUST_LOG
               value: debug
+            {{- with .Values.tls.extraCaVolumeMounts }}
+            {{- include "kubernix.extraCaEnv" $ | nindent 12 }}
+            {{- end }}
           # $HOME and KUBERNIX_NIX_STORE both point under here — baked into
           # the image itself (nix/images.nix), not set here, since they're a
           # property of how this image runs a worker at all, not something
@@ -113,6 +116,9 @@ spec:
           volumeMounts:
             - name: state
               mountPath: /var/lib/kubernix-worker
+            {{- with .Values.tls.extraCaVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           resources:
             # `devices.kubevirt.io/kvm`-style extended resource, merged with
             # (and overridable by) worker.resources — this is what actually
@@ -136,6 +142,9 @@ spec:
         # cold-cache cost, not a correctness problem.
         - name: state
           emptyDir: {}
+        {{- with .Values.tls.extraCaVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.worker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

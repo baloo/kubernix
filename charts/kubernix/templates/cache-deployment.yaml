@@ -36,6 +36,13 @@ spec:
               value: {{ .Values.cache.cachePriority | quote }}
             - name: RUST_LOG
               value: debug
+            {{- with .Values.tls.extraCaVolumeMounts }}
+            {{- include "kubernix.extraCaEnv" $ | nindent 12 }}
+            {{- end }}
+          {{- with .Values.tls.extraCaVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           # TCP, not an HTTP path probe: every route in server/src/http.rs is
           # nested under `/{tenant}/...` (see its `router()`), so there is no
           # tenant-agnostic path that returns 200 to probe against — the port
@@ -48,6 +55,10 @@ spec:
               port: http
           resources:
             {{- toYaml .Values.cache.resources | nindent 12 }}
+      {{- with .Values.tls.extraCaVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.cache.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
