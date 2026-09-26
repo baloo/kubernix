@@ -109,6 +109,23 @@ and gc can't drift from each other.
 {{- end -}}
 
 {{/*
+SSL_CERT_DIR env entry pointing at tls.extraCaCertsPath, emitted only when
+a consumer has actually supplied tls.extraCaVolumeMounts -- shared by every
+Deployment that terminates outbound TLS to the S3 endpoint (worker, sshd,
+cache, gc). All of them resolve trust through rustls-native-certs under the
+hood (reqwest's rustls_platform_verifier for the worker,
+aws-smithy-http-client's rustls provider for the rest -- confirmed by
+reading both crates' source, not assumed), which is what makes one shared
+env var work identically for all four.
+*/}}
+{{- define "kubernix.extraCaEnv" -}}
+{{- if .Values.tls.extraCaVolumeMounts }}
+- name: SSL_CERT_DIR
+  value: {{ .Values.tls.extraCaCertsPath | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Resolves postgres.backup.s3's per-field fallback onto the top-level s3:
 block (see values.yaml's comment on postgres.backup.s3), plus the two
 Secret names the backup ObjectStore and its own secret-postgres-backup-s3*

@@ -62,10 +62,16 @@ spec:
             {{- end }}
             - name: RUST_LOG
               value: debug
+            {{- with .Values.tls.extraCaVolumeMounts }}
+            {{- include "kubernix.extraCaEnv" $ | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: host-key
               mountPath: /etc/kubernix/ssh
               readOnly: true
+            {{- with .Values.tls.extraCaVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml .Values.sshd.resources | nindent 12 }}
       volumes:
@@ -73,6 +79,9 @@ spec:
           secret:
             secretName: {{ printf "%s-sshd-hostkey" (include "kubernix.fullname" .) }}
             defaultMode: 0400
+        {{- with .Values.tls.extraCaVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.sshd.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -50,8 +50,19 @@ spec:
               value: {{ .Values.jobs.resultsRetention | quote }}
             - name: RUST_LOG
               value: debug
+            {{- with .Values.tls.extraCaVolumeMounts }}
+            {{- include "kubernix.extraCaEnv" $ | nindent 12 }}
+            {{- end }}
+          {{- with .Values.tls.extraCaVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.gc.resources | nindent 12 }}
+      {{- with .Values.tls.extraCaVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.gc.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
