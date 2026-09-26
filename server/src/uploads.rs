@@ -11,9 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3::presigning::PresigningConfig;
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::byte_stream::ByteStream;
+use bytes::Bytes;
 use eyre::Context as _;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
+use http_body::Frame;
+use http_body_util::StreamBody;
 
+use kubernix_types::body::SizedBody;
 use kubernix_types::errors::public_message;
 use kubernix_types::{CapabilityToken, ObjectKey};
 
@@ -139,6 +145,35 @@ impl UploadSigner {
             .await
             .wrap_err_with(|| format!("uploading {key}"))?;
         tracing::debug!(%key, bytes = len, "uploaded object");
+        Ok(())
+    }
+
+    /// Write an object from a stream of already-known total length, without
+    /// ever buffering it whole.
+    ///
+    /// Used by `crate::substitute::fetch_one` to relay a substituted NAR
+    /// straight from the upstream substituter's response into S3 — `len`
+    /// comes from that response's own `Content-Length`, which is exactly
+    /// what this object ends up being, since nothing here recompresses.
+    pub async fn put_object_stream(
+        &self,
+        key: &ObjectKey,
+        body: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + Unpin + 'static,
+        len: u64,
+    ) -> eyre::Result<()> {
+        let framed = StreamBody::new(body.map(|chunk| chunk.map(Frame::data)));
+        let sized = SizedBody::new(framed, len);
+        let byte_stream = ByteStream::new(SdkBody::from_body_1_x(sized));
+        self.s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key.as_str())
+            .content_length(len as i64)
+            .body(byte_stream)
+            .send()
+            .await
+            .wrap_err_with(|| format!("uploading {key}"))?;
+        tracing::debug!(%key, bytes = len, "uploaded object (streamed)");
         Ok(())
     }
 

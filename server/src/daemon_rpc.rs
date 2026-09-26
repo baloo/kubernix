@@ -36,7 +36,7 @@ use crate::tenant::Tenant;
 use crate::tenant::TenantId;
 use crate::tenant_view::TenantView;
 use crate::uploads::UploadSigner;
-use kubernix_types::{StorePath, System, derivation};
+use kubernix_types::{Compression, StorePath, System, derivation};
 use uuid::Uuid;
 
 /// The identifier Lix asks for is `"lix/legacy/" PACKAGE_VERSION`, so it varies
@@ -413,6 +413,7 @@ impl LegacyProtocolImpl {
                         key: info.key.clone(),
                         file_size: info.file_size,
                         file_hash: info.file_hash,
+                        compression: info.compression,
                     },
                     Tier::Built,
                 )
@@ -959,10 +960,11 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             })?;
 
             tracing::debug!(%path, key = %remote.key, "streaming from the object store");
-            let mut reader = uploader
+            let reader = uploader
                 .get_object_reader(&remote.key)
                 .await
                 .map_err(|e| e.into_capnp_error("fetching a store path"))?;
+            let reader = tokio::io::BufReader::new(reader);
 
             // Fetched, decompressed and forwarded a chunk at a time. Nothing
             // here scales with the size of the NAR — the old version held the
@@ -974,37 +976,31 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
             // awaiting a `Send` future from a `!Send` task is fine (NOTES.md
             // item 7), so this needs no extra threading.
             const CHUNK: usize = 64 * 1024;
-            let mut decoder = zstd::stream::write::Decoder::new(Vec::new())
-                .map_err(|e| eyre::Report::new(e).into_capnp_error("decompressing a store path"))?;
+            let mut decoded: Box<dyn tokio::io::AsyncRead + Send + Unpin> = match remote.compression
+            {
+                Compression::None => Box::new(reader),
+                Compression::Zstd => {
+                    Box::new(async_compression::tokio::bufread::ZstdDecoder::new(reader))
+                }
+                Compression::Xz => {
+                    Box::new(async_compression::tokio::bufread::XzDecoder::new(reader))
+                }
+            };
             let mut buf = vec![0u8; CHUNK];
             let mut sent: u64 = 0;
 
             loop {
-                let read = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+                let read = tokio::io::AsyncReadExt::read(&mut decoded, &mut buf)
                     .await
-                    .map_err(|e| eyre::Report::new(e).into_capnp_error("reading a store path"))?;
+                    .map_err(|e| {
+                        eyre::Report::new(e).into_capnp_error("decompressing a store path")
+                    })?;
                 if read == 0 {
                     break;
                 }
-                std::io::Write::write_all(&mut decoder, &buf[..read]).map_err(|e| {
-                    eyre::Report::new(e).into_capnp_error("decompressing a store path")
-                })?;
-                let decoded = std::mem::take(decoder.get_mut());
-                if !decoded.is_empty() {
-                    sent += decoded.len() as u64;
-                    let mut request = into.feed_request();
-                    request.get().set_raw(&decoded);
-                    request.send().await?;
-                }
-            }
-
-            std::io::Write::flush(&mut decoder)
-                .map_err(|e| eyre::Report::new(e).into_capnp_error("decompressing a store path"))?;
-            let decoded = std::mem::take(decoder.get_mut());
-            if !decoded.is_empty() {
-                sent += decoded.len() as u64;
+                sent += read as u64;
                 let mut request = into.feed_request();
-                request.get().set_raw(&decoded);
+                request.get().set_raw(&buf[..read]);
                 request.send().await?;
             }
 
@@ -1576,6 +1572,7 @@ impl legacy_protocol::stream::Server for NarSink {
                     key: key.clone(),
                     file_size,
                     file_hash,
+                    compression: Compression::Zstd,
                 },
                 tier,
             )
@@ -1691,6 +1688,7 @@ mod tests {
             key: kubernix_types::ObjectKey::new(key),
             file_size: 0,
             file_hash: Default::default(),
+            compression: Compression::Zstd,
         }
     }
 
@@ -1977,7 +1975,7 @@ mod tests {
             file_hash: Default::default(),
             file_size: 0,
             key: kubernix_types::ObjectKey::new(key),
-            compression: "zstd".to_string(),
+            compression: Compression::Zstd,
             references: Vec::new(),
             deriver: None,
         }

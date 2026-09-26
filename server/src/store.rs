@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kubernix_signing::{LocalSigner, Signer, key_name_for};
-use kubernix_types::{ObjectKey, StorePath};
+use kubernix_types::{Compression, ObjectKey, StorePath};
 use sha2::{Sha256, digest::Output};
 use uuid::Uuid;
 
@@ -654,6 +654,12 @@ pub struct RemoteObject {
     /// states and what a client checks the download against. Distinct from
     /// `PathInfo::nar_hash`, which describes the uncompressed NAR.
     pub file_hash: Output<Sha256>,
+    /// What `file_hash`/`file_size` describe the bytes of. A `Built` output
+    /// is always [`Compression::Zstd`] (the worker always compresses); a
+    /// `Substituted` one is whatever the upstream substituter served, stored
+    /// unmodified rather than recompressed -- see
+    /// `crate::substitute::fetch_one`.
+    pub compression: Compression,
 }
 
 impl MemoryStore {
@@ -1128,6 +1134,7 @@ mod tests {
             key: ObjectKey::new(key),
             file_size: 3,
             file_hash: Output::<Sha256>::from([1u8; 32]),
+            compression: Compression::Zstd,
         }
     }
 

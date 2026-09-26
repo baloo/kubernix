@@ -1,0 +1,11 @@
+-- Every object used to be a zstd-compressed bare NAR, unconditionally --
+-- `crate::substitute::fetch_one` recompressed anything pulled from a trusted
+-- substituter before storing it. That recompression step is gone: objects
+-- fetched through the pull-through cache are now stored exactly as the
+-- upstream substituter served them (verified, not re-encoded), so the
+-- compression an object actually uses is no longer implied -- it has to be
+-- recorded.
+--
+-- Existing rows were all written under the old zstd-only invariant, so the
+-- default correctly labels them without a backfill.
+ALTER TABLE objects ADD COLUMN compression TEXT NOT NULL DEFAULT 'zstd';

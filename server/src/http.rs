@@ -47,7 +47,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 
-use kubernix_types::{ObjectKey, StorePath};
+use kubernix_types::{Compression, ObjectKey, StorePath};
 
 use crate::store::{PathInfo, PathStore};
 use crate::tenant::TenantId;
@@ -198,6 +198,7 @@ async fn narinfo(
             &remote.key,
             remote.file_size,
             &remote.file_hash,
+            remote.compression,
             &state.store_dir,
         ),
     )
@@ -213,6 +214,7 @@ fn render_narinfo(
     object_key: &ObjectKey,
     file_size: u64,
     file_hash: &[u8],
+    compression: Compression,
     store_dir: &str,
 ) -> String {
     let mut out = String::new();
@@ -223,7 +225,7 @@ fn render_narinfo(
         "URL: nar/{}\n",
         object_key_basename(object_key.as_str())
     ));
-    out.push_str("Compression: zstd\n");
+    out.push_str(&format!("Compression: {}\n", compression.as_str()));
     out.push_str(&format!(
         "FileHash: sha256:{}\n",
         kubernix_signing::base32::encode(file_hash)
@@ -404,6 +406,7 @@ async fn upstream_narinfo(
             &remote.key,
             remote.file_size,
             &remote.file_hash,
+            remote.compression,
             &state.store_dir,
         ),
     )
@@ -510,6 +513,7 @@ mod tests {
             &ObjectKey::new("tenant/nar/abc.nar.zst"),
             1024,
             &[0xcd; 32],
+            Compression::Zstd,
             "/nix/store",
         )
     }
@@ -530,6 +534,23 @@ mod tests {
         assert_eq!(field(&body, "NarSize"), Some("4096"));
         assert_eq!(field(&body, "FileSize"), Some("1024"));
         assert_eq!(field(&body, "Sig"), Some("kubernix-t-1:AAAA"));
+    }
+
+    #[test]
+    fn the_compression_field_reflects_the_objects_actual_compression() {
+        // A substituted object is stored exactly as its upstream substituter
+        // served it -- not recompressed to zstd -- so `render_narinfo` must
+        // report whatever `RemoteObject::compression` actually says, not a
+        // hardcoded value.
+        let body = render_narinfo(
+            &info(),
+            &ObjectKey::new("tenant/nar/abc.nar.xz"),
+            1024,
+            &[0xcd; 32],
+            Compression::Xz,
+            "/nix/store",
+        );
+        assert_eq!(field(&body, "Compression"), Some("xz"));
     }
 
     #[test]
@@ -583,6 +604,7 @@ mod tests {
             &ObjectKey::new("t/nar/x.nar.zst"),
             1,
             &[0xcd; 32],
+            Compression::Zstd,
             "/nix/store",
         );
         assert!(!body.contains("Sig:"));
@@ -660,6 +682,7 @@ mod tests {
                     key: ObjectKey::new("substituted/cache.nixos.org/nar/x.nar.zst"),
                     file_size: 10,
                     file_hash: sha2::Sha256::digest([0u8; 1]),
+                    compression: Compression::Zstd,
                 },
                 &url,
                 &key,
@@ -718,6 +741,7 @@ mod tests {
                     key: ObjectKey::new("substituted/cache.nixos.org/nar/x.nar.zst"),
                     file_size: 10,
                     file_hash: sha2::Sha256::digest([0u8; 1]),
+                    compression: Compression::Zstd,
                 },
                 &url_a,
                 &key_a,

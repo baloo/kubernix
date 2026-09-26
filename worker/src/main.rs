@@ -1187,7 +1187,7 @@ impl Job {
                 out.set_file_hash(&artifact.file_hash);
                 out.set_file_size(artifact.file_size);
                 out.set_key(artifact.key.as_str());
-                out.set_compression("zstd");
+                out.set_compression(kubernix_types::Compression::Zstd.as_str());
                 out.set_deriver(
                     artifact
                         .deriver

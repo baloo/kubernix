@@ -17,7 +17,7 @@ use std::time::Duration;
 use async_nats::jetstream::{self, consumer::pull, stream::RetentionPolicy};
 use eyre::{Context as _, OptionExt as _};
 use futures_util::StreamExt;
-use kubernix_types::{CapabilityToken, ObjectKey, StorePath, System};
+use kubernix_types::{CapabilityToken, Compression, ObjectKey, StorePath, System};
 use sha2::{Sha256, digest::Output};
 use uuid::Uuid;
 
@@ -111,7 +111,7 @@ pub struct OutputInfo {
     pub file_hash: Output<Sha256>,
     pub file_size: u64,
     pub key: ObjectKey,
-    pub compression: String,
+    pub compression: Compression,
     pub references: Vec<StorePath>,
     pub deriver: Option<StorePath>,
 }
@@ -370,7 +370,7 @@ pub fn decode_outcome(payload: &[u8]) -> eyre::Result<JobOutcome> {
                     file_hash: Output::<Sha256>::try_from(info.get_file_hash()?)?,
                     file_size: info.get_file_size(),
                     key: ObjectKey::new(info.get_key()?.to_string()?),
-                    compression: info.get_compression()?.to_string()?,
+                    compression: info.get_compression()?.to_str()?.parse()?,
                     references,
                     deriver: (!deriver.is_empty()).then_some(StorePath::new(deriver)),
                 });
