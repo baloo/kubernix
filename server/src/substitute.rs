@@ -23,11 +23,18 @@
 //! [`PathStore::find_substituted_by_hash_part`] before ever making a network
 //! call — see each function's own doc comment.
 
-use std::sync::OnceLock;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
+use tokio_stream::wrappers::ReceiverStream;
 
-use kubernix_types::StorePath;
+use kubernix_types::{Compression, StorePath};
 
 use crate::store::{Hash, HashType, PathInfo, PathStore, RemoteObject, substituted_nar_key};
 use crate::tenant::TenantId;
@@ -210,6 +217,31 @@ enum FetchError {
     Upload(#[from] eyre::Report),
 }
 
+/// Feeds every byte written through it into a `Sha256` hasher shared with the
+/// caller, and discards it -- the sink end of the decompression chain
+/// [`fetch_one`] uses to verify a narinfo's claimed `NarHash` without ever
+/// materializing the decompressed NAR.
+struct HashSink(Arc<Mutex<Sha256>>);
+
+impl tokio::io::AsyncWrite for HashSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.0.lock().unwrap().update(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Fetch and cache one path from one substituter. `Ok(None)` is a plain
 /// miss (404 -- try the next substituter); `Err` is anything else, logged by
 /// the caller and also treated as a miss for this substituter.
@@ -234,41 +266,97 @@ async fn fetch_one(
 
     let path = StorePath::from_full(store_dir, &narinfo.store_path)
         .ok_or(FetchError::Malformed("StorePath"))?;
+    let compression: Compression = narinfo
+        .compression
+        .parse()
+        .map_err(|_| FetchError::UnsupportedCompression(narinfo.compression.clone()))?;
 
     let nar_url = if narinfo.url.contains("://") {
         narinfo.url.clone()
     } else {
         format!("{base}/{}", narinfo.url)
     };
-    let compressed = http_client()
+    let resp = http_client()
         .get(&nar_url)
         .send()
         .await?
-        .error_for_status()?
-        .bytes()
-        .await?
-        .to_vec();
+        .error_for_status()?;
+    // The exact length of what we're about to relay, and -- since nothing
+    // here recompresses -- exactly the length of what ends up stored, so
+    // there is no need to learn it by buffering first.
+    let len = resp
+        .content_length()
+        .ok_or(FetchError::Malformed("missing Content-Length"))?;
 
-    let raw = match narinfo.compression.as_str() {
-        "none" => compressed,
-        "zstd" => zstd::stream::decode_all(compressed.as_slice())
-            .map_err(|_| FetchError::Malformed("nar body did not decode as zstd"))?,
-        other => return Err(FetchError::UnsupportedCompression(other.to_string())),
+    let key = substituted_nar_key(&slug_for(url), &path).ok_or(FetchError::Malformed("path"))?;
+
+    // `nar_hasher` verifies the narinfo's claimed `NarHash` (of the
+    // *decompressed* NAR) by hashing the decoder's output as it passes
+    // through, never keeping it. `file_hasher` hashes the raw, still-
+    // compressed bytes -- the same ones forwarded to the upload channel
+    // below -- since that is what `RemoteObject::file_hash` describes and
+    // it can no longer be computed after the fact from a `recompressed`
+    // buffer that no longer exists.
+    let nar_hasher = Arc::new(Mutex::new(Sha256::new()));
+    let mut decoder: Box<dyn tokio::io::AsyncWrite + Send + Unpin> = match compression {
+        Compression::None => Box::new(HashSink(nar_hasher.clone())),
+        Compression::Zstd => Box::new(async_compression::tokio::write::ZstdDecoder::new(HashSink(
+            nar_hasher.clone(),
+        ))),
+        Compression::Xz => Box::new(async_compression::tokio::write::XzDecoder::new(HashSink(
+            nar_hasher.clone(),
+        ))),
+    };
+    let mut file_hasher = Sha256::new();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(4);
+    let upload = uploader.put_object_stream(&key, ReceiverStream::new(rx), len);
+
+    let verify_and_forward = async {
+        let mut body = resp.bytes_stream();
+        // The digest can only be known once every byte has passed through
+        // the decoder, i.e. exactly when the network stream ends -- so the
+        // most recently read chunk is held back by one step instead of
+        // forwarded immediately, and only sent on once the hash below is
+        // confirmed good. On a mismatch it is never sent at all, which
+        // leaves the upload's body short of the `Content-Length` declared
+        // above and fails the PUT outright -- no object is ever created, so
+        // there is nothing to delete.
+        let mut pending: Option<Bytes> = None;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            file_hasher.update(&chunk);
+            decoder
+                .write_all(&chunk)
+                .await
+                .map_err(|_| FetchError::Malformed("nar body did not decode"))?;
+            if let Some(previous) = pending.replace(chunk)
+                && tx.send(Ok(previous)).await.is_err()
+            {
+                return Err(FetchError::Upload(eyre::eyre!(
+                    "upload stream ended before the download did"
+                )));
+            }
+        }
+        decoder
+            .shutdown()
+            .await
+            .map_err(|_| FetchError::Malformed("nar body did not decode"))?;
+
+        let nar_hash = nar_hasher.lock().unwrap().clone().finalize();
+        if nar_hash.as_slice() != narinfo.nar_hash.as_slice() {
+            drop(tx);
+            return Err(FetchError::HashMismatch);
+        }
+        if let Some(last) = pending {
+            let _ = tx.send(Ok(last)).await;
+        }
+        Ok(file_hasher.finalize())
     };
 
-    if Sha256::digest(&raw).as_slice() != narinfo.nar_hash.as_slice() {
-        return Err(FetchError::HashMismatch);
-    }
-
-    // Kubernix's own object store holds zstd-compressed bare NARs only
-    // (`server/migrations/20260811_initial_schema.sql`'s doc comment on
-    // `objects`) -- recompressing here, rather than storing whatever
-    // compression the substituter used, is what lets every other route
-    // (`http::render_narinfo`) keep assuming `Compression: zstd` uniformly.
-    let recompressed =
-        zstd::stream::encode_all(raw.as_slice(), 3).map_err(|e| FetchError::Upload(e.into()))?;
-    let key = substituted_nar_key(&slug_for(url), &path).ok_or(FetchError::Malformed("path"))?;
-    uploader.put_object(&key, recompressed.clone()).await?;
+    let (verified, uploaded) = tokio::join!(verify_and_forward, upload);
+    let file_hash = verified?;
+    uploaded?;
 
     let info = PathInfo {
         path,
@@ -285,8 +373,9 @@ async fn fetch_one(
     };
     let object = RemoteObject {
         key,
-        file_size: recompressed.len() as u64,
-        file_hash: Sha256::digest(&recompressed),
+        file_size: len,
+        file_hash,
+        compression,
     };
     let _ = public_key; // recorded by the caller alongside `url`, not used here.
     Ok(Some((info, object)))
@@ -411,5 +500,31 @@ Sig: another-1:BBBB\n";
     fn a_narinfo_missing_a_required_field_is_rejected() {
         let broken = "URL: nar/abc.nar.zst\nNarHash: sha256:0000000000000000000000000000000000000000000000000000\nNarSize: 1\n";
         assert!(ParsedNarinfo::parse(broken).is_err());
+    }
+
+    #[test]
+    fn parses_an_xz_compressed_narinfo() {
+        let narinfo = NARINFO.replace("nar/abc.nar.zst", "nar/abc.nar.xz");
+        let narinfo = narinfo.replace("Compression: zstd", "Compression: xz");
+        let parsed = ParsedNarinfo::parse(&narinfo).unwrap();
+        assert_eq!(parsed.url, "nar/abc.nar.xz");
+        assert_eq!(parsed.compression, "xz");
+        assert_eq!(
+            parsed.compression.parse::<Compression>().unwrap(),
+            Compression::Xz
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_compression_is_not_a_parse_error() {
+        // `ParsedNarinfo::parse` never rejects an unknown `Compression:` value
+        // itself -- only `fetch_one`'s later `.parse::<Compression>()` does,
+        // once it actually needs to decode the bytes. A narinfo naming a
+        // format kubernix doesn't understand should still parse, so the
+        // caller can log the real hash part/URL before giving up.
+        let narinfo = NARINFO.replace("Compression: zstd", "Compression: bzip2");
+        let parsed = ParsedNarinfo::parse(&narinfo).unwrap();
+        assert_eq!(parsed.compression, "bzip2");
+        assert!(parsed.compression.parse::<Compression>().is_err());
     }
 }

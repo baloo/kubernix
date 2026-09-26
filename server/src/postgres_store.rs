@@ -478,12 +478,13 @@ impl PostgresStore {
         let mut txn = self.tenant_scoped(tenant).await.map_err(db_err)?;
 
         sqlx::query(
-            "INSERT INTO objects (key, file_size, file_hash) VALUES ($1, $2, $3)
+            "INSERT INTO objects (key, file_size, file_hash, compression) VALUES ($1, $2, $3, $4)
              ON CONFLICT (key) DO NOTHING",
         )
         .bind(object.key.as_str())
         .bind(object.file_size as i64)
         .bind(&object.file_hash[..])
+        .bind(object.compression.as_str())
         .execute(&mut *txn)
         .await
         .map_err(db_err)?;
@@ -692,7 +693,7 @@ impl PostgresStore {
             .inspect_err(|e| tracing::error!(error = %e, %tenant, %path, "could not open a tenant-scoped transaction"))
             .ok()?;
         let row = sqlx::query(
-            "SELECT o.key, o.file_size, o.file_hash
+            "SELECT o.key, o.file_size, o.file_hash, o.compression
                FROM store_paths_live sp JOIN objects o ON o.key = sp.object_key
               WHERE sp.tenant = $1 AND sp.path = $2",
         )
@@ -710,6 +711,10 @@ impl PostgresStore {
             file_size: row.get::<i64, _>("file_size") as u64,
             file_hash: Output::<Sha256>::try_from(row.get::<Vec<u8>, _>("file_hash").as_slice())
                 .expect("file_hash column is always a sha256 digest"),
+            compression: row
+                .get::<String, _>("compression")
+                .parse()
+                .expect("compression column is always a value this binary wrote"),
         })
     }
 
@@ -744,7 +749,7 @@ impl PostgresStore {
             .ok()?;
         let row = sqlx::query(
             "SELECT sp.*, o.key AS obj_key, o.file_size AS obj_file_size,
-                    o.file_hash AS obj_file_hash
+                    o.file_hash AS obj_file_hash, o.compression AS obj_compression
                FROM store_paths_live sp JOIN objects o ON o.key = sp.object_key
               WHERE sp.tier = 'verified' AND sp.hash_part = $1
               LIMIT 1",
@@ -764,6 +769,10 @@ impl PostgresStore {
                 row.get::<Vec<u8>, _>("obj_file_hash").as_slice(),
             )
             .expect("file_hash column is always a sha256 digest"),
+            compression: row
+                .get::<String, _>("obj_compression")
+                .parse()
+                .expect("compression column is always a value this binary wrote"),
         };
         Some((Self::row_to_info(&row), object))
     }
@@ -941,7 +950,7 @@ impl PostgresStore {
             .ok()?;
         let row = sqlx::query(
             "SELECT sp.*, o.key AS obj_key, o.file_size AS obj_file_size,
-                    o.file_hash AS obj_file_hash
+                    o.file_hash AS obj_file_hash, o.compression AS obj_compression
                FROM store_paths_live sp JOIN objects o ON o.key = sp.object_key
               WHERE sp.tier = 'substituted' AND sp.hash_part = $1
               LIMIT 1",
@@ -961,6 +970,10 @@ impl PostgresStore {
                 row.get::<Vec<u8>, _>("obj_file_hash").as_slice(),
             )
             .expect("file_hash column is always a sha256 digest"),
+            compression: row
+                .get::<String, _>("obj_compression")
+                .parse()
+                .expect("compression column is always a value this binary wrote"),
         };
         let url: String = row.get("substituted_from_url");
         let key: String = row.get("substituted_from_key");
@@ -2196,6 +2209,7 @@ impl TenantAuthStore for PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kubernix_types::Compression;
 
     #[test]
     fn extracts_the_hash_part() {
@@ -2298,6 +2312,7 @@ mod tests {
             key: ObjectKey::new(key),
             file_size: 3,
             file_hash: Output::<Sha256>::from([9u8; 32]),
+            compression: Compression::Zstd,
         }
     }
 
@@ -2402,6 +2417,7 @@ mod tests {
                     key: ObjectKey::new(key),
                     file_size: 99,
                     file_hash: Output::<Sha256>::from([0xcdu8; 32]),
+                    compression: Compression::Zstd,
                 },
                 Tier::Built,
             )
@@ -2733,6 +2749,7 @@ mod tests {
                     key: ObjectKey::new(shared_key),
                     file_size: 111,
                     file_hash: Output::<Sha256>::from([1u8; 32]),
+                    compression: Compression::Zstd,
                 },
                 Tier::Verified,
             )
@@ -2748,6 +2765,7 @@ mod tests {
                     key: ObjectKey::new(shared_key),
                     file_size: 222,
                     file_hash: Output::<Sha256>::from([2u8; 32]),
+                    compression: Compression::Zstd,
                 },
                 Tier::Verified,
             )

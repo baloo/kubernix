@@ -15,11 +15,12 @@ kubernix-daemon-protocol = { version = "0.1.0", path = "./daemon-protocol" }
 kubernix-signing = { version = "0.1.0", path = "./signing" }
 kubernix-types = { version = "0.1.0", path = "./types" }
 
-async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+async-compression = { version = "0.4", features = ["tokio", "zstd", "xz"] }
 async-nats = "0.50.0"
 async-trait = "0.1.92"
 aws-config = "1.10.1"
 aws-sdk-s3 = "1.140"
+bytes = "1"
 capnp = { version = "0.27", features = ["alloc", "std"] }
 color-eyre = "0.6.5"
 digest-io-async = { version = "0.1.0", features = ["tokio"] }

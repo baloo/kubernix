@@ -19,59 +19,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::io::InspectWriter;
 
+use kubernix_types::body::SizedBody;
 use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId};
 
 use crate::kubernix_capnp;
 
-/// A streaming request body that reports its exact length via `size_hint`.
+/// Build a `reqwest::Body` for a file of known length, spooled to disk.
 ///
 /// `reqwest::Body::wrap_stream` has no way to know how many bytes a stream
 /// will produce, so hyper falls back to `Transfer-Encoding: chunked` even
 /// when a `Content-Length` header is set by hand alongside it — and a
 /// pre-signed S3 PUT is signed for a fixed-length request, so a chunked one
-/// is rejected outright with `HTTP 400`. This wraps the same stream in a
-/// body that *does* report its length (already known here, from spooling to
-/// a file first), which is what makes hyper use `Content-Length` framing.
-/// Found against a real S3-compatible endpoint — the permissive local mock
-/// `nix/test.nix` uses never exercised the difference, so Phase 5b's
-/// streaming rewrite looked complete without it.
-struct SizedBody<B> {
-    inner: B,
-    len: u64,
-}
-
-impl<B> http_body::Body for SizedBody<B>
-where
-    B: http_body::Body + Unpin,
-{
-    type Data = B::Data;
-    type Error = B::Error;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        http_body::SizeHint::with_exact(self.len)
-    }
-}
-
-/// Build a `reqwest::Body` for a file of known length, spooled to disk —
-/// see [`SizedBody`]'s doc comment for why the length has to be declared
-/// through the body itself, not just the `Content-Length` header.
+/// is rejected outright with `HTTP 400`. [`SizedBody`] wraps the same stream
+/// in a body that *does* report its length (already known here, from
+/// spooling to a file first), which is what makes hyper use
+/// `Content-Length` framing. Found against a real S3-compatible endpoint —
+/// the permissive local mock `nix/test.nix` uses never exercised the
+/// difference, so Phase 5b's streaming rewrite looked complete without it.
 pub(crate) fn sized_file_body(file: tokio::fs::File, len: u64) -> reqwest::Body {
     let stream = tokio_util::io::ReaderStream::new(file).map(|chunk| chunk.map(Frame::data));
-    reqwest::Body::wrap(SizedBody {
-        inner: StreamBody::new(stream),
-        len,
-    })
+    reqwest::Body::wrap(SizedBody::new(StreamBody::new(stream), len))
 }
 
 /// Metadata the frontend needs to build a narinfo, which it cannot recompute

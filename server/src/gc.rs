@@ -497,6 +497,7 @@ mod tests {
     use super::*;
     use crate::store::{Hash, HashType, PathInfo, PathStore, RemoteObject, Tier};
     use crate::tenant::{Tenant, TenantId};
+    use kubernix_types::Compression;
     use serial_test::serial;
     use sha2::{Sha256, digest::Output};
 
@@ -562,6 +563,7 @@ mod tests {
             key: ObjectKey::new(key),
             file_size: 3,
             file_hash: Output::<Sha256>::from([9u8; 32]),
+            compression: Compression::Zstd,
         }
     }
 
@@ -771,6 +773,7 @@ mod tests {
                     key: key.clone(),
                     file_size: 8,
                     file_hash: Output::<Sha256>::from([0u8; 32]),
+                    compression: Compression::Zstd,
                 },
                 Tier::Built,
             )
@@ -820,6 +823,7 @@ mod tests {
                     key: key.clone(),
                     file_size: 8,
                     file_hash: Output::<Sha256>::from([0u8; 32]),
+                    compression: Compression::Zstd,
                 },
                 Tier::Built,
             )
@@ -855,6 +859,7 @@ mod tests {
                     key: key.clone(),
                     file_size: 8,
                     file_hash: Output::<Sha256>::from([0u8; 32]),
+                    compression: Compression::Zstd,
                 },
                 Tier::Built,
             )

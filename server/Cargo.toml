@@ -4,19 +4,25 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-compression.workspace = true
 async-nats.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
+aws-smithy-types = "1.6.1"
 axum = { version = "0.8.9", features = ["macros"] }
 base64 = "0.23.1"
+bytes.workspace = true
 capnp.workspace = true
 capnp-rpc = "0.27.0"
 clap = { version = "4.6.7", features = ["derive"] }
 color-eyre.workspace = true
+digest-io-async.workspace = true
 ed25519-dalek.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
+http-body = "1"
+http-body-util = "0.1"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 kubernix-signing.workspace = true
 kubernix-types.workspace = true
