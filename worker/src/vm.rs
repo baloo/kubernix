@@ -868,6 +868,26 @@ async fn dial_control_port(vsock_socket: &Path) -> eyre::Result<tokio::net::Unix
     Ok(stream)
 }
 
+/// Best-effort `chmod 0666 /dev/kvm`, run once before the boot probe opens
+/// it. Some nodes' `/dev/kvm` ships `0660` (owner `root`, group `kvm`)
+/// instead of the `0666` this chart otherwise assumes (see the module doc on
+/// `drop_privileges`) — the worker container runs as uid 0, which is
+/// `/dev/kvm`'s owner on every node seen so far, so this succeeds on file
+/// ownership alone and needs no `CAP_FOWNER` (not in this container's
+/// capability set). Never fatal: a node without `/dev/kvm` at all, or one
+/// where this still fails for some other reason, just falls through to the
+/// probe below failing in the usual non-fatal way.
+async fn ensure_kvm_world_writable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = Path::new("/dev/kvm");
+    match tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(error = ?e, "chmod 0666 /dev/kvm failed"),
+    }
+}
+
 /// Boots a disk-less, network-less, untenanted probe VM at worker startup to
 /// check whether nested virtualization actually reaches the guest — `/dev/kvm`
 /// presence alone (what the `devices.kubevirt.io/kvm` device plugin checks
@@ -893,6 +913,8 @@ async fn dial_control_port(vsock_socket: &Path) -> eyre::Result<tokio::net::Unix
 /// declares itself `kvm`-capable, and is still a fully useful plain/
 /// `big-parallel` worker. PLAN.md Phase 17.
 pub async fn boot_probe(config: &VmConfig) -> eyre::Result<u32> {
+    ensure_kvm_world_writable().await;
+
     let probe_dir = config.state_dir.join("probe");
     tokio::fs::create_dir_all(&probe_dir)
         .await
