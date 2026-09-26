@@ -840,6 +840,52 @@ pub async fn push_substituters(
     Ok(())
 }
 
+/// Push this deployment's extra trusted CA cert(s) (from `SSL_CERT_DIR`,
+/// wired to whatever a helm consumer supplies via `tls.extraCaVolumeMounts`
+/// — see `charts/kubernix/values.yaml`) to `guest-agent`'s control channel,
+/// so its *next* `nix-daemon` spawn (`spawn_nix_daemon`) merges them into
+/// the guest's own trust store. The guest's `nix-daemon` (Lix) only ever
+/// trusts a single `SSL_CERT_FILE`, fully replacing its default rather than
+/// merging a directory like `rustls-native-certs` does for this worker's
+/// own `reqwest` client — so `guest-agent` has to build a merged bundle
+/// itself; this only carries the *extra* cert material over, not a full
+/// bundle.
+///
+/// Sent on *every* job, exactly like [`push_substituters`] and for the same
+/// reason: a warm, already-running guest-agent process would otherwise
+/// never learn about a cert added (or removed, by a `helm upgrade` that
+/// drops `tls.extraCaVolumeMounts` again) after it booted. `pem` is empty
+/// whenever this deployment has no extra CA configured, which both clears
+/// any previously-pushed value and matches `spawn_nix_daemon`'s own
+/// behaviour when it has never received one at all.
+///
+/// Wire shape — one line: `CACERT <hex>\n`, hex-encoded (`encode_hex`, this
+/// module) rather than base64 to match every other binary payload this
+/// protocol already carries (`push_key`'s store key) without adding a new
+/// dependency to `guest-agent`, which is deliberately minimal.
+pub async fn push_ca_cert(vsock_socket: &Path, pem: &[u8]) -> eyre::Result<()> {
+    let mut stream = dial_control_port(vsock_socket).await?;
+
+    let message = format!("CACERT {}\n", encode_hex(pem));
+    stream
+        .write_all(message.as_bytes())
+        .await
+        .wrap_err("sending the CACERT control message")?;
+
+    let mut reply = Vec::new();
+    stream
+        .read_to_end(&mut reply)
+        .await
+        .wrap_err("reading the CACERT control reply")?;
+    if !reply.starts_with(b"OK") {
+        return Err(eyre!(
+            "guest-agent rejected the extra CA cert: {:?}",
+            String::from_utf8_lossy(&reply)
+        ));
+    }
+    Ok(())
+}
+
 /// Dial `vsock_socket`'s control-channel port and complete cloud-hypervisor's
 /// own `CONNECT <port>\n` -> `OK...` vsock proxy handshake, returning the
 /// still-open stream ready for a guest-agent control verb. Shared by

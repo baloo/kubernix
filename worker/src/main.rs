@@ -143,6 +143,61 @@ impl Job {
     }
 }
 
+/// Concatenates every regular file under `SSL_CERT_DIR` (if set) into one
+/// PEM blob -- mirrors `rustls-native-certs`' own directory-scan semantics
+/// (`load_pem_certs_from_dir`: resolve symlinks via `fs::metadata` rather
+/// than `lstat`, skip dangling ones, no filename/extension filtering) since
+/// that's the crate actually resolving trust for this process's own
+/// `reqwest`/`aws-sdk-s3`-style HTTP clients from that same env var.
+/// Symlink resolution matters here in practice, not just for parity: a
+/// Kubernetes ConfigMap/Secret volume mount presents every key as a symlink
+/// to `..data/<key>`, not a plain file -- `DirEntry::file_type()`'s `lstat`
+/// semantics would see only the symlink and skip every entry outright.
+/// Returns an empty `Vec` -- logged, not fatal -- whenever the var is
+/// unset, the directory can't be read, or it's simply empty; a deployment
+/// without `tls.extraCaVolumeMounts` configured never sets `SSL_CERT_DIR`
+/// at all, so this is the common case.
+fn read_extra_ca_pem() -> Vec<u8> {
+    let Ok(dir) = std::env::var("SSL_CERT_DIR") else {
+        return Vec::new();
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(%dir, error = %e, "SSL_CERT_DIR set but unreadable; pushing no extra CA cert to guests");
+            return Vec::new();
+        }
+    };
+
+    let mut pem = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            // A dangling symlink -- silently skipped, same as
+            // `rustls-native-certs`.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "statting an SSL_CERT_DIR entry failed");
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                pem.extend_from_slice(&bytes);
+                pem.push(b'\n');
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "reading an SSL_CERT_DIR entry failed")
+            }
+        }
+    }
+    pem
+}
+
 /// Parse a seconds-valued env var, falling back to `default` if it's unset
 /// or unparseable. Mirrors `kubernix-gc`/`kubernix-sshd`'s own copies of
 /// this -- small enough, and specific enough to each binary's own env var
@@ -209,6 +264,16 @@ async fn main() -> color_eyre::eyre::Result<()> {
         "KUBERNIX_JOB_RESULTS_RETENTION",
         std::time::Duration::from_secs(24 * 3600),
     );
+    // Same directory this process's own `reqwest`/`aws-sdk-s3`-style trust
+    // resolution already reads via `SSL_CERT_DIR` (set by the chart
+    // whenever a consumer supplies `tls.extraCaVolumeMounts`, see
+    // `charts/kubernix/values.yaml`) -- read once here too, so the exact
+    // same extra CA cert(s) this worker trusts for its own S3 traffic also
+    // get pushed into every tenant VM's guest-agent (`vm::push_ca_cert`),
+    // one source of truth either way. Empty when unset, unreadable, or an
+    // empty directory -- a deployment without this configured pushes
+    // nothing and every guest behaves exactly as before this existed.
+    let extra_ca_pem = read_extra_ca_pem();
 
     tracing::info!(%nats_url, %system, "starting worker");
     let client = async_nats::connect(&nats_url).await?;
@@ -420,6 +485,22 @@ async fn main() -> color_eyre::eyre::Result<()> {
                         Err(e) => tracing::warn!(
                             job_id = %job.job_id, tenant = %job.tenant, error = %e,
                             "could not push trusted substituters to the guest; it will substitute from none"
+                        ),
+                    }
+                    // Every job, unconditionally, same as push_substituters
+                    // just above and for the same reason -- an empty
+                    // `extra_ca_pem` still has to be sent so a warm guest
+                    // that already has a previously-pushed cert actually
+                    // gets it cleared if a later `helm upgrade` removes
+                    // `tls.extraCaVolumeMounts` again.
+                    match vm::push_ca_cert(&handle.vsock_socket, &extra_ca_pem).await {
+                        Ok(()) => tracing::info!(
+                            job_id = %job.job_id, tenant = %job.tenant,
+                            "pushed extra CA cert to the guest"
+                        ),
+                        Err(e) => tracing::warn!(
+                            job_id = %job.job_id, tenant = %job.tenant, error = %e,
+                            "could not push extra CA cert to the guest"
                         ),
                     }
                     match handle.connect().await {
