@@ -48,6 +48,32 @@ fn is_shared_verified_key(key: &ObjectKey) -> bool {
     hash.len() == 32 && kubernix_signing::base32::is_valid(hash)
 }
 
+/// A `Substituted` path's shared object key —
+/// `substituted/<slug>/nar/<hash>.nar.zst`, no tenant prefix — mirrors
+/// `crate::store::substituted_nar_key` for any configured substituter, not
+/// one in particular. Checked structurally, like [`is_shared_verified_key`]:
+/// a worker can only ever have been handed this key in the first place via
+/// `output_object`, which is scoped to store paths this tenant already has
+/// a row for, so granting the download proves nothing new.
+fn is_shared_substituted_key(key: &ObjectKey) -> bool {
+    let Some(rest) = key.as_str().strip_prefix("substituted/") else {
+        return false;
+    };
+    let Some((slug, rest)) = rest.split_once('/') else {
+        return false;
+    };
+    if slug.is_empty() {
+        return false;
+    }
+    let Some(hash) = rest
+        .strip_prefix("nar/")
+        .and_then(|r| r.strip_suffix(".nar.zst"))
+    else {
+        return false;
+    };
+    hash.len() == 32 && kubernix_signing::base32::is_valid(hash)
+}
+
 /// Keys a worker may be granted, for the tenant whose job it is running.
 ///
 /// This is the whole access-control boundary for the object store: workers hold
@@ -69,7 +95,10 @@ fn key_is_permitted(key: &ObjectKey, download: bool, tenant: &TenantId) -> bool 
     // content hash, so this grants nothing a tenant could not already prove
     // it has — never for upload, since only the frontend writes these
     // directly with its own credentials; a worker never should.
-    if download && is_shared_verified_key(key) {
+    //
+    // A `Substituted` object is shared the same way, across every tenant
+    // trusting the same source substituter — see `is_shared_substituted_key`.
+    if download && (is_shared_verified_key(key) || is_shared_substituted_key(key)) {
         return true;
     }
 
@@ -579,6 +608,63 @@ mod tests {
         // base32 omits (RFC 4648 has it; this is not that).
         assert!(!key_is_permitted(
             &ObjectKey::new(format!("nar/{}.nar.zst", "e".repeat(32))),
+            DOWNLOAD,
+            &t
+        ));
+    }
+
+    #[test]
+    fn a_substituted_objects_shared_key_is_downloadable_by_any_tenant() {
+        // Mirrors `a_verified_objects_shared_key_is_downloadable_by_any_tenant`:
+        // a `Substituted` object also carries no tenant prefix, shared by every
+        // tenant trusting the same source substituter.
+        let (alice, bob) = (tenant("alice"), tenant("bob"));
+        let shared = crate::store::substituted_nar_key("cache.nixos.org", &p()).unwrap();
+
+        assert!(key_is_permitted(&shared, DOWNLOAD, &alice));
+        assert!(key_is_permitted(&shared, DOWNLOAD, &bob));
+
+        // Never for upload: only `crate::substitute` writes these, with the
+        // frontend's own credentials.
+        assert!(!key_is_permitted(&shared, UPLOAD, &alice));
+        assert!(!key_is_permitted(&shared, UPLOAD, &bob));
+    }
+
+    #[test]
+    fn a_substituted_looking_key_must_still_be_a_real_hash() {
+        // Structural, not a blanket exemption for anything starting with
+        // `substituted/` — mirrors `a_shared_looking_key_must_still_be_a_real_hash`.
+        let t = tenant("alice");
+        // Missing slug.
+        assert!(!key_is_permitted(
+            &ObjectKey::new("substituted//nar/abc123.nar.zst"),
+            DOWNLOAD,
+            &t
+        ));
+        // No slug segment at all.
+        assert!(!key_is_permitted(
+            &ObjectKey::new("substituted/nar/abc123.nar.zst"),
+            DOWNLOAD,
+            &t
+        ));
+        // Missing `nar/` segment.
+        assert!(!key_is_permitted(
+            &ObjectKey::new("substituted/cache.nixos.org/abc123.nar.zst"),
+            DOWNLOAD,
+            &t
+        ));
+        // Traversal.
+        assert!(!key_is_permitted(
+            &ObjectKey::new("substituted/cache.nixos.org/nar/../../secrets"),
+            DOWNLOAD,
+            &t
+        ));
+        // Right length, wrong alphabet.
+        assert!(!key_is_permitted(
+            &ObjectKey::new(format!(
+                "substituted/cache.nixos.org/nar/{}.nar.zst",
+                "e".repeat(32)
+            )),
             DOWNLOAD,
             &t
         ));

@@ -136,7 +136,8 @@ async fn request_urls(
 
     let error = response.get_error_msg()?.to_string()?;
     if !error.is_empty() {
-        bail!("frontend refused upload: {error}");
+        let direction = if download { "download" } else { "upload" };
+        bail!("frontend refused {direction}: {error}");
     }
 
     let mut urls = Vec::new();
