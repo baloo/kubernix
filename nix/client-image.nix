@@ -27,6 +27,7 @@ let
       : "''${KUBERNIX_SSH_KEY:=/run/secrets/kubernix-ssh-key}"
       : "''${KUBERNIX_SYSTEMS:=x86_64-linux,aarch64-linux}"
       : "''${KUBERNIX_SUBSTITUTE:=1}"
+      : "''${KUBERNIX_MAX_JOBS:=16}"
       # The SSH (builder) and HTTPS (substituter) endpoints are separate
       # services and commonly live on different hostnames -- e.g. this
       # cluster's own kubernix-ssh.sf.superbaloo.net vs.
@@ -68,7 +69,17 @@ let
       build-users-group =
       builders-use-substitutes = true
       plugin-files = ${kubernix-plugin}/lib/lix/plugins/kubernix.so
-      builders = ''${builder} ''${KUBERNIX_SYSTEMS}"
+      # The machine-spec line's field order is: uri systemTypes sshKey
+      # maxJobs speedFactor supportedFeatures mandatoryFeatures
+      # sshPublicHostKey (lix/lix-rs/src/machines.rs). This store's ssh key
+      # is already carried by the URI's own ssh-key= query param, so the
+      # positional sshKey field is unused -- but it still has to be filled
+      # with a '-' placeholder, or whatever comes after it (KUBERNIX_MAX_JOBS)
+      # silently lands in the sshKey slot instead of maxJobs, which parses
+      # fine (it's just a string) and leaves maxJobs defaulted to 1. Found
+      # live: exactly that shift meant every remote build serialized to one
+      # at a time no matter how many derivations were ready to build.
+      builders = ''${builder} ''${KUBERNIX_SYSTEMS} - ''${KUBERNIX_MAX_JOBS}"
 
       if [ "''${KUBERNIX_SUBSTITUTE}" != "0" ]; then
         substituters=""

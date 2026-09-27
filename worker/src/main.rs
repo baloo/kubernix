@@ -215,6 +215,26 @@ fn env_secs(name: &str, default: std::time::Duration) -> std::time::Duration {
     }
 }
 
+/// Parse a positive-integer-valued env var, falling back to `default` if
+/// it's unset, unparseable, or not positive (0 would starve every
+/// replica pulling from the shared durable consumer of a message).
+fn env_positive_i64(name: &str, default: i64) -> i64 {
+    match std::env::var(name) {
+        Ok(v) => match v.parse::<i64>() {
+            Ok(n) if n > 0 => n,
+            Ok(n) => {
+                tracing::warn!(%name, value = n, "must be positive, using the default");
+                default
+            }
+            Err(e) => {
+                tracing::warn!(%name, value = %v, error = %e, "unparseable, using the default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
@@ -264,6 +284,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         "KUBERNIX_JOB_RESULTS_RETENTION",
         std::time::Duration::from_secs(24 * 3600),
     );
+    let worker_max_concurrent = env_positive_i64("KUBERNIX_WORKER_MAX_CONCURRENT", 1);
     // Same directory this process's own `reqwest`/`aws-sdk-s3`-style trust
     // resolution already reads via `SSL_CERT_DIR` (set by the chart
     // whenever a consumer supplies `tls.extraCaVolumeMounts`, see
@@ -372,8 +393,18 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .create_consumer(jetstream::consumer::pull::Config {
             durable_name: Some(format!("worker-{}", system.replace('-', "_"))),
             filter_subjects: subjects.clone(),
-            // One at a time: a build holds its message un-acked while it runs.
-            max_ack_pending: 1,
+            // This is a *shared* durable consumer across every replica pulling
+            // from it (WorkQueue-retention streams forbid per-replica durable
+            // names with overlapping filter subjects), so max_ack_pending caps
+            // the fleet's total in-flight jobs, not "per worker". Each worker's
+            // own 'jobs loop below only ever pulls one message at a time and
+            // holds it un-acked for the build's full duration before acking and
+            // pulling the next, so this only needs to be a static ceiling >= the
+            // number of replicas that could concurrently pull -- it does not
+            // need to track the live replica count. Defaults to 1 (today's
+            // single-worker behavior); the Helm chart sizes it to mirror
+            // worker.replicas / worker.autoscaling.maxReplicaCount.
+            max_ack_pending: worker_max_concurrent,
             ack_wait: std::time::Duration::from_secs(3600),
             // Bounds Nak-based redelivery (PLAN.md Phase 17): a job needing a
             // feature combination no worker in the fleet actually declares

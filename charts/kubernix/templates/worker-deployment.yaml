@@ -104,6 +104,17 @@ spec:
             # at startup. See worker.systemFeatures' comment above.
             - name: KUBERNIX_WORKER_CLASSES
               value: {{ .Values.worker.systemFeatures | join "," | quote }}
+            # Sizes the shared NATS durable consumer's max_ack_pending, not
+            # just this Deployment's replica count -- see worker/src/main.rs's
+            # comment above create_consumer. Must be >= however many replicas
+            # could concurrently pull, so it mirrors whichever setting below
+            # actually governs that count.
+            - name: KUBERNIX_WORKER_MAX_CONCURRENT
+              {{- if .Values.worker.autoscaling.enabled }}
+              value: {{ .Values.worker.autoscaling.maxReplicaCount | quote }}
+              {{- else }}
+              value: {{ .Values.worker.replicas | quote }}
+              {{- end }}
             - name: RUST_LOG
               value: debug
             {{- with .Values.tls.extraCaVolumeMounts }}
