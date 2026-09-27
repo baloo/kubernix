@@ -306,6 +306,9 @@ admin:
   affinity: {}
 
 worker:
+  # Also sizes the shared NATS durable consumer's max_ack_pending when
+  # autoscaling is disabled -- see worker-deployment.yaml's
+  # KUBERNIX_WORKER_MAX_CONCURRENT env entry.
   replicas: 1
   system: x86_64-linux
   # Per-tenant `cloud-hypervisor` VM isolation (PLAN.md Phase 15) is the only
@@ -362,6 +365,10 @@ worker:
   autoscaling:
     enabled: false
     minReplicaCount: 0
+    # Also becomes the shared NATS consumer's max_ack_pending ceiling when
+    # autoscaling is enabled (see worker-deployment.yaml) -- it bounds how
+    # many replicas can ever hold an unacked job concurrently, not just
+    # KEDA's own scale-up limit.
     maxReplicaCount: 10
     # KEDA scaler metadata is string-typed, hence the quotes. lagThreshold
     # targets ~5 pending jobs per active replica; activationLagThreshold is
