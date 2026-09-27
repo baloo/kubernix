@@ -84,6 +84,54 @@ struct InputRef {
     deriver: StorePath,
 }
 
+/// Order `inputs` so that every input comes after every other input it
+/// references (Kahn's algorithm), so that registering them one at a time in
+/// this order never asks the guest's Nix store to validate a path against a
+/// reference it hasn't seen yet. References to paths outside `inputs` (the
+/// guest's base system closure, presumably already valid there) are ignored.
+///
+/// Returns indices into `inputs`. Errors if `inputs` contains a reference
+/// cycle, which real Nix closures never do.
+fn topo_sort_inputs(inputs: &[InputRef]) -> eyre::Result<Vec<usize>> {
+    use std::collections::{HashMap, VecDeque};
+
+    let by_path: HashMap<&StorePath, usize> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| (&input.store_path, i))
+        .collect();
+
+    let mut indegree = vec![0usize; inputs.len()];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); inputs.len()];
+    for (i, input) in inputs.iter().enumerate() {
+        for reference in &input.references {
+            if let Some(&dep) = by_path.get(reference)
+                && dep != i
+            {
+                indegree[i] += 1;
+                dependents[dep].push(i);
+            }
+        }
+    }
+
+    let mut queue: VecDeque<usize> = (0..inputs.len()).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(inputs.len());
+    while let Some(i) = queue.pop_front() {
+        order.push(i);
+        for &dependent in &dependents[i] {
+            indegree[dependent] -= 1;
+            if indegree[dependent] == 0 {
+                queue.push_back(dependent);
+            }
+        }
+    }
+
+    if order.len() != inputs.len() {
+        eyre::bail!("reference cycle among staged inputs");
+    }
+    Ok(order)
+}
+
 impl Job {
     /// The output paths a derivation declares.
     ///
@@ -110,12 +158,25 @@ impl Job {
             return Ok(());
         }
 
-        let keys: Vec<ObjectKey> = self.inputs.iter().map(|i| i.key.clone()).collect();
+        // The server's `inputs` order is not guaranteed to be closure order:
+        // paths the client staged fresh on this connection are (Nix always
+        // exports a closure topologically), but paths backfilled from the
+        // derivation's own `input_srcs` are ordered however Lix's C++
+        // `StringSet` happens to sort store-path strings lexicographically,
+        // which has no relation to the reference graph. Registering an input
+        // before a path it references makes the guest's real `nix-daemon`
+        // reject it ("does not exist in the Lix database"), so re-derive a
+        // correct order here from the `references` every `InputRef` already
+        // carries, rather than trusting the wire order.
+        let order = topo_sort_inputs(&self.inputs).wrap_err("ordering inputs")?;
+
+        let keys: Vec<ObjectKey> = order.iter().map(|&i| self.inputs[i].key.clone()).collect();
         let urls = upload::request_download_urls(client, &self.job_id, &self.token, &keys)
             .await
             .wrap_err("requesting download urls")?;
 
-        for (input, url) in self.inputs.iter().zip(urls) {
+        for (&i, url) in order.iter().zip(urls) {
+            let input = &self.inputs[i];
             tracing::info!(job_id = %self.job_id, path = %input.store_path, "importing input");
             match &mut vm {
                 Some(conn) => vm_ops::fetch_input(
@@ -1558,6 +1619,53 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input(path: &str, references: &[&str]) -> InputRef {
+        InputRef {
+            store_path: StorePath::new(path),
+            key: ObjectKey::new(path),
+            references: references.iter().map(|r| StorePath::new(*r)).collect(),
+            deriver: StorePath::new(format!("{path}.drv")),
+        }
+    }
+
+    #[test]
+    fn topo_sort_inputs_reorders_reference_before_dependent() {
+        // Mirrors the real failure: the referenced path
+        // (`bdw...-xz-5.8.3`) sorts lexicographically *after* the input
+        // that references it (`0fb...-xz-5.8.3-bin`), which is the wire
+        // order the server actually sent.
+        let inputs = vec![
+            input("0fb3-xz-5.8.3-bin", &["bdws-xz-5.8.3"]),
+            input("bdws-xz-5.8.3", &[]),
+        ];
+        let order = topo_sort_inputs(&inputs).unwrap();
+        assert_eq!(order, vec![1, 0]);
+    }
+
+    #[test]
+    fn topo_sort_inputs_ignores_references_outside_the_set() {
+        // A reference to something not in `inputs` (already valid in the
+        // guest, e.g. base system paths) must not block ordering.
+        let inputs = vec![input("a", &["not-an-input"]), input("b", &[])];
+        let order = topo_sort_inputs(&inputs).unwrap();
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&0));
+        assert!(order.contains(&1));
+    }
+
+    #[test]
+    fn topo_sort_inputs_preserves_already_correct_order() {
+        let inputs = vec![input("a", &[]), input("b", &["a"]), input("c", &["b"])];
+        let order = topo_sort_inputs(&inputs).unwrap();
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn topo_sort_inputs_rejects_a_reference_cycle() {
+        let inputs = vec![input("a", &["b"]), input("b", &["a"])];
+        assert!(topo_sort_inputs(&inputs).is_err());
+    }
 
     // PLAN.md Phase 18: `next_action` table test -- every
     // (GuestFailureStatus, original_boot_was_fresh, already_on_big_parallel,
