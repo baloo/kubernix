@@ -11,7 +11,7 @@ let
   # the source is realised once and reused.
   workspaceSource = source.workspace {
     name = "kubernix-src";
-    crates = [ "daemon-protocol" "guest-agent" "guest-init" "server" "signing" "types" "worker" ];
+    crates = [ "daemon-protocol" "guest-agent" "guest-init" "guest-protocol" "guest-protocol-test-cli" "server" "signing" "types" "worker" ];
   };
   inherit (source) outputHashes;
 
@@ -26,9 +26,16 @@ let
     inherit workspaceSource outputHashes kubernix-guest-agent-ebpf;
   };
   kubernix-guest-init = pkgs.pkgsStatic.callPackage ./guest-init.nix { inherit workspaceSource outputHashes; };
+  # A tiny binary `vm-test-lib.nix`'s shell helpers shell out to for the
+  # control-channel calls that raw shell + `socat` could no longer
+  # hand-construct once that protocol became binary `postcard-rpc` -- see its
+  # own file header.
+  kubernix-guest-protocol-test-cli = pkgs.callPackage ./guest-protocol-test-cli.nix {
+    inherit workspaceSource outputHashes;
+  };
   # Shared shell helpers the guest-VM boot tests below all `source` -- see
   # `vm-test-lib.nix`'s own header for why.
-  vm-test-lib = pkgs.callPackage ./vm-test-lib.nix { };
+  vm-test-lib = pkgs.callPackage ./vm-test-lib.nix { inherit kubernix-guest-protocol-test-cli; };
   guest-vm = pkgs.callPackage ./guest-vm.nix {
     inherit kubernix-guest-agent kubernix-guest-init vm-test-lib;
   };
@@ -78,10 +85,11 @@ let
   vm-encryption-test-image = pkgs.callPackage ./vm-encryption-test-image.nix {
     guestVmKernel = guest-vm.kernel;
     guestVmInitrd = guest-vm.initrd;
+    inherit kubernix-guest-protocol-test-cli;
   };
 in {
   inherit kubernix-server kubernix-worker kubernix-plugin kubernix-guest-agent kubernix-guest-init;
-  inherit kubernix-guest-agent-ebpf;
+  inherit kubernix-guest-agent-ebpf kubernix-guest-protocol-test-cli;
   inherit (images) kubernix-server-image kubernix-worker-image;
   inherit kubernix-client-image;
   inherit vm-encryption-test-image;

@@ -1,0 +1,19 @@
+[package]
+name = "kubernix-guest-protocol-test-cli"
+version = "0.1.0"
+edition = "2024"
+
+# Exists solely so `nix/vm-test-lib.nix`'s shell helpers (`vm_push_key`,
+# `vm_caps`, `vm_status`, `vm_reset`, `vm_trigger_oom`, `vm_trigger_enospc`)
+# can still speak one control-channel call from a plain shell script now that
+# the wire format is binary postcard-rpc frames rather than a text line --
+# `socat`/`printf` can hand-construct the latter but not the former. Not
+# shipped in any production image.
+[[bin]]
+name = "kubernix-guest-protocol-test-cli"
+path = "src/main.rs"
+
+[dependencies]
+kubernix-guest-protocol.workspace = true
+postcard-rpc = { workspace = true, features = ["use-std", "tokio"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

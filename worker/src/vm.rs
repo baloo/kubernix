@@ -51,13 +51,26 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use eyre::{Context as _, eyre};
+use kubernix_guest_protocol::{
+    CapsEndpoint, PushCaCertEndpoint, PushCaCertRequest, PushKeyEndpoint, PushKeyRequest,
+    PushSubstitutersEndpoint, PushSubstitutersRequest, ResetEndpoint, StatusEndpoint,
+    StatusResponse, SubstituterEntry,
+};
 use kubernix_types::TenantId;
 use nix::unistd::{Gid, Uid};
+use postcard_rpc::host_client::HostClient;
+use postcard_rpc::standard_icd::WireError;
 use rand::Rng as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 use crate::uid::UidAllocator;
+
+/// The postcard-rpc client for the control channel — a fresh one per call,
+/// same lifecycle as the raw-socket dial it replaces (`dial_control_port`
+/// below). See that function's doc for why the connection itself is still
+/// one-shot even though the wire format is no longer line-based text.
+type ControlClient = HostClient<WireError>;
 
 /// `guest-agent`'s fixed vsock port (`guest-agent/src/main.rs::NIX_DAEMON_PORT`).
 /// Duplicated here rather than shared through a common crate: the guest and
@@ -93,10 +106,6 @@ const NET_GATEWAY: &str = "10.42.100.1";
 /// this process's memory (see `VmPool::keys`). Never `Debug`/`Display` —
 /// accidentally logging one would defeat the entire point.
 type StoreKey = [u8; 32];
-
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// Worker-side VM lifecycle configuration, read once at startup.
 #[derive(Clone, Debug)]
@@ -766,26 +775,13 @@ impl VmLauncher for CloudHypervisorLauncher {
     }
 
     async fn push_key(&self, vsock_socket: &Path, key: &StoreKey, fresh: bool) -> eyre::Result<()> {
-        let mut stream = dial_control_port(vsock_socket).await?;
-
-        let mode = if fresh { "FRESH" } else { "REUSE" };
-        stream
-            .write_all(format!("KEY {} {mode}\n", encode_hex(key)).as_bytes())
+        let client = connect_control_client(vsock_socket).await?;
+        let req = PushKeyRequest { key: *key, fresh };
+        let result = client
+            .send_resp::<PushKeyEndpoint>(&req)
             .await
-            .wrap_err("sending the KEY control message")?;
-
-        let mut reply = Vec::new();
-        stream
-            .read_to_end(&mut reply)
-            .await
-            .wrap_err("reading the KEY control reply")?;
-        if !reply.starts_with(b"OK") {
-            return Err(eyre!(
-                "guest-agent rejected the store key: {:?}",
-                String::from_utf8_lossy(&reply)
-            ));
-        }
-        Ok(())
+            .map_err(|e| eyre!("control RPC failed pushing the store key: {e}"))?;
+        result.map_err(|msg| eyre!("guest-agent rejected the store key: {msg}"))
     }
 }
 
@@ -811,33 +807,21 @@ pub async fn push_substituters(
     vsock_socket: &Path,
     substituters: &[(String, String)],
 ) -> eyre::Result<()> {
-    let mut stream = dial_control_port(vsock_socket).await?;
-
-    let mut message = "SUBST".to_string();
-    for (url, public_key) in substituters {
-        message.push(' ');
-        message.push_str(url);
-        message.push(' ');
-        message.push_str(public_key);
-    }
-    message.push('\n');
-    stream
-        .write_all(message.as_bytes())
+    let client = connect_control_client(vsock_socket).await?;
+    let req = PushSubstitutersRequest {
+        entries: substituters
+            .iter()
+            .map(|(url, public_key)| SubstituterEntry {
+                url: url.clone(),
+                public_key: public_key.clone(),
+            })
+            .collect(),
+    };
+    let result = client
+        .send_resp::<PushSubstitutersEndpoint>(&req)
         .await
-        .wrap_err("sending the SUBST control message")?;
-
-    let mut reply = Vec::new();
-    stream
-        .read_to_end(&mut reply)
-        .await
-        .wrap_err("reading the SUBST control reply")?;
-    if !reply.starts_with(b"OK") {
-        return Err(eyre!(
-            "guest-agent rejected trusted substituters: {:?}",
-            String::from_utf8_lossy(&reply)
-        ));
-    }
-    Ok(())
+        .map_err(|e| eyre!("control RPC failed pushing trusted substituters: {e}"))?;
+    result.map_err(|msg| eyre!("guest-agent rejected trusted substituters: {msg}"))
 }
 
 /// Push this deployment's extra trusted CA cert(s) (from `SSL_CERT_DIR`,
@@ -864,54 +848,35 @@ pub async fn push_substituters(
 /// protocol already carries (`push_key`'s store key) without adding a new
 /// dependency to `guest-agent`, which is deliberately minimal.
 pub async fn push_ca_cert(vsock_socket: &Path, pem: &[u8]) -> eyre::Result<()> {
-    let mut stream = dial_control_port(vsock_socket).await?;
-
-    let message = format!("CACERT {}\n", encode_hex(pem));
-    stream
-        .write_all(message.as_bytes())
+    let client = connect_control_client(vsock_socket).await?;
+    let req = PushCaCertRequest { pem: pem.to_vec() };
+    let result = client
+        .send_resp::<PushCaCertEndpoint>(&req)
         .await
-        .wrap_err("sending the CACERT control message")?;
-
-    let mut reply = Vec::new();
-    stream
-        .read_to_end(&mut reply)
-        .await
-        .wrap_err("reading the CACERT control reply")?;
-    if !reply.starts_with(b"OK") {
-        return Err(eyre!(
-            "guest-agent rejected the extra CA cert: {:?}",
-            String::from_utf8_lossy(&reply)
-        ));
-    }
-    Ok(())
+        .map_err(|e| eyre!("control RPC failed pushing the extra CA cert: {e}"))?;
+    result.map_err(|msg| eyre!("guest-agent rejected the extra CA cert: {msg}"))
 }
 
-/// Dial `vsock_socket`'s control-channel port and complete cloud-hypervisor's
-/// own `CONNECT <port>\n` -> `OK...` vsock proxy handshake, returning the
-/// still-open stream ready for a guest-agent control verb. Shared by
-/// `push_key` and `boot_probe` — the *outer* framing layer both speak before
-/// getting to whichever verb of guest-agent's own protocol they actually
-/// want (`KEY ...` / `CAPS?`, PLAN.md Phase 17).
-async fn dial_control_port(vsock_socket: &Path) -> eyre::Result<tokio::net::UnixStream> {
-    let mut stream = tokio::net::UnixStream::connect(vsock_socket)
+/// Dial `vsock_socket`'s control-channel port, complete cloud-hypervisor's
+/// own `CONNECT <port>\n` -> `OK...` vsock proxy handshake, and wrap the
+/// result in a postcard-rpc [`HostClient`] ready to make typed endpoint
+/// calls or subscribe to topics — see
+/// `kubernix_guest_protocol::client::connect`, shared with the
+/// `kubernix-guest-protocol-test-cli` test tool so this framing glue can't
+/// drift between the two. A fresh client per call, same one-shot-per-command
+/// lifecycle the old text protocol's per-call dial had. The one exception is
+/// the heartbeat monitor (`worker/src/main.rs`), which keeps a client alive
+/// for as long as it watches for liveness instead of dropping it after one
+/// call.
+pub(crate) async fn connect_control_client(vsock_socket: &Path) -> eyre::Result<ControlClient> {
+    kubernix_guest_protocol::client::connect(vsock_socket, CONTROL_PORT)
         .await
-        .wrap_err_with(|| format!("dialing {} for the control channel", vsock_socket.display()))?;
-    stream
-        .write_all(format!("CONNECT {CONTROL_PORT}\n").as_bytes())
-        .await
-        .wrap_err("sending the vsock CONNECT handshake to the control channel")?;
-    let mut buf = [0u8; 32];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .wrap_err("reading the control-channel CONNECT reply")?;
-    if !buf[..n].starts_with(b"OK") {
-        return Err(eyre!(
-            "vsock CONNECT to guest control port {CONTROL_PORT} refused: {:?}",
-            String::from_utf8_lossy(&buf[..n])
-        ));
-    }
-    Ok(stream)
+        .wrap_err_with(|| {
+            format!(
+                "connecting to {} for the control channel",
+                vsock_socket.display()
+            )
+        })
 }
 
 /// Best-effort `chmod 0666 /dev/kvm`, run once before the boot probe opens
@@ -1018,17 +983,13 @@ pub async fn boot_probe(config: &VmConfig) -> eyre::Result<u32> {
         .await
         .wrap_err("timed out waiting for guest-agent's control port")??;
 
-        let mut stream = dial_control_port(&vsock_socket).await?;
-        stream
-            .write_all(b"CAPS?\n")
+        let client = connect_control_client(&vsock_socket).await?;
+        let resp = client
+            .send_resp::<CapsEndpoint>(&())
             .await
-            .wrap_err("sending CAPS?")?;
-        let mut reply = Vec::new();
-        stream
-            .read_to_end(&mut reply)
-            .await
-            .wrap_err("reading the CAPS? reply")?;
-        parse_caps_reply(&reply)
+            .map_err(|e| eyre!("control RPC failed asking CAPS?: {e}"))?
+            .map_err(|msg| eyre!("guest-agent rejected CAPS?: {msg}"))?;
+        Ok(resp.nested_virt_flag_count)
     }
     .await;
 
@@ -1047,113 +1008,34 @@ pub async fn boot_probe(config: &VmConfig) -> eyre::Result<u32> {
     }
 }
 
-fn parse_caps_reply(reply: &[u8]) -> eyre::Result<u32> {
-    let text = String::from_utf8_lossy(reply);
-    let text = text.trim();
-    match text.strip_prefix("OK ") {
-        Some(rest) => rest
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| eyre!("CAPS? reply {text:?} did not carry a decimal count: {e}")),
-        None => Err(eyre!("guest-agent rejected CAPS?: {text:?}")),
-    }
-}
-
-/// PLAN.md Phase 18: what `STATUS?` reports — see
-/// `guest-agent/src/ebpf.rs::FailureStatus`, this function's server-side
-/// mirror, and `guest-agent/src/main.rs::format_status` for the exact wire
-/// text [`parse_status_reply`] below parses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuestFailureStatus {
-    None,
-    OutOfMemory { builder_victim: bool },
-    DiskFull,
-}
+/// PLAN.md Phase 18: what `STATUS?` reports — now the same
+/// `kubernix_guest_protocol::GuestFailureStatus` type `guest-agent`'s
+/// dispatch handler answers with directly, no wire-text parsing needed.
+pub use kubernix_guest_protocol::GuestFailureStatus;
 
 /// Clears the guest's OOM/ENOSPC detection state — sent right before opening
 /// a new build's daemon-protocol connection, so whatever `STATUS?` reports
-/// afterwards is scoped to *this* build, not the VM's whole lifetime. Follows
-/// the same `dial_control_port` + verb-string + one-shot-read pattern as
-/// `push_key`/`boot_probe`.
+/// afterwards is scoped to *this* build, not the VM's whole lifetime.
 pub async fn reset_job_status(vsock_socket: &Path) -> eyre::Result<()> {
-    let mut stream = dial_control_port(vsock_socket).await?;
-    stream
-        .write_all(b"RESET\n")
+    let client = connect_control_client(vsock_socket).await?;
+    let result = client
+        .send_resp::<ResetEndpoint>(&())
         .await
-        .wrap_err("sending RESET")?;
-    let mut reply = Vec::new();
-    stream
-        .read_to_end(&mut reply)
-        .await
-        .wrap_err("reading the RESET reply")?;
-    if !reply.starts_with(b"OK") {
-        return Err(eyre!(
-            "guest-agent rejected RESET: {:?}",
-            String::from_utf8_lossy(&reply)
-        ));
-    }
-    Ok(())
-}
-
-/// Liveness check: dial the control port and ask for `PING`. Used by
-/// `guest_ping_monitor` (`worker/src/main.rs`) on a short, repeating
-/// interval for as long as a build is running, so a hung/dead guest is
-/// detected in seconds rather than waiting on `ack_wait`. Each call is a
-/// fresh dial (the control port has no persistent session), same as every
-/// other control-port helper here.
-pub async fn ping(vsock_socket: &Path) -> eyre::Result<()> {
-    let mut stream = dial_control_port(vsock_socket).await?;
-    stream.write_all(b"PING\n").await.wrap_err("sending PING")?;
-    let mut reply = Vec::new();
-    stream
-        .read_to_end(&mut reply)
-        .await
-        .wrap_err("reading the PING reply")?;
-    if !reply.starts_with(b"OK") {
-        return Err(eyre!(
-            "guest-agent rejected PING: {:?}",
-            String::from_utf8_lossy(&reply)
-        ));
-    }
-    Ok(())
+        .map_err(|e| eyre!("control RPC failed sending RESET: {e}"))?;
+    result.map_err(|msg| eyre!("guest-agent rejected RESET: {msg}"))
 }
 
 /// Asks the guest what resource-exhaustion signal (if any) has fired since
 /// the last [`reset_job_status`] — called once, right after a VM-path build
 /// failure.
 pub async fn query_status(vsock_socket: &Path) -> eyre::Result<GuestFailureStatus> {
-    let mut stream = dial_control_port(vsock_socket).await?;
-    stream
-        .write_all(b"STATUS?\n")
+    let client = connect_control_client(vsock_socket).await?;
+    let StatusResponse(status) = client
+        .send_resp::<StatusEndpoint>(&())
         .await
-        .wrap_err("sending STATUS?")?;
-    let mut reply = Vec::new();
-    stream
-        .read_to_end(&mut reply)
-        .await
-        .wrap_err("reading the STATUS? reply")?;
-    parse_status_reply(&reply)
-}
-
-fn parse_status_reply(reply: &[u8]) -> eyre::Result<GuestFailureStatus> {
-    let text = String::from_utf8_lossy(reply);
-    let text = text.trim();
-    let rest = text
-        .strip_prefix("OK ")
-        .ok_or_else(|| eyre!("guest-agent rejected STATUS?: {text:?}"))?;
-    match rest.trim() {
-        "NONE" => Ok(GuestFailureStatus::None),
-        "OOM BUILDER" => Ok(GuestFailureStatus::OutOfMemory {
-            builder_victim: true,
-        }),
-        "OOM OTHER" => Ok(GuestFailureStatus::OutOfMemory {
-            builder_victim: false,
-        }),
-        "ENOSPC" => Ok(GuestFailureStatus::DiskFull),
-        other => Err(eyre!(
-            "STATUS? reply carried an unrecognised state: {other:?}"
-        )),
-    }
+        .map_err(|e| eyre!("control RPC failed asking STATUS?: {e}"))?
+        .map_err(|msg| eyre!("guest-agent rejected STATUS?: {msg}"))?;
+    Ok(status)
 }
 
 /// Deletes `store.img` outright — the ENOSPC-on-`REUSE` retry path (PLAN.md
@@ -1934,37 +1816,9 @@ mod tests {
         assert!(!is_transient_connect_error(ErrorKind::Other));
     }
 
-    // PLAN.md Phase 18
-
-    #[test]
-    fn parse_status_reply_every_known_state() {
-        assert_eq!(
-            parse_status_reply(b"OK NONE\n").unwrap(),
-            GuestFailureStatus::None
-        );
-        assert_eq!(
-            parse_status_reply(b"OK OOM BUILDER\n").unwrap(),
-            GuestFailureStatus::OutOfMemory {
-                builder_victim: true
-            }
-        );
-        assert_eq!(
-            parse_status_reply(b"OK OOM OTHER\n").unwrap(),
-            GuestFailureStatus::OutOfMemory {
-                builder_victim: false
-            }
-        );
-        assert_eq!(
-            parse_status_reply(b"OK ENOSPC\n").unwrap(),
-            GuestFailureStatus::DiskFull
-        );
-    }
-
-    #[test]
-    fn parse_status_reply_rejects_unrecognised_and_error_replies() {
-        assert!(parse_status_reply(b"OK WAT\n").is_err());
-        assert!(parse_status_reply(b"ERR eBPF detection not available\n").is_err());
-    }
+    // PLAN.md Phase 18: `GuestFailureStatus` is now
+    // `kubernix_guest_protocol::GuestFailureStatus`, decoded straight off the
+    // wire by postcard-rpc -- there is no more text reply to parse/test here.
 
     #[tokio::test]
     async fn wipe_and_reboot_deletes_and_recreates_with_fresh_true() {

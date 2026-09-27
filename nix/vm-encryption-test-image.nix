@@ -26,9 +26,16 @@
   socat,
   guestVmKernel,
   guestVmInitrd,
+  kubernix-guest-protocol-test-cli,
 }:
 
 let
+  # Baked into the generated script as a fully-qualified store path, same
+  # convention as `${guestVmKernel}`/`${guestVmInitrd}` below -- see
+  # `vm-test-lib.nix`'s own `testCli` for why this replaced `socat`/`printf`
+  # for `vm_push_key` (the control channel is binary `postcard-rpc`, not a
+  # text line raw shell can hand-construct).
+  testCli = "${kubernix-guest-protocol-test-cli}/bin/kubernix-guest-protocol-test-cli";
   probe = writeShellScriptBin "vm-encryption-probe" ''
     set -euo pipefail
 
@@ -118,9 +125,7 @@ let
 
     vm_push_key() {
       local vsock_socket="$1" hex_key="$2" mode="$3" port="''${4:-621}"
-      printf 'CONNECT %d\nKEY %s %s\n' "$port" "$hex_key" "$mode" \
-        | timeout "$push_key_timeout" socat - "UNIX-CONNECT:$vsock_socket" \
-        | tail -n +2 || true
+      timeout "$push_key_timeout" ${testCli} "$vsock_socket" "$port" push-key "$hex_key" "$mode" || true
     }
 
     vm_stop() {

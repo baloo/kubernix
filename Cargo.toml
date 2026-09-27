@@ -4,6 +4,8 @@ members = [
     "daemon-protocol",
     "guest-agent",
     "guest-init",
+    "guest-protocol",
+    "guest-protocol-test-cli",
     "server",
     "signing",
     "types",
@@ -12,6 +14,7 @@ members = [
 
 [workspace.dependencies]
 kubernix-daemon-protocol = { version = "0.1.0", path = "./daemon-protocol" }
+kubernix-guest-protocol = { version = "0.1.0", path = "./guest-protocol" }
 kubernix-signing = { version = "0.1.0", path = "./signing" }
 kubernix-types = { version = "0.1.0", path = "./types" }
 
@@ -27,7 +30,11 @@ digest-io-async = { version = "0.1.0", features = ["tokio"] }
 ed25519-dalek = { version = "3", features = ["digest", "rand_core"] }
 eyre = "0.6.14"
 futures-util = "0.3.33"
+postcard = "1"
+postcard-rpc = "0.12"
+postcard-schema = "0.2"
 rand = "0.10"
+serde = "1"
 sha2 = "0.11"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }

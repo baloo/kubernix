@@ -7,8 +7,15 @@
 # once instead of drifting across four copies. Each caller `source`s this
 # file at the top of its `buildCommand` and calls the functions below;
 # nothing here is specific to any one test.
-{ writeText }:
+{ writeText, kubernix-guest-protocol-test-cli }:
 
+let
+  # Baked into the generated script below as a fully-qualified store path --
+  # same convention as `${kernel}/bzImage` elsewhere -- so none of this
+  # file's callers need `kubernix-guest-protocol-test-cli` added to their own
+  # `nativeBuildInputs` just to make these functions work.
+  testCli = "${kubernix-guest-protocol-test-cli}/bin/kubernix-guest-protocol-test-cli";
+in
 writeText "kubernix-vm-test-lib.sh" ''
   # vm_boot <bzImage> <initrd> <vsock-socket> <console-log> [extra cloud-hypervisor args...]
   #
@@ -96,103 +103,80 @@ writeText "kubernix-vm-test-lib.sh" ''
 
   # vm_push_key <vsock-socket> <hex-key> <FRESH|REUSE> [control-port=621]
   #
-  # Speaks guest-agent's control protocol end to end over one connection:
-  # CONNECT to the control port, then the KEY line -- see
-  # `guest-agent/src/main.rs::handle_control` for the server side
+  # Speaks guest-agent's control protocol end to end over one connection: a
+  # `guest/key` postcard-rpc call via ${testCli} -- see
+  # `guest-agent/src/control.rs::handle_push_key` for the server side
   # (`worker/src/vm.rs::push_key` is the production client of this same
-  # protocol). Prints guest-agent's reply (`OK` or `ERR ...`), which may
-  # itself span multiple lines.
+  # endpoint). Prints guest-agent's reply in the same `OK`/`ERR ...` textual
+  # convention the old line-based protocol used, so every caller's own
+  # `[[ == OK* ]]`-style check on the result is unchanged.
   #
-  # `tail -n +2` (everything from line 2 on), not `-n 1` (only the last
-  # line): the first line received is cloud-hypervisor's own `OK <id>\n`
-  # vsock CONNECT acknowledgment, not guest-agent's reply -- skip exactly
-  # that one line and keep the rest verbatim. An `ERR` reply's message can
-  # itself contain embedded newlines (the failing command's own multi-line
-  # stderr, joined into `handle_control`'s error chain) with a trailing
-  # blank line after it, so `-n 1` previously grabbed that trailing blank
-  # line instead of the reply -- every caller here already does a `case`/
-  # `[[ == OK* ]]`-style *prefix* check on the result, which still works
-  # correctly against a multi-line string, matching how the production
-  # client (`worker/src/vm.rs::push_key`) reads the whole reply via
-  # `read_to_end` and does a `starts_with` check rather than assuming one
-  # line -- this was a test-script bug, not a `guest-agent` protocol one.
-  #
-  # Ends in `|| true`: callers run under `set -euo pipefail`, and `socat`
-  # exiting non-zero here -- however cleanly `guest-agent` closed its end --
-  # is not this function's failure to report, only the caller's own
-  # `OK*`/`ERR*` string check on the captured reply is. Without this, a
-  # non-zero `socat` exit killed the *whole script* via `pipefail` right at
-  # `reply=$(vm_push_key ...)`, before the caller's own check ever ran.
+  # Ends in `|| true`: callers run under `set -euo pipefail`, and this tool
+  # already encodes every failure (a rejected key, a connection error) into
+  # its own `OK`/`ERR ...` stdout line rather than a non-zero exit -- this
+  # guards only against something unexpected (e.g. the binary itself being
+  # missing) still not taking down the whole script via `pipefail` before the
+  # caller's own check runs.
   vm_push_key() {
     local vsock_socket="$1" hex_key="$2" mode="$3" port="''${4:-621}"
-    printf 'CONNECT %d\nKEY %s %s\n' "$port" "$hex_key" "$mode" \
-      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
-      | tail -n +2 || true
+    timeout 20 ${testCli} "$vsock_socket" "$port" push-key "$hex_key" "$mode" || true
   }
 
   # vm_caps <vsock-socket> [control-port=621]
   #
-  # Speaks the `CAPS?` control-port verb (PLAN.md Phase 17) end to end:
-  # CONNECT to the control port, then `CAPS?`, mirroring `vm_push_key` above
-  # -- see that function's doc comment for why `tail -n +2` and `|| true`
-  # are both needed. Prints guest-agent's reply, `OK <n>` (the count of
-  # `vmx`/`svm` lines this guest itself sees in `/proc/cpuinfo`) or
-  # `ERR ...`.
+  # Speaks the `guest/caps` control-port endpoint (PLAN.md Phase 17) end to
+  # end via ${testCli} -- mirroring `vm_push_key` above. Prints guest-agent's
+  # reply, `OK <n>` (the count of `vmx`/`svm` lines this guest itself sees in
+  # `/proc/cpuinfo`) or `ERR ...`.
   vm_caps() {
     local vsock_socket="$1" port="''${2:-621}"
-    printf 'CONNECT %d\nCAPS?\n' "$port" \
-      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
-      | tail -n +2 || true
+    timeout 20 ${testCli} "$vsock_socket" "$port" caps || true
   }
 
   # vm_status <vsock-socket> [control-port=621]
   #
-  # Speaks the `STATUS?` control-port verb (PLAN.md Phase 18) end to end,
-  # mirroring `vm_caps` above. Prints guest-agent's reply -- `OK NONE` /
-  # `OK OOM BUILDER` / `OK OOM OTHER` / `OK ENOSPC`, or `ERR ...`.
+  # Speaks the `guest/status` control-port endpoint (PLAN.md Phase 18) end to
+  # end via ${testCli}, mirroring `vm_caps` above. Prints guest-agent's
+  # reply -- `OK NONE` / `OK OOM BUILDER` / `OK OOM OTHER` / `OK ENOSPC`, or
+  # `ERR ...`.
   vm_status() {
     local vsock_socket="$1" port="''${2:-621}"
-    printf 'CONNECT %d\nSTATUS?\n' "$port" \
-      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
-      | tail -n +2 || true
+    timeout 20 ${testCli} "$vsock_socket" "$port" status || true
   }
 
   # vm_reset <vsock-socket> [control-port=621]
   #
-  # Speaks the `RESET` control-port verb (PLAN.md Phase 18) end to end,
-  # mirroring `vm_caps` above. Prints guest-agent's reply, `OK` or `ERR ...`.
+  # Speaks the `guest/reset` control-port endpoint (PLAN.md Phase 18) end to
+  # end via ${testCli}, mirroring `vm_caps` above. Prints guest-agent's
+  # reply, `OK` or `ERR ...`.
   vm_reset() {
     local vsock_socket="$1" port="''${2:-621}"
-    printf 'CONNECT %d\nRESET\n' "$port" \
-      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
-      | tail -n +2 || true
+    timeout 20 ${testCli} "$vsock_socket" "$port" reset || true
   }
 
   # vm_trigger_oom <vsock-socket> [control-port=621]
   #
-  # Speaks the diagnostic-only `TRIGGER_OOM` control-port verb (PLAN.md
-  # Phase 18) -- mirroring `vm_caps` above. Prints guest-agent's reply
-  # (`OK` or `ERR ...`); the actual OOM kill happens asynchronously well
-  # after this call returns, so a caller polls `vm_status` afterwards.
+  # Speaks the diagnostic-only `guest/debug/trigger-oom` control-port
+  # endpoint (PLAN.md Phase 18) via ${testCli} -- mirroring `vm_caps` above.
+  # Prints guest-agent's reply (`OK` or `ERR ...`); the actual OOM kill
+  # happens asynchronously well after this call returns, so a caller polls
+  # `vm_status` afterwards.
   vm_trigger_oom() {
     local vsock_socket="$1" port="''${2:-621}"
-    printf 'CONNECT %d\nTRIGGER_OOM\n' "$port" \
-      | timeout 20 socat - "UNIX-CONNECT:$vsock_socket" \
-      | tail -n +2 || true
+    timeout 20 ${testCli} "$vsock_socket" "$port" trigger-oom || true
   }
 
   # vm_trigger_enospc <vsock-socket> [control-port=621]
   #
-  # Speaks the diagnostic-only `TRIGGER_ENOSPC` control-port verb (PLAN.md
-  # Phase 18) -- mirroring `vm_caps` above. Blocks until guest-agent's own
-  # write-past-capacity loop finishes (bounded, see `guest-agent/src/diag.rs`)
-  # before replying, so the caller's `vm_status` poll afterwards has a real
-  # chance of already seeing the flag set.
+  # Speaks the diagnostic-only `guest/debug/trigger-enospc` control-port
+  # endpoint (PLAN.md Phase 18) via ${testCli} -- mirroring `vm_caps` above.
+  # Blocks until guest-agent's own write-past-capacity loop finishes
+  # (bounded, see `guest-agent/src/diag.rs`) before replying, so the
+  # caller's `vm_status` poll afterwards has a real chance of already seeing
+  # the flag set.
   vm_trigger_enospc() {
     local vsock_socket="$1" port="''${2:-621}"
-    printf 'CONNECT %d\nTRIGGER_ENOSPC\n' "$port" \
-      | timeout 60 socat - "UNIX-CONNECT:$vsock_socket" \
-      | tail -n +2 || true
+    timeout 60 ${testCli} "$vsock_socket" "$port" trigger-enospc || true
   }
 
   # vm_stream_logs <vsock-socket> [log-port=622]
