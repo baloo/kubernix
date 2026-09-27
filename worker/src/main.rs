@@ -6,7 +6,11 @@
 //! to `kubernix.results.<job_id>`.
 //!
 //! The job message is left un-acked for the duration of the build, so a worker
-//! that dies mid-build causes redelivery rather than a silently lost job.
+//! that dies mid-build causes redelivery rather than a silently lost job --
+//! `ack_heartbeat` resets JetStream's `ack_wait` timer throughout a live
+//! build, so redelivery only actually happens once the worker itself has
+//! gone quiet. A hung/dead *guest* VM (worker still alive) is instead
+//! detected directly and much faster by `guest_ping_monitor`.
 
 pub mod kubernix_capnp {
     include!(concat!(env!("OUT_DIR"), "/kubernix_capnp.rs"));
@@ -285,6 +289,38 @@ async fn main() -> color_eyre::eyre::Result<()> {
         std::time::Duration::from_secs(24 * 3600),
     );
     let worker_max_concurrent = env_positive_i64("KUBERNIX_WORKER_MAX_CONCURRENT", 1);
+    // Bounds how long a job sits un-redelivered after the worker holding it
+    // dies outright (pod killed, node lost, panic) -- shortened from an
+    // earlier hardcoded 3600s now that `ack_heartbeat` resets this timer for
+    // as long as the worker is alive and actually running the build, so it
+    // no longer needs to double as "how long can a legitimately slow build
+    // run." A hung *guest* (worker alive, VM unresponsive) is instead
+    // detected directly and much faster by `guest_ping_monitor` -- this only
+    // remains the backstop for the worker process itself dying.
+    let ack_wait = env_secs(
+        "KUBERNIX_WORKER_ACK_WAIT",
+        std::time::Duration::from_secs(90),
+    );
+    // Several heartbeats per `ack_wait` window, so a couple of missed sends
+    // (a transient NATS blip) don't cause a spurious redelivery of a build
+    // that's actually still running fine.
+    let ack_heartbeat_interval = env_secs(
+        "KUBERNIX_WORKER_ACK_HEARTBEAT_INTERVAL",
+        std::time::Duration::from_secs(20),
+    );
+    // Feature B tunables (guest_ping_monitor): how often to PING the guest's
+    // control port while a build is running, how long a single PING may take
+    // before it counts as a miss, and how many consecutive misses mean
+    // "presumed dead" -- see `guest_ping_monitor`'s doc comment.
+    let guest_ping_interval = env_secs(
+        "KUBERNIX_WORKER_GUEST_PING_INTERVAL",
+        std::time::Duration::from_secs(5),
+    );
+    let guest_ping_timeout = env_secs(
+        "KUBERNIX_WORKER_GUEST_PING_TIMEOUT",
+        std::time::Duration::from_secs(5),
+    );
+    let guest_ping_threshold = env_positive_i64("KUBERNIX_WORKER_GUEST_PING_THRESHOLD", 3) as u32;
     // Same directory this process's own `reqwest`/`aws-sdk-s3`-style trust
     // resolution already reads via `SSL_CERT_DIR` (set by the chart
     // whenever a consumer supplies `tls.extraCaVolumeMounts`, see
@@ -405,7 +441,11 @@ async fn main() -> color_eyre::eyre::Result<()> {
             // single-worker behavior); the Helm chart sizes it to mirror
             // worker.replicas / worker.autoscaling.maxReplicaCount.
             max_ack_pending: worker_max_concurrent,
-            ack_wait: std::time::Duration::from_secs(3600),
+            // See `ack_wait`'s own doc comment above: this is now a backstop
+            // for a dead *worker*, not a dead *build* -- `ack_heartbeat`
+            // resets it throughout a live build, and a hung *guest* is
+            // caught separately and much faster by `guest_ping_monitor`.
+            ack_wait,
             // Bounds Nak-based redelivery (PLAN.md Phase 17): a job needing a
             // feature combination no worker in the fleet actually declares
             // would otherwise Nak forever with no visible failure. See the
@@ -609,6 +649,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         let already_on_big_parallel = worker_classes.iter().any(|c| c == "big-parallel");
         let mut enospc_retried = false;
         let mut oom_local_retried = false;
+        let mut guest_hang_retried = false;
 
         let mut outcome;
         let mut log;
@@ -619,18 +660,98 @@ async fn main() -> color_eyre::eyre::Result<()> {
                 tracing::warn!(job_id = %job.job_id, error = ?e, "resetting guest detection state failed");
             }
 
-            let (this_outcome, this_log) = job
-                .run_build(
+            // Feature A: reset this message's ack_wait for as long as this
+            // attempt is running, so a live worker never loses the job to
+            // redelivery purely because the build is legitimately slow.
+            let heartbeat = tokio::spawn(ack_heartbeat(message.clone(), ack_heartbeat_interval));
+            // Feature B: only meaningful with a guest to ping -- the
+            // subprocess fallback path has none.
+            let (hang_tx, hang_rx) = tokio::sync::oneshot::channel();
+            let ping_monitor = vm_handle.as_ref().map(|handle| {
+                tokio::spawn(guest_ping_monitor(
+                    handle.vsock_socket.clone(),
+                    guest_ping_interval,
+                    guest_ping_timeout,
+                    guest_ping_threshold,
+                    hang_tx,
+                ))
+            });
+
+            // Race the build against a guest-hang signal: the Nix daemon wire
+            // protocol has no per-request cancellation, so abandoning this
+            // future (by picking the other `select!` branch) is the only way
+            // to stop waiting on a guest that will never answer.
+            let run_result = tokio::select! {
+                result = job.run_build(
                     &client,
                     outputs.clone(),
                     &builder,
                     store_uri.as_deref(),
                     &store_dir,
                     vm_conn.as_mut(),
-                )
-                .await;
-            outcome = this_outcome;
-            log = this_log;
+                ) => RunResult::Finished(result),
+                _ = hang_rx, if ping_monitor.is_some() => RunResult::GuestHung,
+            };
+
+            heartbeat.abort();
+            if let Some(pm) = ping_monitor {
+                pm.abort();
+            }
+
+            match run_result {
+                RunResult::Finished((this_outcome, this_log)) => {
+                    outcome = this_outcome;
+                    log = this_log;
+                }
+                RunResult::GuestHung => {
+                    tracing::error!(job_id = %job.job_id, "guest VM became unresponsive mid-build");
+                    let hang_outcome = || {
+                        terminal_failure(
+                            Outcome::failed(infra_failure_message(
+                                &job.job_id,
+                                "the guest VM stopped responding during the build",
+                            )),
+                            FailureKind::GuestHang,
+                        )
+                    };
+                    let (Some(pool), Some(_)) = (vm_pool.as_mut(), vm_handle.as_ref()) else {
+                        // Unreachable in practice -- `ping_monitor` only ever
+                        // spawns when `vm_handle` is `Some`, which requires
+                        // `vm_pool` to be `Some` too. Handled rather than
+                        // asserted, since nothing here depends on it holding.
+                        outcome = hang_outcome();
+                        log = Vec::new();
+                        break;
+                    };
+                    if guest_hang_retried {
+                        outcome = hang_outcome();
+                        log = Vec::new();
+                        break;
+                    }
+                    guest_hang_retried = true;
+                    match pool.wipe_and_reboot(&job.tenant).await {
+                        Ok(new_handle) => match reconnect(&new_handle).await {
+                            Ok(conn) => {
+                                vm_conn = Some(conn);
+                                vm_handle = Some(new_handle);
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(job_id = %job.job_id, error = ?e, "reconnecting after a guest-hang wipe-and-reboot failed");
+                                outcome = hang_outcome();
+                                log = Vec::new();
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!(job_id = %job.job_id, error = ?e, "guest-hang wipe-and-reboot failed");
+                            outcome = hang_outcome();
+                            log = Vec::new();
+                            break;
+                        }
+                    }
+                }
+            }
 
             if !matches!(outcome, Outcome::Failed { .. }) {
                 break;
@@ -960,14 +1081,91 @@ async fn reconnect(handle: &vm::VmHandle) -> eyre::Result<VmConn> {
     VmConn::open(stream).await.map_err(eyre::Report::from)
 }
 
+/// One retry-loop iteration's outcome: either `run_build` actually returned,
+/// or `guest_ping_monitor` declared the guest presumed dead first. See the
+/// `tokio::select!` in the retry loop.
+enum RunResult {
+    Finished((Outcome, Vec<u8>)),
+    GuestHung,
+}
+
+/// Periodically resets `message`'s JetStream `ack_wait` timer
+/// (`AckKind::Progress`) for as long as the caller lets this task run --
+/// spawned once per retry-loop iteration, alongside `guest_ping_monitor`,
+/// and stopped via `JoinHandle::abort` once that iteration's `run_build`
+/// settles. `abort()` rather than the channel-close teardown `pump_channel`/
+/// `pump_log` use: this task has no result to collect and no data-driven
+/// end, just a timer to stop. A send failure is logged, not fatal -- an
+/// isolated missed heartbeat is tolerated by `ack_wait` comfortably
+/// outliving a couple of heartbeat intervals.
+async fn ack_heartbeat(message: jetstream::Message, interval: std::time::Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await; // fires immediately; a fresh delivery already starts its own countdown
+    loop {
+        ticker.tick().await;
+        if let Err(e) = message.ack_with(jetstream::AckKind::Progress).await {
+            tracing::warn!(error = %e, "sending ack heartbeat failed");
+        }
+    }
+}
+
+/// Polls the guest's control port with `PING` on `interval` for as long as
+/// this build attempt is running, so a hung/dead guest is detected in
+/// seconds rather than relying on `ack_wait`'s much longer fuse (see
+/// `ack_heartbeat`). Sends once on `tx` and returns after `threshold`
+/// consecutive failed/timed-out pings -- the counting itself is
+/// [`ping_monitor_step`], kept pure and separately unit-tested.
+async fn guest_ping_monitor(
+    vsock_socket: std::path::PathBuf,
+    interval: std::time::Duration,
+    ping_timeout: std::time::Duration,
+    threshold: u32,
+    tx: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+    let mut consecutive_failures = 0u32;
+    loop {
+        ticker.tick().await;
+        let ping_ok = tokio::time::timeout(ping_timeout, vm::ping(&vsock_socket))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+        let (next, hang_detected) = ping_monitor_step(consecutive_failures, ping_ok, threshold);
+        consecutive_failures = next;
+        if hang_detected {
+            let _ = tx.send(());
+            return;
+        }
+    }
+}
+
+/// Pure step function behind [`guest_ping_monitor`]'s consecutive-failure
+/// counting: `ping_ok` resets the streak to zero (an isolated blip should
+/// not count toward a stale streak), a miss increments it, and the guest is
+/// declared hung the moment the streak reaches `threshold`.
+fn ping_monitor_step(consecutive_failures: u32, ping_ok: bool, threshold: u32) -> (u32, bool) {
+    if ping_ok {
+        (0, false)
+    } else {
+        let next = consecutive_failures + 1;
+        (next, next >= threshold)
+    }
+}
+
 /// PLAN.md Phase 18: what a *terminal* resource-exhaustion failure was --
 /// see `guest-agent/src/ebpf.rs::FailureStatus` and
 /// `worker/src/vm.rs::GuestFailureStatus`, the two upstream signals this is
-/// derived from once every retry/escalation option is exhausted.
+/// derived from once every retry/escalation option is exhausted. `GuestHang`
+/// is the odd one out here: it isn't from `GuestFailureStatus` at all, but
+/// from `guest_ping_monitor` declaring the guest unresponsive -- grouped
+/// with these because it's reported the same way, as a terminal failure
+/// distinguished from an ordinary build failure on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureKind {
     OutOfMemory,
     DiskFull,
+    GuestHang,
 }
 
 /// The wire text for an infra failure — one that happened before or around
@@ -1285,6 +1483,7 @@ impl Job {
                     result.set_failure_kind(match failure_kind {
                         Some(FailureKind::OutOfMemory) => kubernix_capnp::FailureKind::OutOfMemory,
                         Some(FailureKind::DiskFull) => kubernix_capnp::FailureKind::DiskFull,
+                        Some(FailureKind::GuestHang) => kubernix_capnp::FailureKind::GuestHang,
                         None => kubernix_capnp::FailureKind::None,
                     });
                 }
@@ -1418,10 +1617,39 @@ mod tests {
     }
 
     #[test]
+    fn terminal_failure_sets_guest_hang_on_a_failed_outcome() {
+        let outcome = Outcome::failed("guest VM stopped responding");
+        let terminal = terminal_failure(outcome, FailureKind::GuestHang);
+        match terminal {
+            Outcome::Failed { failure_kind, .. } => {
+                assert_eq!(failure_kind, Some(FailureKind::GuestHang));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn terminal_failure_is_a_noop_on_a_completed_outcome() {
         let outcome = Outcome::Completed(Vec::new());
         let terminal = terminal_failure(outcome, FailureKind::DiskFull);
         assert!(matches!(terminal, Outcome::Completed(_)));
+    }
+
+    #[test]
+    fn ping_monitor_step_fires_exactly_at_threshold() {
+        let threshold = 3;
+        let (n, hung) = ping_monitor_step(0, false, threshold);
+        assert_eq!((n, hung), (1, false));
+        let (n, hung) = ping_monitor_step(n, false, threshold);
+        assert_eq!((n, hung), (2, false), "one below threshold: not yet");
+        let (n, hung) = ping_monitor_step(n, false, threshold);
+        assert_eq!((n, hung), (3, true), "reaches threshold: fires");
+    }
+
+    #[test]
+    fn ping_monitor_step_resets_the_streak_on_a_success() {
+        let (n, hung) = ping_monitor_step(2, true, 3);
+        assert_eq!((n, hung), (0, false));
     }
 
     #[test]

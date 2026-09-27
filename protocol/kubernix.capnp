@@ -18,6 +18,11 @@ enum FailureKind {
   none        @0;
   outOfMemory @1;
   diskFull    @2;
+  # The guest VM stopped responding mid-build (control-port PING heartbeat
+  # missed `KUBERNIX_WORKER_GUEST_PING_THRESHOLD` times running) and the
+  # worker's one wipe-and-retry attempt either wasn't available or also
+  # timed out. See worker/src/main.rs::guest_ping_monitor.
+  guestHang   @3;
 }
 
 # An input the client staged to the object store for this build. The worker

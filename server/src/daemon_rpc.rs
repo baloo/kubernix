@@ -1348,6 +1348,10 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                             legacy_protocol::build_result::Status::TransientFailure,
                             format!("kubernix: build failed (disk full): {message}"),
                         ),
+                        Some(crate::jobs::FailureKind::GuestHang) => (
+                            legacy_protocol::build_result::Status::TransientFailure,
+                            format!("kubernix: build failed (guest unresponsive): {message}"),
+                        ),
                         None => (
                             legacy_protocol::build_result::Status::PermanentFailure,
                             message,
