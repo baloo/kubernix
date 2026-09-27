@@ -302,11 +302,19 @@ async fn main() -> Result<()> {
     eprintln!("guest-agent listening on log vsock port {LOG_PORT}");
 
     let substituters: Substituters = Arc::new(Mutex::new(Vec::new()));
+    let extra_ca: ExtraCaCert = Arc::new(Mutex::new(Vec::new()));
 
     let control_detection = detection.clone();
     let control_substituters = substituters.clone();
+    let control_extra_ca = extra_ca.clone();
     tokio::spawn(async move {
-        control_accept_loop(control_listener, control_detection, control_substituters).await;
+        control_accept_loop(
+            control_listener,
+            control_detection,
+            control_substituters,
+            control_extra_ca,
+        )
+        .await;
     });
 
     tokio::spawn(async move {
@@ -328,8 +336,9 @@ async fn main() -> Result<()> {
         // to the agent: a build worth retrying dials again.
         let detection = detection.clone();
         let substituters = substituters.clone();
+        let extra_ca = extra_ca.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve(stream, detection, substituters).await {
+            if let Err(err) = serve(stream, detection, substituters, extra_ca).await {
                 eprintln!("guest-agent: connection handling failed: {err}");
             }
         });
@@ -360,6 +369,7 @@ async fn control_accept_loop(
     listener: VsockListener,
     detection: Option<Arc<Mutex<DetectionState>>>,
     substituters: Substituters,
+    extra_ca: ExtraCaCert,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -372,8 +382,9 @@ async fn control_accept_loop(
         eprintln!("guest-agent: accepted control connection from {peer:?}");
         let detection = detection.clone();
         let substituters = substituters.clone();
+        let extra_ca = extra_ca.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_control(stream, detection, substituters).await {
+            if let Err(err) = handle_control(stream, detection, substituters, extra_ca).await {
                 eprintln!("guest-agent: control connection failed: {err}");
             }
         });
@@ -442,6 +453,7 @@ async fn handle_control(
     mut stream: VsockStream,
     detection: Option<Arc<Mutex<DetectionState>>>,
     substituters: Substituters,
+    extra_ca: ExtraCaCert,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
@@ -451,7 +463,7 @@ async fn handle_control(
         .await
         .wrap_err("reading control line")?;
 
-    let reply = match dispatch_control(line.trim_end(), detection, substituters).await {
+    let reply = match dispatch_control(line.trim_end(), detection, substituters, extra_ca).await {
         Ok(ControlReply::Ok) => "OK\n".to_string(),
         Ok(ControlReply::OkWithData(n)) => format!("OK {n}\n"),
         Ok(ControlReply::OkWithStatus(status)) => format!("OK {}\n", format_status(status)),
@@ -505,6 +517,7 @@ async fn dispatch_control(
     line: &str,
     detection: Option<Arc<Mutex<DetectionState>>>,
     substituters: Substituters,
+    extra_ca: ExtraCaCert,
 ) -> Result<ControlReply> {
     let mut parts = line.split(' ');
     let cmd = parts.next().ok_or_else(|| eyre!("empty control line"))?;
@@ -523,6 +536,19 @@ async fn dispatch_control(
                 .map(|pair| (pair[0].to_string(), pair[1].to_string()))
                 .collect();
             *substituters.lock().await = parsed;
+            Ok(ControlReply::Ok)
+        }
+        // `worker::vm::push_ca_cert` -- one hex-encoded argument, the extra
+        // PEM cert material a helm consumer supplied via
+        // `tls.extraCaVolumeMounts` (empty clears it, same convention as
+        // `SUBST` with no pairs). `spawn_nix_daemon` merges this with the
+        // guest's own baked-in CA bundle before pointing `SSL_CERT_FILE` at
+        // it -- see that function's own comment for why a merge is needed
+        // rather than trusting this alone.
+        "CACERT" => {
+            let hex = parts.next().unwrap_or("");
+            let pem = decode_hex(hex).wrap_err("decoding CACERT payload")?;
+            *extra_ca.lock().await = pem;
             Ok(ControlReply::Ok)
         }
         "CAPS?" => Ok(ControlReply::OkWithData(count_nested_virt_flags()?)),
@@ -834,10 +860,12 @@ async fn serve(
     mut stream: VsockStream,
     detection: Option<Arc<Mutex<DetectionState>>>,
     substituters: Substituters,
+    extra_ca: ExtraCaCert,
 ) -> Result<()> {
     tracing::info!("spawning nix-daemon for a new connection");
     let current_substituters = substituters.lock().await.clone();
-    let mut child = spawn_nix_daemon(&current_substituters)?;
+    let current_extra_ca = extra_ca.lock().await.clone();
+    let mut child = spawn_nix_daemon(&current_substituters, &current_extra_ca)?;
     // PLAN.md Phase 18: scope this nix-daemon instance (and everything it
     // forks for the sandboxed build) into the memory-capped build cgroup --
     // best-effort, same as `cgroup::setup()` itself: a guest where this
@@ -948,7 +976,44 @@ where
 /// process has stayed warm across several jobs.
 type Substituters = Arc<Mutex<Vec<(String, String)>>>;
 
-fn spawn_nix_daemon(substituters: &[(String, String)]) -> Result<Child> {
+/// This deployment's extra trusted CA cert(s), PEM bytes as received from
+/// the most recent `CACERT` control verb — empty when the worker has none
+/// configured (`tls.extraCaVolumeMounts` unset) or hasn't pushed one yet.
+/// Read by [`spawn_nix_daemon`] on each new `NIX_DAEMON_PORT` connection,
+/// same lifecycle as [`Substituters`].
+type ExtraCaCert = Arc<Mutex<Vec<u8>>>;
+
+/// The guest's own baked-in CA bundle (`nix/guest-vm.nix`) — the sole
+/// `SSL_CERT_FILE` target before any extra CA is ever pushed, and the base
+/// this merges with once one is.
+const BAKED_CA_BUNDLE: &str = "/etc/ssl/certs/ca-bundle.crt";
+
+/// Where the merged bundle (baked-in + pushed extra CA) is written when an
+/// extra CA is present — `/tmp` is the guest's one writable location (a real
+/// `tmpfs`, same one `HOME`/`build-dir` already point at below), since the
+/// rest of this root filesystem is the read-only EROFS image.
+const MERGED_CA_BUNDLE: &str = "/tmp/kubernix-extra-ca-bundle.crt";
+
+/// The `SSL_CERT_FILE` path `spawn_nix_daemon` should use: the baked-in
+/// bundle unchanged when no extra CA has been pushed (byte-for-byte today's
+/// behaviour), or a freshly (re)written merge of that bundle plus `extra_ca`
+/// otherwise. Rewritten on every call rather than cached — `extra_ca` is
+/// tiny and `/tmp` is a `tmpfs`, so the cost is negligible next to always
+/// being correct after a `CACERT` update lands mid-lifetime of a warm guest.
+fn merged_ca_bundle_path(extra_ca: &[u8]) -> Result<&'static str> {
+    if extra_ca.is_empty() {
+        return Ok(BAKED_CA_BUNDLE);
+    }
+    let mut merged = std::fs::read(BAKED_CA_BUNDLE)
+        .wrap_err_with(|| format!("reading the baked-in CA bundle at {BAKED_CA_BUNDLE}"))?;
+    merged.push(b'\n');
+    merged.extend_from_slice(extra_ca);
+    std::fs::write(MERGED_CA_BUNDLE, &merged)
+        .wrap_err_with(|| format!("writing the merged CA bundle to {MERGED_CA_BUNDLE}"))?;
+    Ok(MERGED_CA_BUNDLE)
+}
+
+fn spawn_nix_daemon(substituters: &[(String, String)], extra_ca: &[u8]) -> Result<Child> {
     let mut nix_config = "build-dir = /tmp\n\
              pasta-path =\n\
              experimental-features = auto-allocate-uids cgroups\n\
@@ -1023,12 +1088,20 @@ fn spawn_nix_daemon(substituters: &[(String, String)]) -> Result<Child> {
         // (mounted in `main()`, and already where `build-dir` points, just
         // above) -- reusing it here needs no new mount.
         .env("HOME", "/tmp")
-        // `nix/guest-vm.nix` bakes a CA bundle in at this exact path --
+        // `nix/guest-vm.nix` bakes a CA bundle in at `BAKED_CA_BUNDLE` --
         // without pointing `SSL_CERT_FILE` at it, every HTTPS fetch inside
         // the sandbox fails "unable to get local issuer certificate" (no
         // `/etc/ssl/certs` at all otherwise exists in this guest for
-        // OpenSSL's own default search paths to find anything at).
-        .env("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt")
+        // OpenSSL's own default search paths to find anything at). Lix's
+        // own CA handling only ever trusts a single `SSL_CERT_FILE`,
+        // completely replacing the default rather than merging in a
+        // directory the way `rustls-native-certs` does for this worker's
+        // own `reqwest`/`aws-sdk-s3` clients -- so when an extra CA has
+        // been pushed (`CACERT`, dispatch_control), it has to be merged
+        // with the baked-in bundle into one file rather than substituted
+        // for it outright, or every fetch against a public substituter
+        // (cache.nixos.org included) would stop being trusted.
+        .env("SSL_CERT_FILE", merged_ca_bundle_path(extra_ca)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -1077,11 +1150,17 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
         Arc::new(Mutex::new(Vec::new()))
     }
 
+    /// A fresh, empty `ExtraCaCert` for tests that don't care about it --
+    /// same reason as `no_substituters`.
+    fn no_extra_ca() -> ExtraCaCert {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
     #[tokio::test]
     async fn dispatch_control_caps_returns_data() {
         // Real /proc/cpuinfo on the machine running the test -- whatever it
         // reports, dispatch should surface it as OkWithData, not Ok/Err.
-        match dispatch_control("CAPS?", None, no_substituters()).await {
+        match dispatch_control("CAPS?", None, no_substituters(), no_extra_ca()).await {
             Ok(ControlReply::OkWithData(_)) => {}
             other => panic!("expected OkWithData, got {other:?}"),
         }
@@ -1089,7 +1168,7 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
 
     #[tokio::test]
     async fn dispatch_control_unrecognised_verb_errors() {
-        let err = dispatch_control("WAT", None, no_substituters())
+        let err = dispatch_control("WAT", None, no_substituters(), no_extra_ca())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unrecognised control command"));
@@ -1097,7 +1176,11 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
 
     #[tokio::test]
     async fn dispatch_control_empty_line_errors() {
-        assert!(dispatch_control("", None, no_substituters()).await.is_err());
+        assert!(
+            dispatch_control("", None, no_substituters(), no_extra_ca())
+                .await
+                .is_err()
+        );
     }
 
     // PLAN.md Phase 18: STATUS?/RESET without a real eBPF-backed
@@ -1108,7 +1191,7 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
     // an unknown verb.
     #[tokio::test]
     async fn dispatch_control_status_without_detection_errors() {
-        let err = dispatch_control("STATUS?", None, no_substituters())
+        let err = dispatch_control("STATUS?", None, no_substituters(), no_extra_ca())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("eBPF detection not available"));
@@ -1116,7 +1199,7 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
 
     #[tokio::test]
     async fn dispatch_control_reset_without_detection_errors() {
-        let err = dispatch_control("RESET", None, no_substituters())
+        let err = dispatch_control("RESET", None, no_substituters(), no_extra_ca())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("eBPF detection not available"));
@@ -1129,6 +1212,7 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
             "SUBST https://cache.nixos.org cache.nixos.org-1:AAAA",
             None,
             substituters.clone(),
+            no_extra_ca(),
         )
         .await
         .unwrap();
@@ -1144,7 +1228,7 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
     #[tokio::test]
     async fn dispatch_control_subst_with_no_pairs_clears_it() {
         let substituters = no_substituters();
-        dispatch_control("SUBST", None, substituters.clone())
+        dispatch_control("SUBST", None, substituters.clone(), no_extra_ca())
             .await
             .unwrap();
         assert!(substituters.lock().await.is_empty());
@@ -1152,10 +1236,34 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
 
     #[tokio::test]
     async fn dispatch_control_subst_rejects_an_odd_token_count() {
-        let err = dispatch_control("SUBST https://cache.nixos.org", None, no_substituters())
-            .await
-            .unwrap_err();
+        let err = dispatch_control(
+            "SUBST https://cache.nixos.org",
+            None,
+            no_substituters(),
+            no_extra_ca(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("even number"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_cacert_updates_the_shared_state() {
+        let extra_ca = no_extra_ca();
+        // "deadbeef" decodes to [0xde, 0xad, 0xbe, 0xef]
+        dispatch_control("CACERT deadbeef", None, no_substituters(), extra_ca.clone())
+            .await
+            .unwrap();
+        assert_eq!(*extra_ca.lock().await, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_control_cacert_empty_clears_it() {
+        let extra_ca = Arc::new(Mutex::new(vec![0xde, 0xad, 0xbe, 0xef]));
+        dispatch_control("CACERT", None, no_substituters(), extra_ca.clone())
+            .await
+            .unwrap();
+        assert!(extra_ca.lock().await.is_empty());
     }
 
     #[test]
