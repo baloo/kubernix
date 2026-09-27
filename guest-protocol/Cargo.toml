@@ -1,0 +1,11 @@
+[package]
+name = "kubernix-guest-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+postcard.workspace = true
+postcard-rpc = { workspace = true, features = ["use-std", "tokio"] }
+postcard-schema = { workspace = true, features = ["use-std"] }
+serde.workspace = true
+tokio = { workspace = true, features = ["io-util"] }

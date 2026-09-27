@@ -5,11 +5,12 @@
 //! - `NIX_DAEMON_PORT`: on each accepted connection, spawns `nix-daemon
 //!   --stdio` and splices the connection's bytes straight onto the child's
 //!   stdin/stdout, in both directions, until either side closes.
-//! - `CONTROL_PORT` (Phase 15 Step 4): a verb-prefixed line protocol,
-//!   one-shot per connection. `KEY` unlocks and mounts the tenant's
-//!   `store.img` before any `nix-daemon` connection is worth accepting;
-//!   `CAPS?` (Phase 17) answers a boot-time nested-virt self-test. See
-//!   [`handle_control`].
+//! - `CONTROL_PORT`: a binary `postcard-rpc` control channel, persistent per
+//!   connection. `guest/key` unlocks and mounts the tenant's `store.img`
+//!   before any `nix-daemon` connection is worth accepting; `guest/caps`
+//!   (Phase 17) answers a boot-time nested-virt self-test; the guest also
+//!   pushes a `guest/heartbeat` pulse on this connection so the worker can
+//!   detect a hung guest without polling. See [`control::run_control_connection`].
 //! - `LOG_PORT`: a debugging aid, not part of the production protocol surface
 //!   — streams this process's `tracing` output to whoever connects. See the
 //!   "Logging" section below for why it's a separate channel.
@@ -53,6 +54,8 @@
 //! just a different pipe for the same noise.
 
 mod cgroup;
+mod control;
+mod control_transport;
 mod diag;
 mod ebpf;
 
@@ -61,14 +64,12 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use eyre::{Context, Result, eyre};
-use tokio::io::{
-    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
-};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
 
-use ebpf::{DetectionState, FailureStatus};
+use ebpf::DetectionState;
 
 /// Fixed by convention between `guest-agent` and whatever dials it (the
 /// worker, or this crate's own boot test in the meantime) — there is exactly
@@ -384,9 +385,15 @@ async fn control_accept_loop(
         let substituters = substituters.clone();
         let extra_ca = extra_ca.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_control(stream, detection, substituters, extra_ca).await {
-                eprintln!("guest-agent: control connection failed: {err}");
-            }
+            control::run_control_connection(
+                stream,
+                control::Context {
+                    detection,
+                    substituters,
+                    extra_ca,
+                },
+            )
+            .await;
         });
     }
 }
@@ -423,165 +430,6 @@ async fn log_accept_loop(listener: VsockListener, tx: broadcast::Sender<Vec<u8>>
                 }
             }
         });
-    }
-}
-
-/// One-shot-per-connection, verb-prefixed line protocol: read a single line,
-/// dispatch on its first space-separated token, and reply either `OK\n`,
-/// `OK <data>\n` (a verb that answers with data rather than plain
-/// success), or `ERR <message>\n`, before closing. Verbs today:
-///
-/// - `KEY <64 hex chars> <FRESH|REUSE>` -- open `RAW_DEVICE` as plain
-///   `dm-crypt` with that key, `mkfs.ext4` it first if `FRESH`, mount the
-///   result at `STORE_MOUNT`. See `worker/src/vm.rs::push_key` for the
-///   client side.
-/// - `CAPS?` -- report nested-virtualization support as seen from inside
-///   this guest (PLAN.md Phase 17). See `worker/src/vm.rs::boot_probe` for
-///   the client side.
-/// - `STATUS?` -- report whatever resource-exhaustion signal has fired
-///   since the last `RESET`, without clearing it (PLAN.md Phase 18). See
-///   `worker/src/vm.rs::query_status`.
-/// - `RESET` -- clear the OOM/ENOSPC detection state, scoping it to the
-///   build about to start (PLAN.md Phase 18). Sent by the worker right
-///   before it opens a new build's daemon-protocol connection. See
-///   `worker/src/vm.rs::reset_job_status`.
-/// - `PING` -- liveness check, sent repeatedly by the worker while a build
-///   is running so a hung/dead guest is detected in seconds rather than
-///   waiting on the much longer JetStream `ack_wait` fuse. Stateless: it
-///   only proves the control-port accept loop is still scheduled and
-///   responsive, not that the daemon-port build itself is progressing. See
-///   `worker/src/vm.rs::ping`/`worker/src/main.rs::guest_ping_monitor`.
-/// - `TRIGGER_OOM` / `TRIGGER_ENOSPC` -- diagnostic-only (PLAN.md Phase
-///   18): drive `diag.rs`'s payloads from the outside, for
-///   `nix/vm-oom-test.nix`/`vm-enospc-test.nix`. No production client ever
-///   sends either.
-async fn handle_control(
-    mut stream: VsockStream,
-    detection: Option<Arc<Mutex<DetectionState>>>,
-    substituters: Substituters,
-    extra_ca: ExtraCaCert,
-) -> Result<()> {
-    let (read_half, mut write_half) = stream.split();
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .wrap_err("reading control line")?;
-
-    let reply = match dispatch_control(line.trim_end(), detection, substituters, extra_ca).await {
-        Ok(ControlReply::Ok) => "OK\n".to_string(),
-        Ok(ControlReply::OkWithData(n)) => format!("OK {n}\n"),
-        Ok(ControlReply::OkWithStatus(status)) => format!("OK {}\n", format_status(status)),
-        // `eyre::Report`'s `Display` only surfaces the outermost context
-        // (e.g. "cryptsetup open"), discarding exactly the underlying
-        // command's stderr that explains *why* -- join the full chain so a
-        // caller (or a console log grep) sees the real cause, not just which
-        // step failed.
-        Err(err) => {
-            let chain: Vec<String> = err.chain().map(|e| e.to_string()).collect();
-            format!("ERR {}\n", chain.join(": "))
-        }
-    };
-    write_half
-        .write_all(reply.as_bytes())
-        .await
-        .wrap_err("writing control reply")?;
-    // Explicit graceful half-close: a `Drop`-only close (tried while chasing
-    // what turned out to be an unrelated bug -- see `nix/vm-test-lib.nix`'s
-    // `vm_push_key` doc comment) made the client-side `socat` see a less
-    // clean disconnect, enough to exit non-zero even after successfully
-    // reading the reply -- and under the test script's `set -euo pipefail`,
-    // that alone killed the whole script via `pipefail`.
-    write_half.shutdown().await.ok();
-    Ok(())
-}
-
-#[derive(Debug)]
-enum ControlReply {
-    Ok,
-    OkWithData(u32),
-    OkWithStatus(FailureStatus),
-}
-
-/// `OK <data>\n`'s wire text for a `STATUS?` reply -- see
-/// `worker/src/vm.rs::parse_status_reply`, the client-side counterpart.
-fn format_status(status: FailureStatus) -> String {
-    match status {
-        FailureStatus::None => "NONE".to_string(),
-        FailureStatus::OutOfMemory {
-            builder_victim: true,
-        } => "OOM BUILDER".to_string(),
-        FailureStatus::OutOfMemory {
-            builder_victim: false,
-        } => "OOM OTHER".to_string(),
-        FailureStatus::DiskFull => "ENOSPC".to_string(),
-    }
-}
-
-async fn dispatch_control(
-    line: &str,
-    detection: Option<Arc<Mutex<DetectionState>>>,
-    substituters: Substituters,
-    extra_ca: ExtraCaCert,
-) -> Result<ControlReply> {
-    let mut parts = line.split(' ');
-    let cmd = parts.next().ok_or_else(|| eyre!("empty control line"))?;
-    match cmd {
-        "KEY" => {
-            unlock_and_mount(parts).await?;
-            Ok(ControlReply::Ok)
-        }
-        "SUBST" => {
-            let tokens: Vec<&str> = parts.filter(|s| !s.is_empty()).collect();
-            if tokens.len() % 2 != 0 {
-                return Err(eyre!("SUBST needs an even number of url/key tokens"));
-            }
-            let parsed: Vec<(String, String)> = tokens
-                .chunks_exact(2)
-                .map(|pair| (pair[0].to_string(), pair[1].to_string()))
-                .collect();
-            *substituters.lock().await = parsed;
-            Ok(ControlReply::Ok)
-        }
-        // `worker::vm::push_ca_cert` -- one hex-encoded argument, the extra
-        // PEM cert material a helm consumer supplied via
-        // `tls.extraCaVolumeMounts` (empty clears it, same convention as
-        // `SUBST` with no pairs). `spawn_nix_daemon` merges this with the
-        // guest's own baked-in CA bundle before pointing `SSL_CERT_FILE` at
-        // it -- see that function's own comment for why a merge is needed
-        // rather than trusting this alone.
-        "CACERT" => {
-            let hex = parts.next().unwrap_or("");
-            let pem = decode_hex(hex).wrap_err("decoding CACERT payload")?;
-            *extra_ca.lock().await = pem;
-            Ok(ControlReply::Ok)
-        }
-        "PING" => Ok(ControlReply::Ok),
-        "CAPS?" => Ok(ControlReply::OkWithData(count_nested_virt_flags()?)),
-        "STATUS?" => {
-            let detection = detection.ok_or_else(|| eyre!("eBPF detection not available"))?;
-            let status = detection.lock().await.status().await;
-            Ok(ControlReply::OkWithStatus(status))
-        }
-        "RESET" => {
-            let detection = detection.ok_or_else(|| eyre!("eBPF detection not available"))?;
-            detection.lock().await.reset().await?;
-            Ok(ControlReply::Ok)
-        }
-        // PLAN.md Phase 18, diagnostic-only: drives `diag.rs`'s payloads
-        // from the outside, for `nix/vm-oom-test.nix`/`vm-enospc-test.nix`.
-        // A real deployment never sends either -- only the worker's
-        // `KEY`/`CAPS?`/`STATUS?`/`RESET` traffic is production use.
-        "TRIGGER_OOM" => {
-            trigger_oom().await?;
-            Ok(ControlReply::Ok)
-        }
-        "TRIGGER_ENOSPC" => {
-            trigger_enospc().await;
-            Ok(ControlReply::Ok)
-        }
-        other => Err(eyre!("unrecognised control command {other:?}")),
     }
 }
 
@@ -625,20 +473,7 @@ async fn trigger_enospc() {
     .await;
 }
 
-async fn unlock_and_mount(mut parts: std::str::Split<'_, char>) -> Result<()> {
-    let hex_key = parts
-        .next()
-        .ok_or_else(|| eyre!("missing key in KEY command"))?;
-    let mode = parts
-        .next()
-        .ok_or_else(|| eyre!("missing FRESH/REUSE in KEY command"))?;
-    let fresh = match mode {
-        "FRESH" => true,
-        "REUSE" => false,
-        other => return Err(eyre!("unrecognised mode {other:?}, want FRESH or REUSE")),
-    };
-    let key = decode_hex(hex_key).wrap_err("decoding key")?;
-
+async fn unlock_and_mount(key: &[u8], fresh: bool) -> Result<()> {
     // `BLK_DEV_DM`/`DM_CRYPT` are kernel modules, not builtins (see
     // `nix/guest-vm.nix`'s comment on why), so `/dev/mapper/control` doesn't
     // exist until `dm-mod`/`dm-crypt` are loaded. `modprobe`'s `modules.dep`
@@ -649,7 +484,7 @@ async fn unlock_and_mount(mut parts: std::str::Split<'_, char>) -> Result<()> {
     // `/sbin/modprobe` this depends on being present.
     modprobe("dm-crypt").await?;
 
-    cryptsetup_open(&key).await?;
+    cryptsetup_open(key).await?;
     if fresh {
         mkfs_ext4().await?;
     }
@@ -675,19 +510,6 @@ fn count_nested_virt_flags_str(cpuinfo: &str) -> u32 {
         .lines()
         .filter(|line| line.contains("vmx") || line.contains("svm"))
         .count() as u32
-}
-
-fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return Err(eyre!("odd-length hex string"));
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .wrap_err_with(|| format!("invalid hex byte at {i}"))
-        })
-        .collect()
 }
 
 /// Load `module` and its dependencies via `modprobe`'s `modules.dep`
@@ -1151,143 +973,10 @@ processor\t: 1\nflags\t\t: fpu vme de pse tsc vmx\n";
         assert_eq!(count_nested_virt_flags_str(cpuinfo), 1);
     }
 
-    /// A fresh, empty `Substituters` for tests that don't care about it --
-    /// every `dispatch_control` call needs one now.
-    fn no_substituters() -> Substituters {
-        Arc::new(Mutex::new(Vec::new()))
-    }
-
-    /// A fresh, empty `ExtraCaCert` for tests that don't care about it --
-    /// same reason as `no_substituters`.
-    fn no_extra_ca() -> ExtraCaCert {
-        Arc::new(Mutex::new(Vec::new()))
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_caps_returns_data() {
-        // Real /proc/cpuinfo on the machine running the test -- whatever it
-        // reports, dispatch should surface it as OkWithData, not Ok/Err.
-        match dispatch_control("CAPS?", None, no_substituters(), no_extra_ca()).await {
-            Ok(ControlReply::OkWithData(_)) => {}
-            other => panic!("expected OkWithData, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_unrecognised_verb_errors() {
-        let err = dispatch_control("WAT", None, no_substituters(), no_extra_ca())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("unrecognised control command"));
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_empty_line_errors() {
-        assert!(
-            dispatch_control("", None, no_substituters(), no_extra_ca())
-                .await
-                .is_err()
-        );
-    }
-
-    // PLAN.md Phase 18: STATUS?/RESET without a real eBPF-backed
-    // `DetectionState` (unit tests never boot a real kernel) still exercise
-    // the dispatch's own plumbing -- both verbs should fail cleanly (not
-    // panic) rather than pretend to answer when detection isn't available,
-    // the same shape `dispatch_control_unrecognised_verb_errors` checks for
-    // an unknown verb.
-    #[tokio::test]
-    async fn dispatch_control_status_without_detection_errors() {
-        let err = dispatch_control("STATUS?", None, no_substituters(), no_extra_ca())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("eBPF detection not available"));
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_reset_without_detection_errors() {
-        let err = dispatch_control("RESET", None, no_substituters(), no_extra_ca())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("eBPF detection not available"));
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_subst_updates_the_shared_state() {
-        let substituters = no_substituters();
-        dispatch_control(
-            "SUBST https://cache.nixos.org cache.nixos.org-1:AAAA",
-            None,
-            substituters.clone(),
-            no_extra_ca(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            *substituters.lock().await,
-            vec![(
-                "https://cache.nixos.org".to_string(),
-                "cache.nixos.org-1:AAAA".to_string()
-            )]
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_subst_with_no_pairs_clears_it() {
-        let substituters = no_substituters();
-        dispatch_control("SUBST", None, substituters.clone(), no_extra_ca())
-            .await
-            .unwrap();
-        assert!(substituters.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_subst_rejects_an_odd_token_count() {
-        let err = dispatch_control(
-            "SUBST https://cache.nixos.org",
-            None,
-            no_substituters(),
-            no_extra_ca(),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("even number"));
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_cacert_updates_the_shared_state() {
-        let extra_ca = no_extra_ca();
-        // "deadbeef" decodes to [0xde, 0xad, 0xbe, 0xef]
-        dispatch_control("CACERT deadbeef", None, no_substituters(), extra_ca.clone())
-            .await
-            .unwrap();
-        assert_eq!(*extra_ca.lock().await, vec![0xde, 0xad, 0xbe, 0xef]);
-    }
-
-    #[tokio::test]
-    async fn dispatch_control_cacert_empty_clears_it() {
-        let extra_ca = Arc::new(Mutex::new(vec![0xde, 0xad, 0xbe, 0xef]));
-        dispatch_control("CACERT", None, no_substituters(), extra_ca.clone())
-            .await
-            .unwrap();
-        assert!(extra_ca.lock().await.is_empty());
-    }
-
-    #[test]
-    fn format_status_matches_wire_convention() {
-        assert_eq!(format_status(FailureStatus::None), "NONE");
-        assert_eq!(
-            format_status(FailureStatus::OutOfMemory {
-                builder_victim: true
-            }),
-            "OOM BUILDER"
-        );
-        assert_eq!(
-            format_status(FailureStatus::OutOfMemory {
-                builder_victim: false
-            }),
-            "OOM OTHER"
-        );
-        assert_eq!(format_status(FailureStatus::DiskFull), "ENOSPC");
-    }
+    // The old `dispatch_control_*`/`format_status_*` tests against the
+    // line-based protocol moved to `control.rs`'s own test module, now
+    // exercising the postcard-rpc handler functions directly instead of a
+    // parsed text line -- same intent (SUBST/CACERT update/clear shared
+    // state, STATUS?/RESET fail cleanly without a real eBPF backend, CAPS?
+    // returns real data), different call surface.
 }

@@ -14,10 +14,12 @@ color-eyre.workspace = true
 digest-io-async.workspace = true
 eyre.workspace = true
 kubernix-daemon-protocol.workspace = true
+kubernix-guest-protocol.workspace = true
 futures-util.workspace = true
 http-body = "1"
 http-body-util = "0.1"
 kubernix-types.workspace = true
+postcard-rpc = { workspace = true, features = ["use-std", "tokio"] }
 # Phase 15 Step 8: per-tenant uid separation for `cloud-hypervisor`/`passt`
 # (setuid/setgid/setgroups in a `pre_exec` hook, `prctl(PR_SET_DUMPABLE)` on
 # the worker itself, resolving the `kvm` group by name). Already pulled in

@@ -10,7 +10,7 @@
 //! `ack_heartbeat` resets JetStream's `ack_wait` timer throughout a live
 //! build, so redelivery only actually happens once the worker itself has
 //! gone quiet. A hung/dead *guest* VM (worker still alive) is instead
-//! detected directly and much faster by `guest_ping_monitor`.
+//! detected directly and much faster by `guest_heartbeat_monitor`.
 
 pub mod kubernix_capnp {
     include!(concat!(env!("OUT_DIR"), "/kubernix_capnp.rs"));
@@ -308,19 +308,17 @@ async fn main() -> color_eyre::eyre::Result<()> {
         "KUBERNIX_WORKER_ACK_HEARTBEAT_INTERVAL",
         std::time::Duration::from_secs(20),
     );
-    // Feature B tunables (guest_ping_monitor): how often to PING the guest's
-    // control port while a build is running, how long a single PING may take
-    // before it counts as a miss, and how many consecutive misses mean
-    // "presumed dead" -- see `guest_ping_monitor`'s doc comment.
-    let guest_ping_interval = env_secs(
-        "KUBERNIX_WORKER_GUEST_PING_INTERVAL",
-        std::time::Duration::from_secs(5),
+    // Feature B tunable (guest_heartbeat_monitor): how long since the last
+    // heartbeat arrived before the guest is presumed dead -- see that
+    // function's doc comment. Replaces the old three-way
+    // interval/timeout/threshold PING-polling tunables (their product was
+    // roughly 15-20s at the old defaults of 5s/5s/3) with one deadline in the
+    // same ballpark, now that the guest pushes heartbeats instead of being
+    // polled for them.
+    let guest_heartbeat_deadline = env_secs(
+        "KUBERNIX_WORKER_GUEST_HEARTBEAT_DEADLINE",
+        std::time::Duration::from_secs(20),
     );
-    let guest_ping_timeout = env_secs(
-        "KUBERNIX_WORKER_GUEST_PING_TIMEOUT",
-        std::time::Duration::from_secs(5),
-    );
-    let guest_ping_threshold = env_positive_i64("KUBERNIX_WORKER_GUEST_PING_THRESHOLD", 3) as u32;
     // Same directory this process's own `reqwest`/`aws-sdk-s3`-style trust
     // resolution already reads via `SSL_CERT_DIR` (set by the chart
     // whenever a consumer supplies `tls.extraCaVolumeMounts`, see
@@ -668,11 +666,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
             // subprocess fallback path has none.
             let (hang_tx, hang_rx) = tokio::sync::oneshot::channel();
             let ping_monitor = vm_handle.as_ref().map(|handle| {
-                tokio::spawn(guest_ping_monitor(
+                tokio::spawn(guest_heartbeat_monitor(
                     handle.vsock_socket.clone(),
-                    guest_ping_interval,
-                    guest_ping_timeout,
-                    guest_ping_threshold,
+                    guest_heartbeat_deadline,
                     hang_tx,
                 ))
             });
@@ -1109,48 +1105,78 @@ async fn ack_heartbeat(message: jetstream::Message, interval: std::time::Duratio
     }
 }
 
-/// Polls the guest's control port with `PING` on `interval` for as long as
-/// this build attempt is running, so a hung/dead guest is detected in
-/// seconds rather than relying on `ack_wait`'s much longer fuse (see
-/// `ack_heartbeat`). Sends once on `tx` and returns after `threshold`
-/// consecutive failed/timed-out pings -- the counting itself is
-/// [`ping_monitor_step`], kept pure and separately unit-tested.
-async fn guest_ping_monitor(
+/// Watches the guest-agent's heartbeat topic for as long as this build
+/// attempt is running, so a hung/dead guest is detected in seconds rather
+/// than relying on `ack_wait`'s much longer fuse (see `ack_heartbeat`).
+/// Replaces the old active `PING`-polling `guest_ping_monitor`: the guest
+/// now pushes a `Heartbeat` on its own cadence
+/// (`guest-agent/src/control.rs`), and this task declares the guest hung the
+/// moment `deadline` elapses since the last one arrived (or since this task
+/// started, if none ever has) — see [`heartbeat_is_stale`], kept pure and
+/// separately unit-tested. Sends once on `tx` and returns, either on
+/// staleness or if the connection/subscription itself fails outright (a
+/// dropped control connection is exactly as strong a "guest is gone" signal
+/// as a missed heartbeat, since both share the same underlying connection).
+async fn guest_heartbeat_monitor(
     vsock_socket: std::path::PathBuf,
-    interval: std::time::Duration,
-    ping_timeout: std::time::Duration,
-    threshold: u32,
+    deadline: std::time::Duration,
     tx: tokio::sync::oneshot::Sender<()>,
 ) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.tick().await;
-    let mut consecutive_failures = 0u32;
-    loop {
-        ticker.tick().await;
-        let ping_ok = tokio::time::timeout(ping_timeout, vm::ping(&vsock_socket))
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
-        let (next, hang_detected) = ping_monitor_step(consecutive_failures, ping_ok, threshold);
-        consecutive_failures = next;
-        if hang_detected {
+    let client = match vm::connect_control_client(&vsock_socket).await {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = ?e, "connecting the heartbeat monitor failed");
             let _ = tx.send(());
             return;
+        }
+    };
+    let mut sub = match client
+        .subscribe_multi::<kubernix_guest_protocol::HeartbeatTopic>(8)
+        .await
+    {
+        Ok(sub) => sub,
+        Err(_) => {
+            let _ = tx.send(());
+            return;
+        }
+    };
+
+    let mut last_seen = std::time::Instant::now();
+    loop {
+        let remaining = deadline.saturating_sub(last_seen.elapsed());
+        match tokio::time::timeout(remaining, sub.recv()).await {
+            Ok(Ok(_heartbeat)) => {
+                last_seen = std::time::Instant::now();
+            }
+            // The subscription/connection closed outright -- exactly as
+            // strong a "no more heartbeats are coming" signal as staleness.
+            Ok(Err(_)) => {
+                let _ = tx.send(());
+                return;
+            }
+            // No heartbeat arrived within `deadline` of the last one.
+            Err(_elapsed) => {
+                debug_assert!(heartbeat_is_stale(
+                    last_seen,
+                    std::time::Instant::now(),
+                    deadline
+                ));
+                let _ = tx.send(());
+                return;
+            }
         }
     }
 }
 
-/// Pure step function behind [`guest_ping_monitor`]'s consecutive-failure
-/// counting: `ping_ok` resets the streak to zero (an isolated blip should
-/// not count toward a stale streak), a miss increments it, and the guest is
-/// declared hung the moment the streak reaches `threshold`.
-fn ping_monitor_step(consecutive_failures: u32, ping_ok: bool, threshold: u32) -> (u32, bool) {
-    if ping_ok {
-        (0, false)
-    } else {
-        let next = consecutive_failures + 1;
-        (next, next >= threshold)
-    }
+/// Pure staleness check behind [`guest_heartbeat_monitor`]: the guest is
+/// presumed dead once `deadline` has elapsed since the last heartbeat was
+/// actually received.
+fn heartbeat_is_stale(
+    last_seen: std::time::Instant,
+    now: std::time::Instant,
+    deadline: std::time::Duration,
+) -> bool {
+    now.saturating_duration_since(last_seen) >= deadline
 }
 
 /// PLAN.md Phase 18: what a *terminal* resource-exhaustion failure was --
@@ -1636,20 +1662,24 @@ mod tests {
     }
 
     #[test]
-    fn ping_monitor_step_fires_exactly_at_threshold() {
-        let threshold = 3;
-        let (n, hung) = ping_monitor_step(0, false, threshold);
-        assert_eq!((n, hung), (1, false));
-        let (n, hung) = ping_monitor_step(n, false, threshold);
-        assert_eq!((n, hung), (2, false), "one below threshold: not yet");
-        let (n, hung) = ping_monitor_step(n, false, threshold);
-        assert_eq!((n, hung), (3, true), "reaches threshold: fires");
-    }
-
-    #[test]
-    fn ping_monitor_step_resets_the_streak_on_a_success() {
-        let (n, hung) = ping_monitor_step(2, true, 3);
-        assert_eq!((n, hung), (0, false));
+    fn heartbeat_is_stale_fires_once_deadline_elapses() {
+        let last_seen = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(20);
+        assert!(!heartbeat_is_stale(
+            last_seen,
+            last_seen + std::time::Duration::from_secs(19),
+            deadline
+        ));
+        assert!(heartbeat_is_stale(
+            last_seen,
+            last_seen + std::time::Duration::from_secs(20),
+            deadline
+        ));
+        assert!(heartbeat_is_stale(
+            last_seen,
+            last_seen + std::time::Duration::from_secs(21),
+            deadline
+        ));
     }
 
     #[test]
