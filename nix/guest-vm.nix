@@ -58,10 +58,17 @@ let
       # still needs: the kernel has to be able to unpack this zstd-compressed
       # initramfs (`nix/guest-vm.nix`'s `makeInitrdNG` uses `compressor =
       # "zstd"`) and exec ELF binaries out of it (`guest-agent` as `/init`,
-      # then the `nix-daemon` it spawns).
+      # then the `nix-daemon` it spawns). `BINFMT_SCRIPT` is the same kind of
+      # plumbing for the builds `nix-daemon` then runs inside its sandbox:
+      # build phases routinely `execve()` a script straight off its `#!` line
+      # (`./configure`, wrapper scripts, ...) rather than always invoking an
+      # interpreter explicitly, and without it that exec fails outright with
+      # `ENOEXEC` even though `BINFMT_ELF` alone makes everything else here
+      # look fine.
       BLK_DEV_INITRD = yes;
       RD_ZSTD = yes;
       BINFMT_ELF = yes;
+      BINFMT_SCRIPT = yes;
       BLOCK = yes;
       # `tiny.config` (what `tinyconfig` layers on top of `allnoconfig`)
       # disables `PRINTK` outright to save size -- without it the kernel is
