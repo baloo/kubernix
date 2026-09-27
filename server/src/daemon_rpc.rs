@@ -1202,12 +1202,46 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                         "trusted substituters for build VM"
                     );
 
+                    // `staged` only covers paths pushed on *this* connection,
+                    // which is right for an ordinary `nix build` (it pushes
+                    // whatever it locally knows is missing right before
+                    // calling us). But a client that already believed
+                    // kubernix had an input — e.g. it was pushed earlier via
+                    // a separate `nix copy` — never re-pushes it here, so
+                    // `staged` alone can miss inputs this derivation still
+                    // needs, even though the frontend can already vouch for
+                    // them. Fill those in the same way `finalize`'s "already
+                    // vouched for" branch resolves a single path's key.
+                    let mut known: std::collections::HashSet<StorePath> = staged
+                        .iter()
+                        .map(|input| input.store_path.clone())
+                        .collect();
+                    let mut inputs = staged;
+                    for src in &parsed.input_srcs {
+                        if !known.insert(src.clone()) {
+                            continue;
+                        }
+                        let Some(object) = store.output_object(src).await else {
+                            continue;
+                        };
+                        let info = store.query_path_info(src).await;
+                        inputs.push(crate::jobs::InputRef {
+                            store_path: src.clone(),
+                            key: object.key,
+                            references: info
+                                .as_ref()
+                                .map(|i| i.references.clone())
+                                .unwrap_or_default(),
+                            deriver: info.and_then(|i| i.deriver).unwrap_or_default(),
+                        });
+                    }
+
                     let job = BuildJob {
                         job_id,
                         derivation_path: path.clone(),
                         system: system.clone(),
                         drv,
-                        inputs: staged,
+                        inputs,
                         tenant: tenant.clone(),
                         token,
                         required_features,
