@@ -445,6 +445,12 @@ async fn log_accept_loop(listener: VsockListener, tx: broadcast::Sender<Vec<u8>>
 ///   build about to start (PLAN.md Phase 18). Sent by the worker right
 ///   before it opens a new build's daemon-protocol connection. See
 ///   `worker/src/vm.rs::reset_job_status`.
+/// - `PING` -- liveness check, sent repeatedly by the worker while a build
+///   is running so a hung/dead guest is detected in seconds rather than
+///   waiting on the much longer JetStream `ack_wait` fuse. Stateless: it
+///   only proves the control-port accept loop is still scheduled and
+///   responsive, not that the daemon-port build itself is progressing. See
+///   `worker/src/vm.rs::ping`/`worker/src/main.rs::guest_ping_monitor`.
 /// - `TRIGGER_OOM` / `TRIGGER_ENOSPC` -- diagnostic-only (PLAN.md Phase
 ///   18): drive `diag.rs`'s payloads from the outside, for
 ///   `nix/vm-oom-test.nix`/`vm-enospc-test.nix`. No production client ever
@@ -551,6 +557,7 @@ async fn dispatch_control(
             *extra_ca.lock().await = pem;
             Ok(ControlReply::Ok)
         }
+        "PING" => Ok(ControlReply::Ok),
         "CAPS?" => Ok(ControlReply::OkWithData(count_nested_virt_flags()?)),
         "STATUS?" => {
             let detection = detection.ok_or_else(|| eyre!("eBPF detection not available"))?;

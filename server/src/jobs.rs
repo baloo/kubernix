@@ -142,6 +142,7 @@ pub enum JobOutcome {
 pub enum FailureKind {
     OutOfMemory,
     DiskFull,
+    GuestHang,
 }
 
 #[derive(Clone)]
@@ -393,6 +394,7 @@ pub fn decode_outcome(payload: &[u8]) -> eyre::Result<JobOutcome> {
                 kubernix_capnp::FailureKind::None => None,
                 kubernix_capnp::FailureKind::OutOfMemory => Some(FailureKind::OutOfMemory),
                 kubernix_capnp::FailureKind::DiskFull => Some(FailureKind::DiskFull),
+                kubernix_capnp::FailureKind::GuestHang => Some(FailureKind::GuestHang),
             };
             Ok(JobOutcome::Failed {
                 message,

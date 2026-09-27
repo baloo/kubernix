@@ -1095,6 +1095,29 @@ pub async fn reset_job_status(vsock_socket: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Liveness check: dial the control port and ask for `PING`. Used by
+/// `guest_ping_monitor` (`worker/src/main.rs`) on a short, repeating
+/// interval for as long as a build is running, so a hung/dead guest is
+/// detected in seconds rather than waiting on `ack_wait`. Each call is a
+/// fresh dial (the control port has no persistent session), same as every
+/// other control-port helper here.
+pub async fn ping(vsock_socket: &Path) -> eyre::Result<()> {
+    let mut stream = dial_control_port(vsock_socket).await?;
+    stream.write_all(b"PING\n").await.wrap_err("sending PING")?;
+    let mut reply = Vec::new();
+    stream
+        .read_to_end(&mut reply)
+        .await
+        .wrap_err("reading the PING reply")?;
+    if !reply.starts_with(b"OK") {
+        return Err(eyre!(
+            "guest-agent rejected PING: {:?}",
+            String::from_utf8_lossy(&reply)
+        ));
+    }
+    Ok(())
+}
+
 /// Asks the guest what resource-exhaustion signal (if any) has fired since
 /// the last [`reset_job_status`] — called once, right after a VM-path build
 /// failure.

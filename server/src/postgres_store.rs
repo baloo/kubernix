@@ -1271,6 +1271,7 @@ impl PostgresStore {
                 failure_kind.map(|k| match k {
                     crate::jobs::FailureKind::OutOfMemory => "out_of_memory",
                     crate::jobs::FailureKind::DiskFull => "disk_full",
+                    crate::jobs::FailureKind::GuestHang => "guest_hang",
                 }),
             ),
         };
