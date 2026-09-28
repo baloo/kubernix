@@ -670,10 +670,17 @@ async fn main() -> color_eyre::eyre::Result<()> {
             }
         }
 
-        if let Err(report) = job
-            .fetch_inputs(&client, &http, nix, vm_conn.as_mut())
-            .await
-        {
+        // Feature A, extended to the input-download phase: fetch_inputs
+        // downloads every input serially and can itself outlast
+        // `ack_wait` for a job with many/large assets, well before the
+        // retry loop below ever spawns its own heartbeat. Scoped to a
+        // block so the guard aborts it as soon as fetch_inputs resolves.
+        let fetch_result = {
+            let _heartbeat = HeartbeatGuard::spawn(message.clone(), ack_heartbeat_interval);
+            job.fetch_inputs(&client, &http, nix, vm_conn.as_mut()).await
+        };
+
+        if let Err(report) = fetch_result {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
             let outcome =
                 Outcome::failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
@@ -727,7 +734,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
             // Feature A: reset this message's ack_wait for as long as this
             // attempt is running, so a live worker never loses the job to
             // redelivery purely because the build is legitimately slow.
-            let heartbeat = tokio::spawn(ack_heartbeat(message.clone(), ack_heartbeat_interval));
+            // Dropped (aborting the task) at the end of this scope, right
+            // after `run_result` is settled below.
+            let heartbeat = HeartbeatGuard::spawn(message.clone(), ack_heartbeat_interval);
             // Feature B: only meaningful with a guest to ping -- the
             // subprocess fallback path has none.
             let (hang_tx, hang_rx) = tokio::sync::oneshot::channel();
@@ -755,7 +764,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
                 _ = hang_rx, if ping_monitor.is_some() => RunResult::GuestHung,
             };
 
-            heartbeat.abort();
+            drop(heartbeat);
             if let Some(pm) = ping_monitor {
                 pm.abort();
             }
@@ -1169,13 +1178,12 @@ enum RunResult {
 
 /// Periodically resets `message`'s JetStream `ack_wait` timer
 /// (`AckKind::Progress`) for as long as the caller lets this task run --
-/// spawned once per retry-loop iteration, alongside `guest_ping_monitor`,
-/// and stopped via `JoinHandle::abort` once that iteration's `run_build`
-/// settles. `abort()` rather than the channel-close teardown `pump_channel`/
-/// `pump_log` use: this task has no result to collect and no data-driven
-/// end, just a timer to stop. A send failure is logged, not fatal -- an
-/// isolated missed heartbeat is tolerated by `ack_wait` comfortably
-/// outliving a couple of heartbeat intervals.
+/// spawned once for the input-download phase (`fetch_inputs`, once per
+/// job) and again once per retry-loop iteration during the build phase
+/// (alongside `guest_ping_monitor`), and stopped once that phase settles.
+/// A send failure is logged, not fatal -- an isolated missed heartbeat is
+/// tolerated by `ack_wait` comfortably outliving a couple of heartbeat
+/// intervals.
 async fn ack_heartbeat(message: jetstream::Message, interval: std::time::Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // fires immediately; a fresh delivery already starts its own countdown
@@ -1184,6 +1192,23 @@ async fn ack_heartbeat(message: jetstream::Message, interval: std::time::Duratio
         if let Err(e) = message.ack_with(jetstream::AckKind::Progress).await {
             tracing::warn!(error = %e, "sending ack heartbeat failed");
         }
+    }
+}
+
+/// Aborts the wrapped `ack_heartbeat` task when dropped, so a heartbeat's
+/// lifetime can be tied to a lexical scope instead of a manual `.abort()`
+/// call.
+struct HeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl HeartbeatGuard {
+    fn spawn(message: jetstream::Message, interval: std::time::Duration) -> Self {
+        Self(tokio::spawn(ack_heartbeat(message, interval)))
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
