@@ -20,7 +20,7 @@ use tokio::process::Command;
 use tokio_util::io::InspectWriter;
 
 use kubernix_types::body::SizedBody;
-use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId};
+use kubernix_types::{CapabilityToken, Compression, ObjectKey, StorePath, TenantId};
 
 use crate::kubernix_capnp;
 
@@ -337,6 +337,7 @@ impl<'a> NixStore<'a> {
         store_path: &StorePath,
         references: &[StorePath],
         deriver: &StorePath,
+        compression: Compression,
     ) -> eyre::Result<()> {
         let response = http
             .get(url)
@@ -361,7 +362,6 @@ impl<'a> NixStore<'a> {
 
         {
             use futures_util::StreamExt as _;
-            use std::io::Write as _;
 
             let mut stdin = child.stdin.take().expect("piped");
 
@@ -375,32 +375,27 @@ impl<'a> NixStore<'a> {
                 .wrap_err("writing the export header")?;
 
             // Decompressed as it arrives rather than in one piece: peak
-            // memory is a chunk, not the whole NAR. `zstd`'s streaming writer
-            // is enough for this, so it needs no additional dependency.
-            let mut decoder =
-                zstd::stream::write::Decoder::new(Vec::new()).wrap_err("starting decompression")?;
-            let mut body = response.bytes_stream();
-            while let Some(chunk) = body.next().await {
-                decoder
-                    .write_all(&chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
-                    .wrap_err_with(|| format!("decompressing {store_path}"))?;
-                let decoded = std::mem::take(decoder.get_mut());
-                if !decoded.is_empty() {
-                    stdin
-                        .write_all(&decoded)
+            // memory is a chunk, not the whole NAR. Borrows `stdin` rather
+            // than owning it -- the export trailer below is written to
+            // `stdin` directly, after the decoder (dropped first) is done
+            // with it.
+            {
+                let mut decoder = crate::decompress::decoder_for(compression, &mut stdin)
+                    .wrap_err("starting decompression")?;
+                let mut body = response.bytes_stream();
+                while let Some(chunk) = body.next().await {
+                    decoder
+                        .write_all(&chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
                         .await
-                        .wrap_err("writing to nix-store --import")?;
+                        .wrap_err_with(|| format!("decompressing {store_path}"))?;
                 }
-            }
-            decoder
-                .flush()
-                .wrap_err_with(|| format!("decompressing {store_path}"))?;
-            let decoded = std::mem::take(decoder.get_mut());
-            if !decoded.is_empty() {
-                stdin
-                    .write_all(&decoded)
+                // `flush`, not `shutdown` -- this only needs to drain the
+                // decoder's own buffered bytes through to `stdin`, not close
+                // it: the export trailer still has to be written after this.
+                decoder
+                    .flush()
                     .await
-                    .wrap_err("writing to nix-store --import")?;
+                    .wrap_err_with(|| format!("decompressing {store_path}"))?;
             }
 
             stdin

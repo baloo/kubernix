@@ -306,6 +306,24 @@ async fn fetch_one(
         Compression::Xz => Box::new(async_compression::tokio::write::XzDecoder::new(HashSink(
             nar_hasher.clone(),
         ))),
+        Compression::Bzip2 => Box::new(async_compression::tokio::write::BzDecoder::new(HashSink(
+            nar_hasher.clone(),
+        ))),
+        Compression::Gzip => Box::new(async_compression::tokio::write::GzipDecoder::new(HashSink(
+            nar_hasher.clone(),
+        ))),
+        Compression::Lz4 => Box::new(async_compression::tokio::write::Lz4Decoder::new(HashSink(
+            nar_hasher.clone(),
+        ))),
+        Compression::Brotli => Box::new(async_compression::tokio::write::BrotliDecoder::new(
+            HashSink(nar_hasher.clone()),
+        )),
+        // No viable Rust decoder exists for lzip -- named so it still parses
+        // and logs correctly, but rejected here rather than attempting a
+        // decode we cannot actually do.
+        Compression::Lzip => {
+            return Err(FetchError::UnsupportedCompression(compression.to_string()));
+        }
     };
     let mut file_hasher = Sha256::new();
 
@@ -516,15 +534,83 @@ Sig: another-1:BBBB\n";
     }
 
     #[test]
+    fn parses_a_bzip2_compressed_narinfo() {
+        let narinfo = NARINFO.replace("nar/abc.nar.zst", "nar/abc.nar.bz2");
+        let narinfo = narinfo.replace("Compression: zstd", "Compression: bzip2");
+        let parsed = ParsedNarinfo::parse(&narinfo).unwrap();
+        assert_eq!(parsed.url, "nar/abc.nar.bz2");
+        assert_eq!(parsed.compression, "bzip2");
+        assert_eq!(
+            parsed.compression.parse::<Compression>().unwrap(),
+            Compression::Bzip2
+        );
+    }
+
+    #[test]
+    fn parses_a_gzip_compressed_narinfo() {
+        let narinfo = NARINFO.replace("nar/abc.nar.zst", "nar/abc.nar.gz");
+        let narinfo = narinfo.replace("Compression: zstd", "Compression: gzip");
+        let parsed = ParsedNarinfo::parse(&narinfo).unwrap();
+        assert_eq!(parsed.url, "nar/abc.nar.gz");
+        assert_eq!(parsed.compression, "gzip");
+        assert_eq!(
+            parsed.compression.parse::<Compression>().unwrap(),
+            Compression::Gzip
+        );
+    }
+
+    #[test]
+    fn parses_an_lz4_compressed_narinfo() {
+        let narinfo = NARINFO.replace("nar/abc.nar.zst", "nar/abc.nar.lz4");
+        let narinfo = narinfo.replace("Compression: zstd", "Compression: lz4");
+        let parsed = ParsedNarinfo::parse(&narinfo).unwrap();
+        assert_eq!(parsed.url, "nar/abc.nar.lz4");
+        assert_eq!(parsed.compression, "lz4");
+        assert_eq!(
+            parsed.compression.parse::<Compression>().unwrap(),
+            Compression::Lz4
+        );
+    }
+
+    #[test]
+    fn parses_a_brotli_compressed_narinfo() {
+        let narinfo = NARINFO.replace("nar/abc.nar.zst", "nar/abc.nar.br");
+        let narinfo = narinfo.replace("Compression: zstd", "Compression: br");
+        let parsed = ParsedNarinfo::parse(&narinfo).unwrap();
+        assert_eq!(parsed.url, "nar/abc.nar.br");
+        assert_eq!(parsed.compression, "br");
+        assert_eq!(
+            parsed.compression.parse::<Compression>().unwrap(),
+            Compression::Brotli
+        );
+    }
+
+    #[test]
     fn an_unrecognised_compression_is_not_a_parse_error() {
         // `ParsedNarinfo::parse` never rejects an unknown `Compression:` value
         // itself -- only `fetch_one`'s later `.parse::<Compression>()` does,
         // once it actually needs to decode the bytes. A narinfo naming a
         // format kubernix doesn't understand should still parse, so the
         // caller can log the real hash part/URL before giving up.
-        let narinfo = NARINFO.replace("Compression: zstd", "Compression: bzip2");
+        let narinfo = NARINFO.replace("Compression: zstd", "Compression: lrzip");
         let parsed = ParsedNarinfo::parse(&narinfo).unwrap();
-        assert_eq!(parsed.compression, "bzip2");
+        assert_eq!(parsed.compression, "lrzip");
         assert!(parsed.compression.parse::<Compression>().is_err());
+    }
+
+    #[test]
+    fn lzip_parses_but_is_rejected_at_decode_time() {
+        // Unlike a genuinely unrecognised name, `lzip` is a real,
+        // parseable `Compression` variant -- kubernix knows the format,
+        // it just has no decoder for it. `fetch_one`'s decode-dispatch is
+        // what actually refuses it (see the `Compression::Lzip` arm
+        // above); this only checks the parse half still succeeds.
+        let narinfo = NARINFO.replace("Compression: zstd", "Compression: lzip");
+        let parsed = ParsedNarinfo::parse(&narinfo).unwrap();
+        assert_eq!(parsed.compression, "lzip");
+        assert_eq!(
+            parsed.compression.parse::<Compression>().unwrap(),
+            Compression::Lzip
+        );
     }
 }

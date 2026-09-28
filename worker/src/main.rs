@@ -16,6 +16,7 @@ pub mod kubernix_capnp {
     include!(concat!(env!("OUT_DIR"), "/kubernix_capnp.rs"));
 }
 
+mod decompress;
 mod nar_export;
 mod serve;
 mod uid;
@@ -42,7 +43,7 @@ const MAX_JOB_DELIVER: i64 = 5;
 use async_nats::jetstream::{self, consumer::PullConsumer};
 use eyre::{Context as _, OptionExt as _};
 use futures_util::stream::StreamExt;
-use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId, derivation};
+use kubernix_types::{CapabilityToken, Compression, ObjectKey, StorePath, TenantId, derivation};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -82,6 +83,8 @@ struct InputRef {
     /// carries neither.
     references: Vec<StorePath>,
     deriver: StorePath,
+    /// What `key`'s bytes actually use. See `kubernix_capnp::InputRef`.
+    compression: Compression,
 }
 
 /// Order `inputs` so that every input comes after every other input it
@@ -187,6 +190,7 @@ impl Job {
                     &input.references,
                     &input.deriver,
                     nix.store_dir,
+                    input.compression,
                 )
                 .await
                 .wrap_err_with(|| format!("importing {}", input.store_path))?,
@@ -197,6 +201,7 @@ impl Job {
                         &input.store_path,
                         &input.references,
                         &input.deriver,
+                        input.compression,
                     )
                     .await
                     .wrap_err_with(|| format!("importing {}", input.store_path))?,
@@ -955,11 +960,27 @@ fn decode_job(payload: &[u8]) -> eyre::Result<Job> {
         for reference in input.get_references()?.iter() {
             references.push(StorePath::new(reference?.to_string()?));
         }
+        // Empty on a message from an older server that predates this field
+        // -- the only compression that existed before this field did was
+        // zstd, so that's the safe assumption for a rolling deploy.
+        let compression_str = input.get_compression()?.to_string()?;
+        let compression = if compression_str.is_empty() {
+            tracing::warn!(
+                store_path = %input.get_store_path()?.to_str()?,
+                "InputRef carries no compression; assuming zstd"
+            );
+            Compression::Zstd
+        } else {
+            compression_str
+                .parse()
+                .wrap_err("build request carries an unrecognised input compression")?
+        };
         inputs.push(InputRef {
             store_path: StorePath::new(input.get_store_path()?.to_string()?),
             key: ObjectKey::new(input.get_key()?.to_string()?),
             references,
             deriver: StorePath::new(input.get_deriver()?.to_string()?),
+            compression,
         });
     }
     let tenant = request.get_tenant()?.to_string()?;
@@ -1626,6 +1647,7 @@ mod tests {
             key: ObjectKey::new(path),
             references: references.iter().map(|r| StorePath::new(*r)).collect(),
             deriver: StorePath::new(format!("{path}.drv")),
+            compression: Compression::Zstd,
         }
     }
 
