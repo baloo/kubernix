@@ -518,10 +518,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
     }
     tracing::info!(classes = ?worker_classes, "worker capability classes");
 
-    let mut subjects = vec![format!("kubernix.jobs.{system}")];
-    for class in &worker_classes {
-        subjects.push(format!("kubernix.jobs.{system}.{class}"));
-    }
+    let worker_exclusive_classes = std::env::var("KUBERNIX_WORKER_EXCLUSIVE_CLASSES").is_ok();
+    let (subjects, durable_name) =
+        worker_subjects_and_consumer(&system, &worker_classes, worker_exclusive_classes)?;
 
     // A WorkQueue stream permits only one consumer per filter subject, so a
     // leftover consumer from a previous run blocks startup with "filtered
@@ -556,7 +555,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let stream = jetstream.get_stream("kubernix_jobs").await?;
     let consumer: PullConsumer = stream
         .create_consumer(jetstream::consumer::pull::Config {
-            durable_name: Some(format!("worker-{}", system.replace('-', "_"))),
+            durable_name: Some(durable_name),
             filter_subjects: subjects.clone(),
             // This is a *shared* durable consumer across every replica pulling
             // from it (WorkQueue-retention streams forbid per-replica durable
@@ -1109,6 +1108,47 @@ fn parse_static_worker_classes(env_value: &str) -> Vec<String> {
         .filter(|f| *f == "big-parallel")
         .map(String::from)
         .collect()
+}
+
+/// Builds the JetStream subjects a worker subscribes to and the durable
+/// consumer name it uses, from its system and declared capability classes.
+/// Non-exclusive (the default): always includes the plain
+/// `kubernix.jobs.<system>` subject plus one per class, sharing the
+/// fleet-wide `worker-<system>` durable consumer -- classes only ever widen
+/// what's handled. Exclusive (`KUBERNIX_WORKER_EXCLUSIVE_CLASSES`): drops
+/// the plain subject, subscribing only to the declared classes' subjects,
+/// under a durable name that folds the (sorted) classes in -- so it doesn't
+/// collide with the shared consumer or with another exclusive pool
+/// declaring different classes for the same system. Requires at least one
+/// class, since a WorkQueue-retention consumer subscribed to nothing would
+/// never receive anything.
+fn worker_subjects_and_consumer(
+    system: &str,
+    classes: &[String],
+    exclusive: bool,
+) -> eyre::Result<(Vec<String>, String)> {
+    let mut subjects = Vec::new();
+    if !exclusive {
+        subjects.push(format!("kubernix.jobs.{system}"));
+    }
+    for class in classes {
+        subjects.push(format!("kubernix.jobs.{system}.{class}"));
+    }
+    if subjects.is_empty() {
+        eyre::bail!(
+            "KUBERNIX_WORKER_EXCLUSIVE_CLASSES set but no capability classes \
+             declared (KUBERNIX_WORKER_CLASSES empty and no probe-confirmed \
+             classes) -- refusing to start a worker subscribed to nothing"
+        );
+    }
+    let durable_name = if exclusive {
+        let mut sorted = classes.to_vec();
+        sorted.sort();
+        format!("worker-{}-{}", system.replace('-', "_"), sorted.join("_"))
+    } else {
+        format!("worker-{}", system.replace('-', "_"))
+    };
+    Ok((subjects, durable_name))
 }
 
 /// Whether this worker's own declared capability classes cover every feature
@@ -1954,6 +1994,49 @@ mod tests {
     fn parse_static_worker_classes_rejects_kvm_and_unknown() {
         // kvm is probe-only; anything else unrecognised is dropped too.
         assert!(parse_static_worker_classes("kvm,made-up-feature").is_empty());
+    }
+
+    #[test]
+    fn worker_subjects_non_exclusive_includes_base_subject() {
+        let (subjects, durable_name) =
+            worker_subjects_and_consumer("x86_64-linux", &["big-parallel".to_string()], false)
+                .unwrap();
+        assert_eq!(
+            subjects,
+            vec![
+                "kubernix.jobs.x86_64-linux".to_string(),
+                "kubernix.jobs.x86_64-linux.big-parallel".to_string(),
+            ]
+        );
+        assert_eq!(durable_name, "worker-x86_64_linux");
+    }
+
+    #[test]
+    fn worker_subjects_exclusive_drops_base_subject() {
+        let (subjects, durable_name) =
+            worker_subjects_and_consumer("x86_64-linux", &["big-parallel".to_string()], true)
+                .unwrap();
+        assert_eq!(
+            subjects,
+            vec!["kubernix.jobs.x86_64-linux.big-parallel".to_string()]
+        );
+        assert_eq!(durable_name, "worker-x86_64_linux-big-parallel");
+    }
+
+    #[test]
+    fn worker_subjects_exclusive_sorts_classes_into_consumer_name() {
+        let (_, durable_name) = worker_subjects_and_consumer(
+            "x86_64-linux",
+            &["kvm".to_string(), "big-parallel".to_string()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(durable_name, "worker-x86_64_linux-big-parallel_kvm");
+    }
+
+    #[test]
+    fn worker_subjects_exclusive_with_no_classes_errors() {
+        assert!(worker_subjects_and_consumer("x86_64-linux", &[], true).is_err());
     }
 
     #[test]
