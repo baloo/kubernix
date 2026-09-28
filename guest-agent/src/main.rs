@@ -218,14 +218,17 @@ async fn main() -> Result<()> {
     // does it before the build's own mount namespace even exists, so this
     // has to be visible here, in the guest's root namespace).
     //
-    // `/tmp` is where this points Nix's own `build-dir` setting (see
-    // `spawn_nix_daemon`'s doc comment), and `/nix/var` is Nix's state
-    // directory (its path/GC-roots database, temp roots, ...) -- `nix
-    // -daemon` `mkdir`s directly inside both itself, which the read-only
-    // EROFS root (`nix/guest-vm.nix`'s `rootImg`) can never allow no matter
-    // how the directory got there. Everything else in this list only needs
-    // an empty directory to mount *onto*, which `rootImg` ships pre-made
-    // for exactly that reason; these two need to be writable themselves.
+    // `/tmp` holds substituter cache metadata (see `spawn_nix_daemon`'s
+    // `HOME` doc comment), and `/nix/var` is Nix's state directory (its
+    // path/GC-roots database, temp roots, ...) -- `nix-daemon` `mkdir`s
+    // directly inside both itself, which the read-only EROFS root
+    // (`nix/guest-vm.nix`'s `rootImg`) can never allow no matter how the
+    // directory got there. Everything else in this list only needs an empty
+    // directory to mount *onto*, which `rootImg` ships pre-made for exactly
+    // that reason; these two need to be writable themselves. `mount_store()`
+    // later bind-mounts a disk-backed directory onto `/nix/var/nix/b`
+    // (Nix's own default `build-dir`) once the tmpfs here has given it
+    // somewhere to attach to.
     for (fstype, target) in [
         ("proc", "/proc"),
         ("sysfs", "/sys"),
@@ -615,7 +618,28 @@ async fn mount_store() -> Result<()> {
         ],
     )
     .await
-    .wrap_err("mounting the overlay")
+    .wrap_err("mounting the overlay")?;
+
+    // Nix's own `build-dir` default (`<nixStateDir>/b`, i.e.
+    // `/nix/var/nix/b`) is where every derivation's actual build/compile
+    // scratch directory lives -- left on the `tmpfs` mounted at `/nix/var`
+    // in `main()`, that scratch space is bounded by the guest's RAM
+    // (`worker.vm.memoryMb`), not by `store.img`'s much larger size, so a
+    // build with a large scratch footprint could hit `tmpfs` `ENOSPC` well
+    // before the disk-backed store fills up. Bind-mounting a directory on
+    // the same decrypted ext4 device onto that exact path moves build
+    // scratch space onto disk instead, with no `NIX_CONFIG` override
+    // needed (see `spawn_nix_daemon`).
+    let build = format!("{STORE_RAW}/b");
+    tokio::fs::create_dir_all(&build)
+        .await
+        .wrap_err_with(|| format!("creating {build}"))?;
+    tokio::fs::create_dir_all("/nix/var/nix/b")
+        .await
+        .wrap_err("creating /nix/var/nix/b")?;
+    run(MOUNT_BIN, &["--bind", &build, "/nix/var/nix/b"])
+        .await
+        .wrap_err("bind-mounting the disk-backed build-dir onto /nix/var/nix/b")
 }
 
 /// Static point-to-point bring-up of `NET_IFACE` against the `passt` link on
@@ -843,8 +867,7 @@ fn merged_ca_bundle_path(extra_ca: &[u8]) -> Result<&'static str> {
 }
 
 fn spawn_nix_daemon(substituters: &[(String, String)], extra_ca: &[u8]) -> Result<Child> {
-    let mut nix_config = "build-dir = /tmp\n\
-             pasta-path =\n\
+    let mut nix_config = "pasta-path =\n\
              experimental-features = auto-allocate-uids cgroups\n\
              auto-allocate-uids = true\n\
              use-cgroups = true"
@@ -866,12 +889,12 @@ fn spawn_nix_daemon(substituters: &[(String, String)], extra_ca: &[u8]) -> Resul
 
     Command::new(NIX_DAEMON_BIN)
         .arg("--stdio")
-        // `build-dir`'s compiled-in default (`<nixStateDir>/b`) resolves
-        // somewhere this guest never created and has no reason to trust is
-        // on the `tmpfs` mounted at `/tmp` above — pinning it there
-        // directly is what actually makes the sandbox's `pivot_root`
-        // work, since that needs its chroot directory on a real mount,
-        // not wherever the default happened to land.
+        // No `build-dir` override needed: Lix's compiled-in default
+        // (`<nixStateDir>/b`, i.e. `/nix/var/nix/b`) is exactly the path
+        // `mount_store()` bind-mounts onto the decrypted ext4 device before
+        // this ever runs, so it's already a real, disk-backed mount by the
+        // time the sandbox's `pivot_root` needs its chroot directory there
+        // — no reason left to distrust wherever the default lands.
         //
         // `pasta-path = ` (empty) turns off Lix's own per-build network
         // sandbox (`LinuxLocalDerivationGoal::wantNetNS` in
@@ -914,8 +937,10 @@ fn spawn_nix_daemon(substituters: &[(String, String)], extra_ca: &[u8]) -> Resul
         // image (`nix/guest-vm.nix`), so every substituter's setup failed
         // outright with "creating directory '/root/.cache': Read-only file
         // system" before this. `/tmp` is already a real, writable `tmpfs`
-        // (mounted in `main()`, and already where `build-dir` points, just
-        // above) -- reusing it here needs no new mount.
+        // (mounted in `main()`) -- reusing it here needs no new mount, and
+        // unlike `build-dir` above this is just cache metadata, not
+        // something worth spending disk space (or persisting across
+        // reboots) on.
         .env("HOME", "/tmp")
         // `nix/guest-vm.nix` bakes a CA bundle in at `BAKED_CA_BUNDLE` --
         // without pointing `SSL_CERT_FILE` at it, every HTTPS fetch inside
