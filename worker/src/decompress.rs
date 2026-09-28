@@ -1,10 +1,9 @@
 //! Picking the right decoder for a fetched input's actual storage
 //! compression.
 //!
-//! `vm_ops::fetch_input` and `upload::NixStore::fetch_input` both stream a
-//! fetched object straight through a decoder into some downstream sink; this
-//! is the one place that decoder is chosen, so the two call sites don't each
-//! carry their own copy of the match. Kept in `worker` rather than
+//! `input_fetch::download_to_spool` streams a fetched object straight
+//! through a decoder into a spool file; this is the one place that decoder
+//! is chosen. Kept in `worker` rather than
 //! `kubernix_types` -- `Compression` deliberately stays a thin string<->enum
 //! boundary type with no decoding dependencies of its own; this dispatch is
 //! duplicated (mechanically, a handful of match arms) against the same shape
@@ -18,14 +17,14 @@ use kubernix_types::Compression;
 
 /// Wrap `sink` in the `AsyncWrite` decoder appropriate for `compression`.
 ///
-/// Not `Send` -- both call sites run inline in the worker's single-job loop
-/// (never `tokio::spawn`ed), so there's no reason to force it, and it lets
-/// the hash/size tracking wrapped around the sink use a plain `Rc<RefCell<_>>`
-/// instead of an `Arc<Mutex<_>>` no thread ever actually contends.
+/// `Send`: `input_fetch::download_to_spool` is `tokio::spawn`ed by
+/// `Job::fetch_inputs` so several downloads can run concurrently, which
+/// requires the whole future -- this decoder included -- to cross that
+/// bound.
 pub fn decoder_for<'a>(
     compression: Compression,
-    sink: impl tokio::io::AsyncWrite + Unpin + 'a,
-) -> eyre::Result<Box<dyn tokio::io::AsyncWrite + Unpin + 'a>> {
+    sink: impl tokio::io::AsyncWrite + Unpin + Send + 'a,
+) -> eyre::Result<Box<dyn tokio::io::AsyncWrite + Unpin + Send + 'a>> {
     Ok(match compression {
         Compression::None => Box::new(sink),
         Compression::Zstd => Box::new(ZstdDecoder::new(sink)),

@@ -17,6 +17,7 @@ pub mod kubernix_capnp {
 }
 
 mod decompress;
+mod input_fetch;
 mod nar_export;
 mod serve;
 mod uid;
@@ -76,6 +77,7 @@ struct Job {
     trusted_substituters: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
 struct InputRef {
     store_path: StorePath,
     key: ObjectKey,
@@ -85,6 +87,13 @@ struct InputRef {
     deriver: StorePath,
     /// What `key`'s bytes actually use. See `kubernix_capnp::InputRef`.
     compression: Compression,
+    /// The uncompressed NAR's hash, in Nix's own wire form
+    /// (`"<algo>:<base16>"`, e.g. `"sha256:abcd..."`) -- known ahead of the
+    /// download from the server's own record of this path, so it doubles as
+    /// both what's verified against and what's declared to the guest's
+    /// `AddToStoreNar` / `nix-store --import`.
+    nar_hash: String,
+    nar_size: u64,
 }
 
 /// Order `inputs` so that every input comes after every other input it
@@ -156,6 +165,7 @@ impl Job {
         http: &reqwest::Client,
         nix: upload::NixStore<'_>,
         mut vm: Option<&mut VmConn>,
+        max_parallel_fetches: usize,
     ) -> eyre::Result<()> {
         if self.inputs.is_empty() {
             return Ok(());
@@ -170,7 +180,8 @@ impl Job {
         // before a path it references makes the guest's real `nix-daemon`
         // reject it ("does not exist in the Lix database"), so re-derive a
         // correct order here from the `references` every `InputRef` already
-        // carries, rather than trusting the wire order.
+        // carries, rather than trusting the wire order. Only *registration*
+        // needs this order, though -- the download below runs unordered.
         let order = topo_sort_inputs(&self.inputs).wrap_err("ordering inputs")?;
 
         let keys: Vec<ObjectKey> = order.iter().map(|&i| self.inputs[i].key.clone()).collect();
@@ -178,30 +189,77 @@ impl Job {
             .await
             .wrap_err("requesting download urls")?;
 
+        // Every input's download is spawned up front (gated by a semaphore
+        // so at most `max_parallel_fetches` run at once), then the loop
+        // below registers/imports them sequentially in topo order as each
+        // one's download lands -- so registering input `k` overlaps with
+        // the still-running downloads for inputs later in `order`, rather
+        // than waiting for every download in the job to finish first.
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel_fetches));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(order.len());
         for (&i, url) in order.iter().zip(urls) {
+            let input = self.inputs[i].clone();
+            let http = http.clone();
+            let semaphore = semaphore.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore not closed");
+                let result = input_fetch::download_to_spool(
+                    &http,
+                    &url,
+                    input.compression,
+                    &input.nar_hash,
+                    input.nar_size,
+                )
+                .await
+                .wrap_err_with(|| format!("fetching {}", input.store_path));
+                let _ = tx.send((i, result)).await;
+            });
+        }
+        drop(tx);
+
+        let mut ready: std::collections::HashMap<usize, input_fetch::SpooledInput> =
+            std::collections::HashMap::new();
+        for &i in &order {
+            let spooled = match ready.remove(&i) {
+                Some(s) => s,
+                None => loop {
+                    let (j, result) = rx
+                        .recv()
+                        .await
+                        .expect("every spawned download reports back before its sender drops");
+                    let s = result?;
+                    if j == i {
+                        break s;
+                    }
+                    ready.insert(j, s);
+                },
+            };
+
             let input = &self.inputs[i];
             tracing::info!(job_id = %self.job_id, path = %input.store_path, "importing input");
             match &mut vm {
-                Some(conn) => vm_ops::fetch_input(
+                Some(conn) => vm_ops::register_input(
                     conn,
-                    http,
-                    &url,
+                    spooled,
                     &input.store_path,
                     &input.references,
                     &input.deriver,
                     nix.store_dir,
-                    input.compression,
+                    &input.nar_hash,
+                    input.nar_size,
                 )
                 .await
                 .wrap_err_with(|| format!("importing {}", input.store_path))?,
                 None => nix
-                    .fetch_input(
-                        http,
-                        &url,
+                    .import_spooled(
+                        spooled,
                         &input.store_path,
                         &input.references,
                         &input.deriver,
-                        input.compression,
                     )
                     .await
                     .wrap_err_with(|| format!("importing {}", input.store_path))?,
@@ -355,6 +413,13 @@ async fn main() -> color_eyre::eyre::Result<()> {
         std::time::Duration::from_secs(24 * 3600),
     );
     let worker_max_concurrent = env_positive_i64("KUBERNIX_WORKER_MAX_CONCURRENT", 1);
+    // How many of a single job's inputs may download concurrently.
+    // `fetch_inputs` still registers/imports them one at a time, in
+    // dependency order -- the guest's/`nix-store`'s own protocol requires
+    // that -- but nothing about the network fetch that precedes it does, so
+    // this only bounds the fan-out of concurrent HTTP downloads.
+    let max_parallel_input_fetches =
+        env_positive_i64("KUBERNIX_WORKER_MAX_PARALLEL_INPUT_FETCHES", 8) as usize;
     // Bounds how long a job sits un-redelivered after the worker holding it
     // dies outright (pod killed, node lost, panic) -- shortened from an
     // earlier hardcoded 3600s now that `ack_heartbeat` resets this timer for
@@ -670,10 +735,24 @@ async fn main() -> color_eyre::eyre::Result<()> {
             }
         }
 
-        if let Err(report) = job
-            .fetch_inputs(&client, &http, nix, vm_conn.as_mut())
+        // Feature A, extended to the input-download phase: fetch_inputs
+        // downloads every input serially and can itself outlast
+        // `ack_wait` for a job with many/large assets, well before the
+        // retry loop below ever spawns its own heartbeat. Scoped to a
+        // block so the guard aborts it as soon as fetch_inputs resolves.
+        let fetch_result = {
+            let _heartbeat = HeartbeatGuard::spawn(message.clone(), ack_heartbeat_interval);
+            job.fetch_inputs(
+                &client,
+                &http,
+                nix,
+                vm_conn.as_mut(),
+                max_parallel_input_fetches,
+            )
             .await
-        {
+        };
+
+        if let Err(report) = fetch_result {
             tracing::error!(job_id = %job.job_id, error = ?report, "could not fetch inputs");
             let outcome =
                 Outcome::failed(infra_failure_message(&job.job_id, "fetching inputs failed"));
@@ -727,7 +806,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
             // Feature A: reset this message's ack_wait for as long as this
             // attempt is running, so a live worker never loses the job to
             // redelivery purely because the build is legitimately slow.
-            let heartbeat = tokio::spawn(ack_heartbeat(message.clone(), ack_heartbeat_interval));
+            // Dropped (aborting the task) at the end of this scope, right
+            // after `run_result` is settled below.
+            let heartbeat = HeartbeatGuard::spawn(message.clone(), ack_heartbeat_interval);
             // Feature B: only meaningful with a guest to ping -- the
             // subprocess fallback path has none.
             let (hang_tx, hang_rx) = tokio::sync::oneshot::channel();
@@ -755,7 +836,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
                 _ = hang_rx, if ping_monitor.is_some() => RunResult::GuestHung,
             };
 
-            heartbeat.abort();
+            drop(heartbeat);
             if let Some(pm) = ping_monitor {
                 pm.abort();
             }
@@ -981,6 +1062,8 @@ fn decode_job(payload: &[u8]) -> eyre::Result<Job> {
             references,
             deriver: StorePath::new(input.get_deriver()?.to_string()?),
             compression,
+            nar_hash: input.get_nar_hash()?.to_string()?,
+            nar_size: input.get_nar_size(),
         });
     }
     let tenant = request.get_tenant()?.to_string()?;
@@ -1169,13 +1252,12 @@ enum RunResult {
 
 /// Periodically resets `message`'s JetStream `ack_wait` timer
 /// (`AckKind::Progress`) for as long as the caller lets this task run --
-/// spawned once per retry-loop iteration, alongside `guest_ping_monitor`,
-/// and stopped via `JoinHandle::abort` once that iteration's `run_build`
-/// settles. `abort()` rather than the channel-close teardown `pump_channel`/
-/// `pump_log` use: this task has no result to collect and no data-driven
-/// end, just a timer to stop. A send failure is logged, not fatal -- an
-/// isolated missed heartbeat is tolerated by `ack_wait` comfortably
-/// outliving a couple of heartbeat intervals.
+/// spawned once for the input-download phase (`fetch_inputs`, once per
+/// job) and again once per retry-loop iteration during the build phase
+/// (alongside `guest_ping_monitor`), and stopped once that phase settles.
+/// A send failure is logged, not fatal -- an isolated missed heartbeat is
+/// tolerated by `ack_wait` comfortably outliving a couple of heartbeat
+/// intervals.
 async fn ack_heartbeat(message: jetstream::Message, interval: std::time::Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // fires immediately; a fresh delivery already starts its own countdown
@@ -1184,6 +1266,23 @@ async fn ack_heartbeat(message: jetstream::Message, interval: std::time::Duratio
         if let Err(e) = message.ack_with(jetstream::AckKind::Progress).await {
             tracing::warn!(error = %e, "sending ack heartbeat failed");
         }
+    }
+}
+
+/// Aborts the wrapped `ack_heartbeat` task when dropped, so a heartbeat's
+/// lifetime can be tied to a lexical scope instead of a manual `.abort()`
+/// call.
+struct HeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl HeartbeatGuard {
+    fn spawn(message: jetstream::Message, interval: std::time::Duration) -> Self {
+        Self(tokio::spawn(ack_heartbeat(message, interval)))
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1648,6 +1747,8 @@ mod tests {
             references: references.iter().map(|r| StorePath::new(*r)).collect(),
             deriver: StorePath::new(format!("{path}.drv")),
             compression: Compression::Zstd,
+            nar_hash: format!("sha256:{path}"),
+            nar_size: 0,
         }
     }
 

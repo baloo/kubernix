@@ -44,6 +44,23 @@ pub struct Hash {
     pub bytes: Vec<u8>,
 }
 
+impl Hash {
+    /// Nix's own wire form for a hash, `"<algo>:<base16>"` -- e.g.
+    /// `"sha256:abcd..."` -- exactly what `add_to_store_nar`'s `nar_hash`
+    /// parameter and `nix-store --import` expect, so a worker never has to
+    /// parse or reformat this once it arrives on `InputRef`.
+    pub fn to_wire_string(&self) -> String {
+        let algo = match self.hash_type {
+            HashType::Md5 => "md5",
+            HashType::Sha1 => "sha1",
+            HashType::Sha256 => "sha256",
+            HashType::Sha512 => "sha512",
+        };
+        let hex: String = self.bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{algo}:{hex}")
+    }
+}
+
 /// Everything `queryPathInfo` answers with, and everything a `narinfo` is made
 /// of. Store paths here are bare (`<hash>-<name>`, no store directory) — see
 /// [`kubernix_types::StorePath`]; the daemon protocol boundary

@@ -70,6 +70,12 @@ pub struct InputRef {
     /// `Built`-tier object, whatever the upstream substituter served for a
     /// `Substituted` one. See `RemoteObject::compression`.
     pub compression: Compression,
+    /// The uncompressed NAR's hash, in Nix's own wire form (`Hash::
+    /// to_wire_string`, e.g. `"sha256:abcd..."`) -- already known from this
+    /// path's `store_paths` row, so the worker can verify what it downloads
+    /// against this instead of computing a hash it has no way to check.
+    pub nar_hash: String,
+    pub nar_size: u64,
 }
 
 #[derive(Debug)]
@@ -282,6 +288,8 @@ impl JobQueue {
                 entry.set_key(input.key.as_str());
                 entry.set_deriver(input.deriver.as_str());
                 entry.set_compression(input.compression.as_str());
+                entry.set_nar_hash(input.nar_hash.as_str());
+                entry.set_nar_size(input.nar_size);
                 let mut refs = entry.init_references(input.references.len() as u32);
                 for (r, reference) in input.references.iter().enumerate() {
                     refs.set(r as u32, reference.as_str());

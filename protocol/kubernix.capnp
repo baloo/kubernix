@@ -46,6 +46,19 @@ struct InputRef {
   # older server that predates this field -- treat that the same as
   # "zstd", the only compression that existed before this field did.
   compression @4 :Text;
+  # The uncompressed NAR's hash and size, per the server's own record of this
+  # path (`store_paths` in Postgres) -- known ahead of any download, so the
+  # worker can verify what it fetches against this rather than having to
+  # compute-then-trust its own hash before it can even declare it to the
+  # guest's `AddToStoreNar`. Unlike `OutputInfo.narHash` (always sha256 --
+  # the worker computes it itself with `Sha256`), an input's hash algorithm
+  # isn't fixed (`kubernix_types`/`store::HashType` allows md5/sha1/sha256/
+  # sha512), so this travels pre-formatted as Nix's own wire form,
+  # `"<algo>:<base16>"` (e.g. `"sha256:abcd..."`) -- the exact string
+  # `add_to_store_nar`'s `nar_hash` parameter and `nix-store --import`
+  # already expect, needing no further parsing by the worker.
+  narHash     @5 :Text;
+  narSize     @6 :UInt64;
 }
 
 # Published to kubernix.jobs.<system>.
