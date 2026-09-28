@@ -4,28 +4,18 @@
 //! Each function here mirrors one existing subprocess call site closely
 //! enough to be a drop-in for it in `main.rs`'s job loop: [`build_derivation`]
 //! mirrors `serve::ServeConnection::build_derivation`, [`upload_output`]
-//! mirrors `upload::NixStore::upload_output`, [`fetch_input`] mirrors
-//! `upload::NixStore::fetch_input`, and path metadata comes from
+//! mirrors `upload::NixStore::upload_output`, [`register_input`] mirrors
+//! `upload::NixStore::import_spooled` (both taking an already-downloaded
+//! `input_fetch::SpooledInput`), and path metadata comes from
 //! [`kubernix_daemon_protocol::DaemonConnection::query_path_info`] directly
 //! rather than a fifth wrapper here.
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
-
 use eyre::{Context as _, OptionExt as _, bail};
-use futures_util::StreamExt as _;
-use kubernix_types::{Compression, StorePath};
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
-use tokio_util::io::InspectWriter;
+use kubernix_types::StorePath;
 
 use kubernix_daemon_protocol::DaemonConnection;
 
 use crate::upload::OutputArtifact;
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// `None` for `StorePath::default()` — the wire's own "no deriver" sentinel
 /// (`nar_export.rs`'s trailer comment: "empty when unknown"), not a distinct
@@ -161,86 +151,39 @@ where
     })
 }
 
-/// Fetch a staged input and register it in the VM's store via
-/// `Op::AddToStoreNar` — replaces `upload::NixStore::fetch_input`'s
-/// `nix-store --import` subprocess. Unlike `--import`, `AddToStoreNar` needs
-/// the NAR's hash and size *before* the framed body starts, so the
-/// decompressed NAR is spooled to disk while being hashed first, then
-/// streamed back out for the actual `add_to_store_nar` call — `--import`
-/// gets to compute this itself as it reads; this protocol does not.
+/// Register an already-downloaded input (`input_fetch::download_to_spool`)
+/// in the VM's store via `Op::AddToStoreNar` — replaces `upload::NixStore::
+/// import_spooled`'s `nix-store --import` subprocess. `nar_hash`/`nar_size`
+/// come from the input's own `InputRef` (known from the server's record of
+/// the path, and already verified against the downloaded bytes by
+/// `download_to_spool`) rather than being computed here -- `AddToStoreNar`
+/// needs them declared *before* the framed body starts, which is exactly
+/// why they have to be known ahead of time rather than derived from the
+/// spooled file itself.
 #[allow(clippy::too_many_arguments)]
-pub async fn fetch_input<S>(
+pub async fn register_input<S>(
     conn: &mut DaemonConnection<S>,
-    http: &reqwest::Client,
-    url: &str,
+    spooled: crate::input_fetch::SpooledInput,
     store_path: &StorePath,
     references: &[StorePath],
     deriver: &StorePath,
     store_dir: &str,
-    compression: Compression,
+    nar_hash: &str,
+    nar_size: u64,
 ) -> eyre::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    let response = http
-        .get(url)
-        .send()
-        .await
-        .wrap_err_with(|| format!("fetching {store_path}"))?;
-    if !response.status().is_success() {
-        bail!("fetching {store_path}: HTTP {}", response.status());
-    }
-
-    let spool = tempfile::NamedTempFile::new().wrap_err("creating a spool file")?;
-    let sink = tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
-
-    // `decoder_for` erases the concrete decoder type, so the hash/size
-    // tracking below can't ride along as a wrapper it owns (there would be
-    // no way to get it back out through `Box<dyn AsyncWrite>` afterward) --
-    // instead it's tapped via `InspectWriter` on the way into the spool
-    // file, same as `substitute.rs::fetch_one`'s `nar_hasher`. `Rc`/`RefCell`,
-    // not `Arc`/`Mutex`: this runs inline in the worker's single-job loop,
-    // never spawned onto another task, so there's no real concurrency to
-    // guard against.
-    let hasher = Rc::new(RefCell::new(Sha256::new()));
-    let nar_size = Rc::new(Cell::new(0u64));
-    let counted = InspectWriter::new(sink, {
-        let hasher = hasher.clone();
-        let nar_size = nar_size.clone();
-        move |chunk: &[u8]| {
-            hasher.borrow_mut().update(chunk);
-            nar_size.set(nar_size.get() + chunk.len() as u64);
-        }
-    });
-
-    let mut decoder =
-        crate::decompress::decoder_for(compression, counted).wrap_err("starting decompression")?;
-    let mut body = response.bytes_stream();
-    while let Some(chunk) = body.next().await {
-        decoder
-            .write_all(&chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
-            .await
-            .wrap_err_with(|| format!("decompressing {store_path}"))?;
-    }
-    // Flushes any codec's trailing buffered bytes through to the spool file
-    // -- must happen before the hash/size below are read.
-    decoder
-        .shutdown()
-        .await
-        .wrap_err_with(|| format!("decompressing {store_path}"))?;
-
-    let nar_hash = format!("sha256:{}", hex(&hasher.borrow().clone().finalize()));
-    let nar_size = nar_size.get();
-
     let full = store_path.to_full(store_dir);
     let full_references: Vec<String> = references.iter().map(|r| r.to_full(store_dir)).collect();
     let full_deriver = full_or_none(deriver, store_dir);
 
-    let reader = tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
+    let reader =
+        tokio::fs::File::from_std(spooled.file.reopen().wrap_err("reopening the spool file")?);
     conn.add_to_store_nar(
         &full,
         full_deriver.as_deref(),
-        &nar_hash,
+        nar_hash,
         &full_references,
         // Nix's own daemon accepts whatever the client claims here and does
         // not treat it as meaningful beyond bookkeeping — `AddSignatures`/GC

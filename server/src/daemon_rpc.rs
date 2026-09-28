@@ -1241,16 +1241,28 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                         let Some(object) = store.output_object(src).await else {
                             continue;
                         };
-                        let info = store.query_path_info(src).await;
+                        // Unlike references/deriver, `nar_hash`/`nar_size`
+                        // have no harmless default -- without them the
+                        // worker has nothing to verify its download against
+                        // or declare to the guest, so skip rather than send
+                        // a half-populated `InputRef`. An object with no
+                        // `path_info` row at all indicates inconsistent DB
+                        // state, not a normal path through here.
+                        let Some(info) = store.query_path_info(src).await else {
+                            tracing::warn!(
+                                path = %src,
+                                "no path_info for a backfilled input; skipping it"
+                            );
+                            continue;
+                        };
                         inputs.push(crate::jobs::InputRef {
                             store_path: src.clone(),
                             key: object.key,
-                            references: info
-                                .as_ref()
-                                .map(|i| i.references.clone())
-                                .unwrap_or_default(),
-                            deriver: info.and_then(|i| i.deriver).unwrap_or_default(),
+                            references: info.references,
+                            deriver: info.deriver.unwrap_or_default(),
                             compression: object.compression,
+                            nar_hash: info.nar_hash.to_wire_string(),
+                            nar_size: info.nar_size,
                         });
                     }
 
@@ -1553,6 +1565,8 @@ impl legacy_protocol::stream::Server for NarSink {
                     references: self.info.references.clone(),
                     deriver: self.info.deriver.clone().unwrap_or_default(),
                     compression,
+                    nar_hash: self.info.nar_hash.to_wire_string(),
+                    nar_size: self.info.nar_size,
                 });
             return Ok(());
         }
@@ -1621,6 +1635,8 @@ impl legacy_protocol::stream::Server for NarSink {
 
         let references = info.references.clone();
         let deriver = info.deriver.clone().unwrap_or_default();
+        let nar_hash = info.nar_hash.to_wire_string();
+        let nar_size = info.nar_size;
 
         store
             .record_path(
@@ -1648,6 +1664,8 @@ impl legacy_protocol::stream::Server for NarSink {
                 references,
                 deriver,
                 compression: Compression::Zstd,
+                nar_hash,
+                nar_size,
             });
         Ok(())
     }

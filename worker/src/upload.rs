@@ -20,7 +20,7 @@ use tokio::process::Command;
 use tokio_util::io::InspectWriter;
 
 use kubernix_types::body::SizedBody;
-use kubernix_types::{CapabilityToken, Compression, ObjectKey, StorePath, TenantId};
+use kubernix_types::{CapabilityToken, ObjectKey, StorePath, TenantId};
 
 use crate::kubernix_capnp;
 
@@ -315,39 +315,33 @@ impl<'a> NixStore<'a> {
         })
     }
 
-    /// Fetch a staged input and import it into the local store.
+    /// Import an already-downloaded input
+    /// (`input_fetch::download_to_spool`) into the local store.
     ///
-    /// The object is a zstd-compressed *bare NAR* -- the same shape every
-    /// artifact has. `--import` needs an export stream, so the wrapping is
-    /// added here, which is why the references and deriver travel alongside
-    /// the key rather than being stored a second time.
+    /// `--import` wants an export stream, not a bare NAR, which is why the
+    /// references and deriver travel alongside the key rather than being
+    /// stored a second time — the wrapping is built here rather than
+    /// stored, so the object store holds one representation of a path
+    /// rather than two — see `nar_export`.
     ///
-    /// Streamed end to end: fetched, decompressed and piped into the child a
-    /// chunk at a time, so peak memory does not scale with the size of the
-    /// input.
+    /// Streamed from the spool file to the child a chunk at a time, so peak
+    /// memory does not scale with the size of the input; the fetch and
+    /// decompression that produced the spool file already happened in
+    /// `input_fetch::download_to_spool`, decoupled from this so several
+    /// inputs' downloads can run concurrently ahead of this — still
+    /// sequential — import step.
     ///
     /// TODO: same unbounded-hang risk on the `--import` child as
-    /// `upload_output`'s `dump-path` child. `vm_ops::fetch_input` is the real
-    /// fix, over `Op::AddToStoreNar`, but only when a tenant VM is available;
-    /// this remains the fallback.
-    pub async fn fetch_input(
+    /// `upload_output`'s `dump-path` child. `vm_ops::register_input` is the
+    /// real fix, over `Op::AddToStoreNar`, but only when a tenant VM is
+    /// available; this remains the fallback.
+    pub async fn import_spooled(
         &self,
-        http: &reqwest::Client,
-        url: &str,
+        spooled: crate::input_fetch::SpooledInput,
         store_path: &StorePath,
         references: &[StorePath],
         deriver: &StorePath,
-        compression: Compression,
     ) -> eyre::Result<()> {
-        let response = http
-            .get(url)
-            .send()
-            .await
-            .wrap_err_with(|| format!("fetching {store_path}"))?;
-        if !response.status().is_success() {
-            bail!("fetching {store_path}: HTTP {}", response.status());
-        }
-
         let mut command = Command::new(self.nix_store);
         if let Some(uri) = self.store_uri {
             command.arg("--store").arg(uri);
@@ -361,42 +355,19 @@ impl<'a> NixStore<'a> {
             .wrap_err_with(|| format!("spawning {} --import", self.nix_store))?;
 
         {
-            use futures_util::StreamExt as _;
-
             let mut stdin = child.stdin.take().expect("piped");
 
-            // The object is a bare NAR; `--import` wants an export stream. The
-            // wrapping is built here rather than stored, so the object store
-            // holds one representation of a path rather than two — see
-            // `nar_export`.
             stdin
                 .write_all(&crate::nar_export::header())
                 .await
                 .wrap_err("writing the export header")?;
 
-            // Decompressed as it arrives rather than in one piece: peak
-            // memory is a chunk, not the whole NAR. Borrows `stdin` rather
-            // than owning it -- the export trailer below is written to
-            // `stdin` directly, after the decoder (dropped first) is done
-            // with it.
-            {
-                let mut decoder = crate::decompress::decoder_for(compression, &mut stdin)
-                    .wrap_err("starting decompression")?;
-                let mut body = response.bytes_stream();
-                while let Some(chunk) = body.next().await {
-                    decoder
-                        .write_all(&chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
-                        .await
-                        .wrap_err_with(|| format!("decompressing {store_path}"))?;
-                }
-                // `flush`, not `shutdown` -- this only needs to drain the
-                // decoder's own buffered bytes through to `stdin`, not close
-                // it: the export trailer still has to be written after this.
-                decoder
-                    .flush()
-                    .await
-                    .wrap_err_with(|| format!("decompressing {store_path}"))?;
-            }
+            let mut nar = tokio::fs::File::from_std(
+                spooled.file.reopen().wrap_err("reopening the spool file")?,
+            );
+            tokio::io::copy(&mut nar, &mut stdin)
+                .await
+                .wrap_err_with(|| format!("piping the spooled NAR for {store_path}"))?;
 
             stdin
                 .write_all(&crate::nar_export::trailer(
@@ -455,10 +426,10 @@ pub async fn upload_log(
 impl<'a> NixStore<'a> {
     // TODO: the `nix-store --query` children spawned below (via `.output()`,
     // which waits for exit with no timeout) share the same unbounded-hang
-    // risk as `upload_output`'s and `fetch_input`'s. `vm_ops::path_metadata`
-    // is the real fix, one `Op::QueryPathInfo` round trip instead of two
-    // subprocesses, but only when a tenant VM is available; this remains the
-    // fallback.
+    // risk as `upload_output`'s and `import_spooled`'s. `vm_ops::
+    // path_metadata` is the real fix, one `Op::QueryPathInfo` round trip
+    // instead of two subprocesses, but only when a tenant VM is available;
+    // this remains the fallback.
     async fn query_path_metadata(
         &self,
         store_path: &StorePath,
