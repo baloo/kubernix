@@ -305,6 +305,54 @@ admin:
   tolerations: []
   affinity: {}
 
+# Extra worker pools beyond the default one below, keyed by name, each
+# shaped exactly like `worker:` plus one extra field, `exclusiveClasses`.
+# The default pool above is untouched by this -- it keeps its existing
+# Deployment/ScaledObject/NATS consumer names, so adding entries here never
+# migrates or renames anything.
+#
+# Set `exclusiveClasses: true` together with a non-empty `systemFeatures`
+# (e.g. ["big-parallel"]) to make a pool subscribe ONLY to that class's jobs
+# instead of also pulling from the plain queue like the default pool does --
+# see worker/src/main.rs's KUBERNIX_WORKER_EXCLUSIVE_CLASSES and
+# worker_subjects_and_consumer. This is what gets you e.g. a dedicated
+# high-CPU/RAM pool that only serves `requiredSystemFeatures = "big-parallel"`
+# jobs, alongside a cheaper default pool serving everything else. The chart
+# computes this pool's NATS durable consumer name the same way main.rs does
+# (sorted classes folded in), so it doesn't collide with the default pool's
+# `worker-<system>` consumer -- don't set exclusiveClasses on a pool that
+# also relies on the kvm probe, since the chart can't know the probe result
+# at template time and would compute the wrong consumer name.
+#
+# example:
+# workers:
+#   big:
+#     replicas: 1
+#     system: x86_64-linux
+#     systemFeatures: ["big-parallel"]
+#     exclusiveClasses: true
+#     vm:
+#       vcpus: 8
+#       overheadMb: 512
+#       storeImgMb: 8192
+#       kvmResourceName: devices.kubevirt.io/kvm
+#     autoscaling:
+#       enabled: true
+#       minReplicaCount: 0
+#       maxReplicaCount: 2
+#       lagThreshold: "5"
+#       activationLagThreshold: "0"
+#       pollingInterval: 15
+#       cooldownPeriod: 300
+#     resources:
+#       limits:
+#         cpu: 8
+#         memory: 32Gi
+#     nodeSelector: {}
+#     tolerations: []
+#     affinity: {}
+workers: {}
+
 worker:
   # Also sizes the shared NATS durable consumer's max_ack_pending when
   # autoscaling is disabled -- see worker-deployment.yaml's

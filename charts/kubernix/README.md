@@ -122,6 +122,18 @@ per-system consumer (`worker/src/main.rs`) — including down to `minReplicaCoun
 works because the consumer is *durable*: its pending-message count stays queryable via NATS'
 monitoring API with no worker pod running, which is what lets KEDA scale back up from zero.
 
+### Extra worker pools (`workers`)
+
+The `worker:` block is one pool. `workers:` (empty by default) adds more, keyed by name, each
+shaped like `worker:` plus `exclusiveClasses`. A pool with `exclusiveClasses: true` and a
+non-empty `systemFeatures` (e.g. `["big-parallel"]`) subscribes *only* to that class's jobs
+(`requiredSystemFeatures = "big-parallel"` on the Nix derivation) instead of also pulling from the
+plain queue — useful for a dedicated high-CPU/RAM pool that shouldn't compete with the default
+pool for ordinary jobs. Each pool gets its own Deployment/ScaledObject
+(`<release>-worker-<name>`) and NATS durable consumer, computed to match
+`worker/src/main.rs::worker_subjects_and_consumer` exactly; see the `workers` example in
+`values.yaml` for the full shape.
+
 ### Provisioning tenants (`kubernix-admin`)
 
 Tenants and their auth credentials (`server/src/admin.rs`) are managed with `kubernix-admin`, which

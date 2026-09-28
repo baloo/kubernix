@@ -28,16 +28,21 @@ set, matching today's behaviour for anyone who hasn't set resource limits.
 Only a plain Mi/Gi quantity is supported for worker.resources.limits.memory
 (Helm has no built-in Kubernetes-quantity parser); anything else fails
 loudly with a clear message rather than silently miscomputing.
+
+Takes a single worker pool's own values dict (not the top-level .Values),
+so it works identically for the default `worker:` pool and any extra
+`workers.<name>` pool -- call as
+`include "kubernix.worker.vmMemoryMb" $worker`.
 */}}
 {{- define "kubernix.worker.vmMemoryMb" -}}
-{{- if .Values.worker.vm.memoryMb -}}
-{{- .Values.worker.vm.memoryMb -}}
-{{- else if (dig "limits" "memory" "" .Values.worker.resources) -}}
-{{- $mem := dig "limits" "memory" "" .Values.worker.resources -}}
+{{- if .vm.memoryMb -}}
+{{- .vm.memoryMb -}}
+{{- else if (dig "limits" "memory" "" .resources) -}}
+{{- $mem := dig "limits" "memory" "" .resources -}}
 {{- if not (regexMatch "^[0-9]+(Mi|Gi)$" $mem) -}}
 {{- fail (printf "worker.resources.limits.memory %q must be a plain Mi/Gi quantity (e.g. \"2Gi\") for worker.vm.memoryMb to be computed from it -- set worker.vm.memoryMb explicitly instead" $mem) -}}
 {{- end -}}
-{{- $overhead := int .Values.worker.vm.overheadMb -}}
+{{- $overhead := int .vm.overheadMb -}}
 {{- $num := regexFind "^[0-9]+" $mem | int -}}
 {{- $limitMb := $num -}}
 {{- if hasSuffix "Gi" $mem -}}
@@ -47,6 +52,33 @@ loudly with a clear message rather than silently miscomputing.
 {{- else -}}
 768
 {{- end -}}
+{{- end -}}
+
+{{/*
+The consumer name/suffix a worker pool renders under -- "" for the default
+pool (unnamed, preserves today's `<fullname>-worker` naming exactly) or
+"-<name>" for an extra `workers.<name>` pool. Call as
+`include "kubernix.worker.suffix" $name` where $name is "" for the default
+pool or the pool's key otherwise.
+*/}}
+{{- define "kubernix.worker.suffix" -}}
+{{- if . -}}{{- printf "-%s" . -}}{{- end -}}
+{{- end -}}
+
+{{/*
+The NATS JetStream durable consumer name a worker pool uses -- must track
+worker/src/main.rs's `worker_subjects_and_consumer` exactly (base
+`worker-<system_with_underscores>`, with the pool's sorted systemFeatures
+folded in when it declares `exclusiveClasses: true`). Call as
+`include "kubernix.worker.consumer" $worker` with a single pool's values
+dict.
+*/}}
+{{- define "kubernix.worker.consumer" -}}
+{{- $consumer := printf "worker-%s" (.system | replace "-" "_") -}}
+{{- if .exclusiveClasses -}}
+{{- $consumer = printf "%s-%s" $consumer (.systemFeatures | sortAlpha | join "_") -}}
+{{- end -}}
+{{- $consumer -}}
 {{- end -}}
 
 {{/*
