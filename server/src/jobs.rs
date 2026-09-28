@@ -60,12 +60,16 @@ pub fn results_subject(job_id: &Uuid) -> String {
 #[derive(Debug, Clone)]
 pub struct InputRef {
     pub store_path: StorePath,
-    /// Object key holding the zstd-compressed bare NAR.
+    /// Object key holding a bare NAR.
     pub key: ObjectKey,
     /// Sent with the key because a bare NAR cannot be imported alone: the
     /// worker wraps it into an export stream, which needs both of these.
     pub references: Vec<StorePath>,
     pub deriver: StorePath,
+    /// What `key`'s bytes actually use -- always [`Compression::Zstd`] for a
+    /// `Built`-tier object, whatever the upstream substituter served for a
+    /// `Substituted` one. See `RemoteObject::compression`.
+    pub compression: Compression,
 }
 
 #[derive(Debug)]
@@ -277,6 +281,7 @@ impl JobQueue {
                 entry.set_store_path(input.store_path.as_str());
                 entry.set_key(input.key.as_str());
                 entry.set_deriver(input.deriver.as_str());
+                entry.set_compression(input.compression.as_str());
                 let mut refs = entry.init_references(input.references.len() as u32);
                 for (r, reference) in input.references.iter().enumerate() {
                     refs.set(r as u32, reference.as_str());

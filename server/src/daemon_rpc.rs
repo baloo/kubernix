@@ -36,7 +36,7 @@ use crate::tenant::Tenant;
 use crate::tenant::TenantId;
 use crate::tenant_view::TenantView;
 use crate::uploads::UploadSigner;
-use kubernix_types::{Compression, StorePath, System, derivation};
+use kubernix_types::{Compression, ObjectKey, StorePath, System, derivation};
 use uuid::Uuid;
 
 /// The identifier Lix asks for is `"lix/legacy/" PACKAGE_VERSION`, so it varies
@@ -985,6 +985,23 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                 Compression::Xz => {
                     Box::new(async_compression::tokio::bufread::XzDecoder::new(reader))
                 }
+                Compression::Bzip2 => {
+                    Box::new(async_compression::tokio::bufread::BzDecoder::new(reader))
+                }
+                Compression::Gzip => {
+                    Box::new(async_compression::tokio::bufread::GzipDecoder::new(reader))
+                }
+                Compression::Lz4 => {
+                    Box::new(async_compression::tokio::bufread::Lz4Decoder::new(reader))
+                }
+                Compression::Brotli => Box::new(
+                    async_compression::tokio::bufread::BrotliDecoder::new(reader),
+                ),
+                Compression::Lzip => {
+                    return Err(rpc_error::failed(format!(
+                        "kubernix: {path} is stored as lzip, which kubernix cannot decode"
+                    )));
+                }
             };
             let mut buf = vec![0u8; CHUNK];
             let mut sent: u64 = 0;
@@ -1233,6 +1250,7 @@ impl legacy_protocol::Server for LegacyProtocolImpl {
                                 .map(|i| i.references.clone())
                                 .unwrap_or_default(),
                             deriver: info.and_then(|i| i.deriver).unwrap_or_default(),
+                            compression: object.compression,
                         });
                     }
 
@@ -1521,11 +1539,11 @@ impl legacy_protocol::stream::Server for NarSink {
             // `InputRef` literal — holding `staged`'s `RefCell` guard across
             // this `.await` would risk a panic if anything else on this
             // single-threaded connection tries to borrow it while suspended.
-            let key = store
+            let (key, compression) = store
                 .output_object(&self.info.path)
                 .await
-                .map(|o| o.key)
-                .unwrap_or_default();
+                .map(|o| (o.key, o.compression))
+                .unwrap_or((ObjectKey::default(), Compression::Zstd));
             self.connection
                 .staged
                 .borrow_mut()
@@ -1534,6 +1552,7 @@ impl legacy_protocol::stream::Server for NarSink {
                     key,
                     references: self.info.references.clone(),
                     deriver: self.info.deriver.clone().unwrap_or_default(),
+                    compression,
                 });
             return Ok(());
         }
@@ -1628,6 +1647,7 @@ impl legacy_protocol::stream::Server for NarSink {
                 key,
                 references,
                 deriver,
+                compression: Compression::Zstd,
             });
         Ok(())
     }

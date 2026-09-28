@@ -9,12 +9,15 @@
 //! [`kubernix_daemon_protocol::DaemonConnection::query_path_info`] directly
 //! rather than a fifth wrapper here.
 
-use digest_io_async::HashWriter;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use eyre::{Context as _, OptionExt as _, bail};
 use futures_util::StreamExt as _;
-use kubernix_types::StorePath;
+use kubernix_types::{Compression, StorePath};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::InspectWriter;
 
 use kubernix_daemon_protocol::DaemonConnection;
 
@@ -165,6 +168,7 @@ where
 /// decompressed NAR is spooled to disk while being hashed first, then
 /// streamed back out for the actual `add_to_store_nar` call — `--import`
 /// gets to compute this itself as it reads; this protocol does not.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_input<S>(
     conn: &mut DaemonConnection<S>,
     http: &reqwest::Client,
@@ -173,6 +177,7 @@ pub async fn fetch_input<S>(
     references: &[StorePath],
     deriver: &StorePath,
     store_dir: &str,
+    compression: Compression,
 ) -> eyre::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -188,40 +193,44 @@ where
 
     let spool = tempfile::NamedTempFile::new().wrap_err("creating a spool file")?;
     let sink = tokio::fs::File::from_std(spool.reopen().wrap_err("reopening the spool file")?);
-    let mut hashed = HashWriter::<Sha256, _>::new(sink);
+
+    // `decoder_for` erases the concrete decoder type, so the hash/size
+    // tracking below can't ride along as a wrapper it owns (there would be
+    // no way to get it back out through `Box<dyn AsyncWrite>` afterward) --
+    // instead it's tapped via `InspectWriter` on the way into the spool
+    // file, same as `substitute.rs::fetch_one`'s `nar_hasher`. `Rc`/`RefCell`,
+    // not `Arc`/`Mutex`: this runs inline in the worker's single-job loop,
+    // never spawned onto another task, so there's no real concurrency to
+    // guard against.
+    let hasher = Rc::new(RefCell::new(Sha256::new()));
+    let nar_size = Rc::new(Cell::new(0u64));
+    let counted = InspectWriter::new(sink, {
+        let hasher = hasher.clone();
+        let nar_size = nar_size.clone();
+        move |chunk: &[u8]| {
+            hasher.borrow_mut().update(chunk);
+            nar_size.set(nar_size.get() + chunk.len() as u64);
+        }
+    });
 
     let mut decoder =
-        zstd::stream::write::Decoder::new(Vec::new()).wrap_err("starting decompression")?;
+        crate::decompress::decoder_for(compression, counted).wrap_err("starting decompression")?;
     let mut body = response.bytes_stream();
-    let mut nar_size: u64 = 0;
     while let Some(chunk) = body.next().await {
-        std::io::Write::write_all(
-            &mut decoder,
-            &chunk.wrap_err_with(|| format!("fetching {store_path}"))?,
-        )
-        .wrap_err_with(|| format!("decompressing {store_path}"))?;
-        let decoded = std::mem::take(decoder.get_mut());
-        if !decoded.is_empty() {
-            nar_size += decoded.len() as u64;
-            hashed
-                .write_all(&decoded)
-                .await
-                .wrap_err("spooling the decompressed input")?;
-        }
-    }
-    std::io::Write::flush(&mut decoder).wrap_err_with(|| format!("decompressing {store_path}"))?;
-    let decoded = std::mem::take(decoder.get_mut());
-    if !decoded.is_empty() {
-        nar_size += decoded.len() as u64;
-        hashed
-            .write_all(&decoded)
+        decoder
+            .write_all(&chunk.wrap_err_with(|| format!("fetching {store_path}"))?)
             .await
-            .wrap_err("spooling the decompressed input")?;
+            .wrap_err_with(|| format!("decompressing {store_path}"))?;
     }
+    // Flushes any codec's trailing buffered bytes through to the spool file
+    // -- must happen before the hash/size below are read.
+    decoder
+        .shutdown()
+        .await
+        .wrap_err_with(|| format!("decompressing {store_path}"))?;
 
-    let (hasher, mut sink) = hashed.into_parts();
-    sink.flush().await.wrap_err("flushing the spool file")?;
-    let nar_hash = format!("sha256:{}", hex(&hasher.finalize()));
+    let nar_hash = format!("sha256:{}", hex(&hasher.borrow().clone().finalize()));
+    let nar_size = nar_size.get();
 
     let full = store_path.to_full(store_dir);
     let full_references: Vec<String> = references.iter().map(|r| r.to_full(store_dir)).collect();

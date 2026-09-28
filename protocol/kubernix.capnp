@@ -29,14 +29,23 @@ enum FailureKind {
 # fetches it and imports it before building.
 struct InputRef {
   storePath @0 :Text;
-  # Object key, holding a zstd-compressed bare NAR -- the same format every
-  # other artifact uses. The worker wraps it into a Nix `--export` stream
-  # locally, which is why the two fields below travel with it: importing a path
-  # needs its references and deriver, and a bare NAR carries neither.
+  # Object key, holding a bare NAR. The worker wraps it into a Nix `--export`
+  # stream locally, which is why the two fields below travel with it:
+  # importing a path needs its references and deriver, and a bare NAR
+  # carries neither.
   key       @1 :Text;
   references @2 :List(Text);
   # Empty when unknown.
   deriver    @3 :Text;
+  # What compression `key`'s bytes actually use -- "zstd", "xz", "bzip2",
+  # etc. (kubernix_types::Compression::as_str). Only zstd-compressed for a
+  # `Built`-tier object (the worker always compresses its own outputs); a
+  # `Substituted` one is stored exactly as the upstream substituter served
+  # it, which can be anything -- see `OutputInfo.compression` for the same
+  # field in the opposite (upload) direction. Empty on a message from an
+  # older server that predates this field -- treat that the same as
+  # "zstd", the only compression that existed before this field did.
+  compression @4 :Text;
 }
 
 # Published to kubernix.jobs.<system>.

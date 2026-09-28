@@ -18,7 +18,7 @@ kubernix-guest-protocol = { version = "0.1.0", path = "./guest-protocol" }
 kubernix-signing = { version = "0.1.0", path = "./signing" }
 kubernix-types = { version = "0.1.0", path = "./types" }
 
-async-compression = { version = "0.4", features = ["tokio", "zstd", "xz"] }
+async-compression = { version = "0.4", features = ["tokio", "zstd", "xz", "bzip2", "gzip", "brotli", "lz4"] }
 async-nats = "0.50.0"
 async-trait = "0.1.92"
 aws-config = "1.10.1"
