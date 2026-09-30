@@ -174,6 +174,7 @@ dockerTools.buildLayeredImage {
   contents = [
     lix
     kubernix-plugin
+    entrypoint
     # The plugin drives SSH itself via Lix's `SSH` class (plugin/src/plugin.cc,
     # `#include <lix/libstore/ssh.hh>`), which shells out to a real `ssh` binary.
     openssh
