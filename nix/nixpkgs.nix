@@ -32,6 +32,9 @@ in let
         sed -i "\|subdir('tests/functional2')|d" meson.build
       '';
     });
+    cloud-hypervisor = super.cloud-hypervisor.overrideAttrs (old: {
+      patches = [ ./patches/cloud-hypervisor-nested-vmx.patch ];
+    });
   };
 in import nixpkgs ({
   overlays = [
