@@ -1,0 +1,127 @@
+Backport of https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8985
+
+diff --git a/arch/src/x86_64/mod.rs b/arch/src/x86_64/mod.rs
+index e5ee4f5..a54c795 100644
+--- a/arch/src/x86_64/mod.rs
++++ b/arch/src/x86_64/mod.rs
+@@ -1008,7 +1008,7 @@ pub fn configure_vcpu(
+         vcpu.enable_hyperv_synic().unwrap();
+     }
+ 
+-    regs::setup_msrs(vcpu).map_err(Error::MsrsConfiguration)?;
++    regs::setup_msrs(vcpu, cpu_vendor, nested).map_err(Error::MsrsConfiguration)?;
+     if let Some((kernel_entry_point, guest_memory)) = boot_setup {
+         if setup_registers {
+             regs::setup_regs(vcpu, kernel_entry_point).map_err(Error::RegsConfiguration)?;
+diff --git a/arch/src/x86_64/regs.rs b/arch/src/x86_64/regs.rs
+index 352b274..d5dadf6 100644
+--- a/arch/src/x86_64/regs.rs
++++ b/arch/src/x86_64/regs.rs
+@@ -8,9 +8,10 @@
+ // found in the LICENSE-BSD-3-Clause file.
+ use std::result;
+ 
++use hypervisor::CpuVendor;
+ use hypervisor::arch::x86::gdt::{gdt_entry, segment_from_gdt};
+ use hypervisor::arch::x86::regs::CR0_PE;
+-use hypervisor::arch::x86::{FpuState, SpecialRegisters};
++use hypervisor::arch::x86::{FpuState, MsrEntry, SpecialRegisters, msr_index};
+ use thiserror::Error;
+ use vm_memory::{Address, Bytes, GuestMemory, GuestMemoryError};
+ 
+@@ -33,6 +34,15 @@ pub enum Error {
+     /// Setting up MSRs failed.
+     #[error("Setting up MSRs failed")]
+     SetModelSpecificRegisters(#[source] hypervisor::HypervisorCpuError),
++    /// Setting up MSRs wrote fewer entries than requested.
++    #[error("Setting up MSRs wrote {written} entries, requested {requested}")]
++    SetModelSpecificRegistersCount { written: usize, requested: usize },
++    /// Reading nested virtualization MSRs failed.
++    #[error("Reading nested virtualization MSRs failed")]
++    GetNestedModelSpecificRegisters(#[source] hypervisor::HypervisorCpuError),
++    /// Reading nested virtualization MSRs returned fewer entries than requested.
++    #[error("Reading nested virtualization MSRs returned {read} entries, requested {requested}")]
++    GetNestedModelSpecificRegistersCount { read: usize, requested: usize },
+     /// Failed to set SREGs for this CPU.
+     #[error("Failed to set SREGs for this CPU")]
+     SetStatusRegisters(#[source] hypervisor::HypervisorCpuError),
+@@ -81,9 +91,64 @@ pub fn setup_fpu(vcpu: &dyn hypervisor::Vcpu) -> Result<()> {
+ /// # Arguments
+ ///
+ /// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
+-pub fn setup_msrs(vcpu: &dyn hypervisor::Vcpu) -> Result<()> {
+-    vcpu.set_msrs(vcpu.boot_msr_entries())
++pub fn setup_msrs(vcpu: &dyn hypervisor::Vcpu, cpu_vendor: CpuVendor, nested: bool) -> Result<()> {
++    let mut msrs = vcpu.boot_msr_entries().to_vec();
++
++    if nested && cpu_vendor == CpuVendor::Intel {
++        // Match QEMU's nested-VMX feature MSR selection/order: write
++        // IA32_FEATURE_CONTROL first, then only the VMX capability MSRs KVM
++        // accepts as feature MSRs.
++        const NESTED_VMX_FEATURE_MSRS: [u32; 11] = [
++            msr_index::MSR_IA32_VMX_TRUE_PROCBASED_CTLS,
++            msr_index::MSR_IA32_VMX_TRUE_PINBASED_CTLS,
++            msr_index::MSR_IA32_VMX_TRUE_EXIT_CTLS,
++            msr_index::MSR_IA32_VMX_TRUE_ENTRY_CTLS,
++            msr_index::MSR_IA32_VMX_PROCBASED_CTLS2,
++            msr_index::MSR_IA32_VMX_EPT_VPID_CAP,
++            msr_index::MSR_IA32_VMX_BASIC,
++            msr_index::MSR_IA32_VMX_MISC,
++            msr_index::MSR_IA32_VMX_VMFUNC,
++            msr_index::MSR_IA32_VMX_CR0_FIXED0,
++            msr_index::MSR_IA32_VMX_CR4_FIXED0,
++        ];
++
++        let mut vmx_feature_msrs: Vec<MsrEntry> = NESTED_VMX_FEATURE_MSRS
++            .iter()
++            .map(|index| MsrEntry {
++                index: *index,
++                ..Default::default()
++            })
++            .collect();
++
++        let read = vcpu
++            .get_msrs(&mut vmx_feature_msrs)
++            .map_err(Error::GetNestedModelSpecificRegisters)?;
++        if read != vmx_feature_msrs.len() {
++            return Err(Error::GetNestedModelSpecificRegistersCount {
++                read,
++                requested: vmx_feature_msrs.len(),
++            });
++        }
++
++        msrs.push(MsrEntry {
++            index: msr_index::MSR_IA32_FEATURE_CONTROL,
++            data: u64::from(
++                msr_index::FEATURE_CONTROL_LOCKED
++                    | msr_index::FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX,
++            ),
++        });
++        msrs.extend(vmx_feature_msrs);
++    }
++
++    let written = vcpu
++        .set_msrs(&msrs)
+         .map_err(Error::SetModelSpecificRegisters)?;
++    if written != msrs.len() {
++        return Err(Error::SetModelSpecificRegistersCount {
++            written,
++            requested: msrs.len(),
++        });
++    }
+ 
+     Ok(())
+ }
+diff --git a/vmm/src/cpu.rs b/vmm/src/cpu.rs
+index e6925bb..ed85082 100644
+--- a/vmm/src/cpu.rs
++++ b/vmm/src/cpu.rs
+@@ -3486,7 +3486,7 @@ mod unit_tests {
+             .create_vm(HypervisorVmConfig::default())
+             .expect("new VM fd creation failed");
+         let vcpu = vm.create_vcpu(0, None).unwrap();
+-        setup_msrs(vcpu.as_ref()).unwrap();
++        setup_msrs(vcpu.as_ref(), CpuVendor::Intel, false).unwrap();
+ 
+         // This test will check against the last MSR entry configured (the tenth one).
+         // See create_msr_entries for details.
