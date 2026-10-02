@@ -79,7 +79,7 @@ let
       # fine (it's just a string) and leaves maxJobs defaulted to 1. Found
       # live: exactly that shift meant every remote build serialized to one
       # at a time no matter how many derivations were ready to build.
-      builders = ''${builder} ''${KUBERNIX_SYSTEMS} - ''${KUBERNIX_MAX_JOBS}"
+      builders = ''${builder} ''${KUBERNIX_SYSTEMS} - ''${KUBERNIX_MAX_JOBS} 1 kvm,nixos-test,big-parallel"
 
       if [ "''${KUBERNIX_SUBSTITUTE}" != "0" ]; then
         substituters=""
