@@ -65,6 +65,22 @@ stdenvNoCC.mkDerivation {
     grep -q "guest-agent listening" "$console_log"
     grep -q "accepted vsock connection" "$console_log"
 
+    # PLAN.md Phase 17 kvm investigation: does the guest's own /dev, as
+    # logged by guest-agent's `log_dev_contents()` right after mounting
+    # devtmpfs, actually contain a `kvm` node? The worker's boot-time
+    # nested-virt probe (`worker/src/vm.rs::boot_probe`) only ever checks
+    # `vmx`/`svm` CPUID flags reaching the guest via the `guest/caps`
+    # control-port endpoint -- it never asks whether `/dev/kvm` itself
+    # exists in here, which is a separate question gated on the guest
+    # kernel actually building the `KVM`/`KVM_INTEL`/`KVM_AMD` drivers
+    # (`nix/guest-vm.nix`'s `structuredExtraConfig`). A hard assertion, not
+    # just a diagnostic print, now that those are enabled: a `nixos-test`
+    # build routed here on the strength of `boot_probe`'s CPUID check alone
+    # would otherwise silently fail later for want of this device node.
+    echo "==> checking the guest's own /dev for kvm"
+    grep "guest-agent: /dev contains:" "$console_log" | grep -q '"kvm"' \
+      || { echo "guest's own /dev never grew a kvm node"; exit 1; }
+
     echo "guest-agent booted, listened, and accepted a vsock connection"
     touch $out
   '';

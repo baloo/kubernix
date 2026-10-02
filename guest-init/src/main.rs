@@ -177,8 +177,39 @@ fn main() {
     mount(&loop_path, "/target", "erofs", libc::MS_RDONLY, None);
     unsafe { libc::close(loop_fd) };
 
-    if unsafe { libc::chroot(cstr("/target").as_ptr()) } != 0 {
-        die("chroot /target");
+    // `switch_root`'s own sequence (`move_mount(2)`'s predecessor, what
+    // dracut/systemd/busybox all actually do), not a plain `chroot`: moving
+    // `/target`'s mount onto `/` makes it *become* this mount namespace's
+    // root, rather than leaving the kernel's anonymous initial root as the
+    // real `mnt_ns` root with `/target` merely `chroot`ed into underneath
+    // it. That distinction matters here specifically because
+    // `kernel/user_namespace.c`'s `create_user_ns()` refuses
+    // `unshare(CLONE_NEWUSER)` outright (`EPERM`, regardless of
+    // capabilities) for any process `current_chrooted()` -- which a plain
+    // `chroot` into a mount that isn't also the namespace root trips,
+    // permanently, for every descendant (`guest-agent`, and every
+    // `nix-daemon` it execs). Found by `guest-agent` logging exactly that
+    // `EPERM` and `nix-daemon`'s own `check-namespace-support` helper
+    // warning "user namespaces do not work on this system" -- every
+    // sandboxed build in here needs `CLONE_NEWUSER` (auto-allocate-uids'
+    // `uid-range` feature included), not just `nixos-test`/`kvm` ones.
+    if unsafe { libc::chdir(cstr("/target").as_ptr()) } != 0 {
+        die("chdir /target");
+    }
+    if unsafe {
+        libc::mount(
+            cstr(".").as_ptr(),
+            cstr("/").as_ptr(),
+            std::ptr::null(),
+            libc::MS_MOVE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        die("move-mounting /target onto /");
+    }
+    if unsafe { libc::chroot(cstr(".").as_ptr()) } != 0 {
+        die("chroot .");
     }
     if unsafe { libc::chdir(cstr("/").as_ptr()) } != 0 {
         die("chdir /");

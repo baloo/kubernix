@@ -121,6 +121,19 @@ let
       PARAVIRT = yes;
       PARAVIRT_CLOCK = yes;
       KVM_GUEST = yes;
+      # The above three make this L1 guest behave well *as* a KVM guest --
+      # none of them make the kernel itself *provide* `/dev/kvm` to anything
+      # nested inside it (an L2 VM a `nixos-test`-class build boots). That's
+      # this: the actual hypervisor driver, needed so a nested
+      # `requiredSystemFeatures = "kvm"` build has something to open. Found
+      # missing after `nix/guest-vm-test.nix` confirmed `/dev` never grows a
+      # `kvm` node despite `worker/src/vm.rs::boot_probe` reporting non-zero
+      # `vmx`/`svm` CPUID flags -- that probe only proves the flag reaches
+      # this guest, never that this kernel turns it into a device node.
+      VIRTUALIZATION = yes;
+      KVM = yes;
+      KVM_INTEL = yes;
+      KVM_AMD = yes;
       # `tinyconfig`'s `EXPERT = yes` hides (and defaults off) a handful of
       # syscall-class options a normal system always has on -- invisible on
       # the stock default config, which never sets `EXPERT` at all. Found by
