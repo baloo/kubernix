@@ -78,6 +78,27 @@ where
     Ok((references, deriver))
 }
 
+/// Whether `store_path` is already valid in the guest's store — one
+/// `QueryPathInfo` round trip, local to the host over the VM's control
+/// channel, not a network call. Unlike `path_metadata`, `None` is expected
+/// here (a path a previous job on this same tenant already registered into
+/// the retained `store.img`), not an error.
+pub async fn path_is_valid<S>(
+    conn: &mut DaemonConnection<S>,
+    store_path: &StorePath,
+    store_dir: &str,
+) -> eyre::Result<bool>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let full = store_path.to_full(store_dir);
+    Ok(conn
+        .query_path_info(&full)
+        .await
+        .wrap_err_with(|| format!("checking whether {store_path} is already valid"))?
+        .is_some())
+}
+
 /// `Op::NarFromPath`, hashed/compressed/spooled/uploaded exactly like
 /// `upload::NixStore::upload_output`'s `nix store dump-path` pipeline — only
 /// the byte source changes, from a subprocess's stdout to the daemon
