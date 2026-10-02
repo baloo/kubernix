@@ -166,6 +166,7 @@ impl Job {
         nix: upload::NixStore<'_>,
         mut vm: Option<&mut VmConn>,
         max_parallel_fetches: usize,
+        vm_store_fresh: bool,
     ) -> eyre::Result<()> {
         if self.inputs.is_empty() {
             return Ok(());
@@ -183,6 +184,14 @@ impl Job {
         // carries, rather than trusting the wire order. Only *registration*
         // needs this order, though -- the download below runs unordered.
         let order = topo_sort_inputs(&self.inputs).wrap_err("ordering inputs")?;
+        let order = self
+            .skip_already_valid(order, &mut vm, vm_store_fresh, nix.store_dir)
+            .await
+            .wrap_err("checking which inputs are already valid")?;
+        if order.is_empty() {
+            tracing::info!(job_id = %self.job_id, "every staged input already valid in the guest's store");
+            return Ok(());
+        }
 
         let keys: Vec<ObjectKey> = order.iter().map(|&i| self.inputs[i].key.clone()).collect();
         let urls = upload::request_download_urls(client, &self.job_id, &self.token, &keys)
@@ -266,8 +275,43 @@ impl Job {
             }
         }
 
-        tracing::info!(job_id = %self.job_id, count = self.inputs.len(), "inputs imported");
+        tracing::info!(job_id = %self.job_id, count = order.len(), "inputs imported");
         Ok(())
+    }
+
+    /// Of `order` (already a valid topological order over `self.inputs`),
+    /// the subsequence not already valid in `vm`'s guest store. Returns
+    /// `order` unchanged with no VM (the non-VM fallback has no retained
+    /// store across jobs -- nothing to skip) or when `fresh` (a `store.img`
+    /// just created for this boot can't already hold anything a previous
+    /// job registered).
+    async fn skip_already_valid(
+        &self,
+        order: Vec<usize>,
+        vm: &mut Option<&mut VmConn>,
+        fresh: bool,
+        store_dir: &str,
+    ) -> eyre::Result<Vec<usize>> {
+        let Some(conn) = (if fresh { None } else { vm.as_mut() }) else {
+            return Ok(order);
+        };
+        let mut pending = Vec::with_capacity(order.len());
+        let mut skipped = 0usize;
+        for i in order {
+            let input = &self.inputs[i];
+            if vm_ops::path_is_valid(conn, &input.store_path, store_dir).await? {
+                skipped += 1;
+            } else {
+                pending.push(i);
+            }
+        }
+        if skipped > 0 {
+            tracing::info!(
+                job_id = %self.job_id, skipped, remaining = pending.len(),
+                "skipping inputs already valid in the guest's retained store"
+            );
+        }
+        Ok(pending)
     }
 }
 
@@ -739,6 +783,13 @@ async fn main() -> color_eyre::eyre::Result<()> {
         // `ack_wait` for a job with many/large assets, well before the
         // retry loop below ever spawns its own heartbeat. Scoped to a
         // block so the guard aborts it as soon as fetch_inputs resolves.
+        // PLAN.md Phase 18: whether *this job's* VM boot (not any later
+        // retry's) was FRESH — computed once, before both the input-fetch
+        // filtering below and the retry loop further down, since both gate
+        // on it ("nothing to gain from wiping/skip-checking an
+        // already-empty disk").
+        let original_boot_was_fresh = vm_handle.as_ref().map(|h| h.fresh).unwrap_or(false);
+
         let fetch_result = {
             let _heartbeat = HeartbeatGuard::spawn(message.clone(), ack_heartbeat_interval);
             job.fetch_inputs(
@@ -747,6 +798,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
                 nix,
                 vm_conn.as_mut(),
                 max_parallel_input_fetches,
+                original_boot_was_fresh,
             )
             .await
         };
@@ -783,11 +835,6 @@ async fn main() -> color_eyre::eyre::Result<()> {
             }
         };
 
-        // PLAN.md Phase 18: whether *this job's* VM boot (not any later
-        // retry's) was FRESH — computed once, before the retry loop, since
-        // it's what gates ENOSPC recovery ("nothing to gain from wiping an
-        // already-empty disk").
-        let original_boot_was_fresh = vm_handle.as_ref().map(|h| h.fresh).unwrap_or(false);
         let already_on_big_parallel = worker_classes.iter().any(|c| c == "big-parallel");
         let mut enospc_retried = false;
         let mut oom_local_retried = false;
@@ -1828,6 +1875,158 @@ mod tests {
     fn topo_sort_inputs_rejects_a_reference_cycle() {
         let inputs = vec![input("a", &["b"]), input("b", &["a"])];
         assert!(topo_sort_inputs(&inputs).is_err());
+    }
+
+    fn job_with_inputs(inputs: Vec<InputRef>) -> Job {
+        Job {
+            job_id: "job".to_string(),
+            derivation_path: StorePath::new("out.drv"),
+            tenant: TenantId::from_parts("t", "0"),
+            inputs,
+            drv: Vec::new(),
+            token: CapabilityToken::default(),
+            required_features: Vec::new(),
+            trusted_substituters: Vec::new(),
+        }
+    }
+
+    /// Drives the guest side of `DaemonConnection::open`'s handshake/
+    /// `set_options`, then answers exactly `valid_for.len()` `QueryPathInfo`
+    /// calls in order, reporting each one valid/invalid per that list. Wire
+    /// shape and the constants below are copied from `daemon-protocol`'s own
+    /// (crate-private) `connection.rs`, the same way that crate's own tests
+    /// copy them rather than exposing them across the crate boundary just for
+    /// tests.
+    mod fake_guest_daemon {
+        use kubernix_types::wire::{write_bytes, write_u64};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        const MAGIC_1: u64 = 0x6e69_7863;
+        const MAGIC_2: u64 = 0x6478_696f;
+        const PROTOCOL_VERSION: u64 = (1 << 8) | 35;
+        const STDERR_LAST: u64 = 0x616c_7473;
+        const OP_QUERY_PATH_INFO: u64 = 26;
+
+        fn padding(len: usize) -> usize {
+            (8 - len % 8) % 8
+        }
+
+        async fn read_u64(stream: &mut UnixStream) -> u64 {
+            let mut buf = [0u8; 8];
+            stream.read_exact(&mut buf).await.unwrap();
+            u64::from_le_bytes(buf)
+        }
+
+        async fn discard_wire_str(stream: &mut UnixStream) {
+            let len = read_u64(stream).await as usize;
+            let mut buf = vec![0u8; len + padding(len)];
+            stream.read_exact(&mut buf).await.unwrap();
+        }
+
+        pub async fn run(mut stream: UnixStream, valid_for: Vec<bool>) {
+            let mut magic = [0u8; 8];
+            stream.read_exact(&mut magic).await.unwrap();
+            assert_eq!(u64::from_le_bytes(magic), MAGIC_1);
+
+            let mut greeting = Vec::new();
+            write_u64(&mut greeting, MAGIC_2);
+            write_u64(&mut greeting, PROTOCOL_VERSION);
+            stream.write_all(&greeting).await.unwrap();
+
+            // Client's PROTOCOL_VERSION, obsolete CPU affinity, obsolete
+            // reserveSpace -- three words, none acted on here.
+            let mut discard = [0u8; 24];
+            stream.read_exact(&mut discard).await.unwrap();
+
+            let mut reply = Vec::new();
+            write_bytes(&mut reply, b"2.96.0-test");
+            write_u64(&mut reply, 0); // optional<TrustedFlag>: absent
+            write_u64(&mut reply, STDERR_LAST);
+            stream.write_all(&reply).await.unwrap();
+
+            // `set_options`: OP_SET_OPTIONS + 13 further words (104 bytes),
+            // none of which this fake daemon needs to act on.
+            let mut discard = [0u8; 8 + 104];
+            stream.read_exact(&mut discard).await.unwrap();
+            let mut reply = Vec::new();
+            write_u64(&mut reply, STDERR_LAST);
+            stream.write_all(&reply).await.unwrap();
+
+            for valid in valid_for {
+                let op = read_u64(&mut stream).await;
+                assert_eq!(op, OP_QUERY_PATH_INFO);
+                discard_wire_str(&mut stream).await; // the queried store path
+
+                let mut reply = Vec::new();
+                write_u64(&mut reply, STDERR_LAST);
+                write_u64(&mut reply, valid as u64);
+                if valid {
+                    write_bytes(&mut reply, b""); // deriver: none
+                    write_bytes(&mut reply, b"sha256:abc"); // nar_hash
+                    write_u64(&mut reply, 0); // references: none
+                    write_u64(&mut reply, 0); // registrationTime
+                    write_u64(&mut reply, 0); // narSize
+                    write_u64(&mut reply, 0); // ultimate: false
+                    write_u64(&mut reply, 0); // sigs: none
+                    write_bytes(&mut reply, b""); // ca: none
+                }
+                stream.write_all(&reply).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_already_valid_filters_out_valid_inputs_in_order() {
+        let (client, guest) = tokio::net::UnixStream::pair().unwrap();
+        let guest_task = tokio::spawn(fake_guest_daemon::run(guest, vec![true, false]));
+
+        let job = job_with_inputs(vec![input("a", &[]), input("b", &[])]);
+        let mut conn = VmConn::open(client).await.unwrap();
+        let mut vm = Some(&mut conn);
+
+        let order = job
+            .skip_already_valid(vec![0, 1], &mut vm, false, "/nix/store")
+            .await
+            .unwrap();
+
+        // `a` (index 0) reported valid, `b` (index 1) not -- only `b`
+        // remains, keeping its position in `order`.
+        assert_eq!(order, vec![1]);
+        guest_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skip_already_valid_is_a_noop_on_a_fresh_store() {
+        // A fresh `store.img` can't already hold anything a previous job
+        // registered, so no `QueryPathInfo` call should ever be sent --
+        // `fake_guest_daemon::run` is handed an empty `valid_for`, so it
+        // returns right after the handshake and would otherwise panic on
+        // seeing a further read it did not expect.
+        let (client, guest) = tokio::net::UnixStream::pair().unwrap();
+        let guest_task = tokio::spawn(fake_guest_daemon::run(guest, vec![]));
+
+        let job = job_with_inputs(vec![input("a", &[])]);
+        let mut conn = VmConn::open(client).await.unwrap();
+        let mut vm = Some(&mut conn);
+
+        let order = job
+            .skip_already_valid(vec![0], &mut vm, true, "/nix/store")
+            .await
+            .unwrap();
+        assert_eq!(order, vec![0]);
+        guest_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skip_already_valid_passes_inputs_through_with_no_vm() {
+        let job = job_with_inputs(vec![input("a", &[]), input("b", &[])]);
+        let mut vm: Option<&mut VmConn> = None;
+        let order = job
+            .skip_already_valid(vec![0, 1], &mut vm, false, "/nix/store")
+            .await
+            .unwrap();
+        assert_eq!(order, vec![0, 1]);
     }
 
     // PLAN.md Phase 18: `next_action` table test -- every
