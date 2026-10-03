@@ -134,6 +134,20 @@ let
       KVM = yes;
       KVM_INTEL = yes;
       KVM_AMD = yes;
+      # A `kvm`/`nixos-test`-class build's own `virtiofsd` (sharing this
+      # guest's `/nix/store` into *its* nested VM) calls `name_to_handle_at`/
+      # `open_by_handle_at` at startup (`--inode-file-handles=prefer`, its
+      # default) to build its internal filesystem representation. Those
+      # syscalls live in `fs/fhandle.c`, gated entirely by `FHANDLE` --
+      # without it they alias to the kernel's `sys_ni_syscall` stub, which
+      # always returns `ENOSYS`, not the `EOPNOTSUPP` virtiofsd's "prefer"
+      # mode actually knows how to fall back on
+      # (`virtiofsd/src/passthrough/file_handle.rs`'s `from_fd`) -- so
+      # virtiofsd hard-crashes ("Failed to create internal filesystem
+      # representation: Function not implemented (os error 38)") instead of
+      # silently downgrading to `O_PATH` fds the way it would on literally
+      # any ordinary distro kernel, which always carries `FHANDLE = y`.
+      FHANDLE = yes;
       # `tinyconfig`'s `EXPERT = yes` hides (and defaults off) a handful of
       # syscall-class options a normal system always has on -- invisible on
       # the stock default config, which never sets `EXPERT` at all. Found by
