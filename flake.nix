@@ -2,7 +2,7 @@
   description = "Kubernix: a distributed remote builder for Lix";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     lix.url = "github:lix-project/lix";
     # PLAN.md Phase 18: the guest-agent-ebpf crate needs a nightly Rust
     # toolchain with `rust-src` (for `-Z build-std=core`) to target
