@@ -47,6 +47,10 @@ let
     inherit (guest-vm) kernel initrd;
     inherit kubernix-worker vm-test-lib;
   };
+  vm-db-persistence-test = pkgs.callPackage ./vm-db-persistence-test.nix {
+    inherit (guest-vm) kernel initrd;
+    inherit kubernix-worker vm-test-lib;
+  };
   vm-encryption-test = pkgs.callPackage ./vm-encryption-test.nix {
     inherit (guest-vm) kernel initrd;
     inherit vm-test-lib;
@@ -96,7 +100,7 @@ in {
   kubernix-guest-vm-kernel = guest-vm.kernel;
   kubernix-guest-vm-initrd = guest-vm.initrd;
   guest-vm-test = guest-vm.test;
-  inherit vm-lifecycle-test vm-build-test vm-encryption-test vm-network-test vm-caps-test vm-status-test;
+  inherit vm-lifecycle-test vm-build-test vm-db-persistence-test vm-encryption-test vm-network-test vm-caps-test vm-status-test;
   inherit vm-oom-test vm-enospc-test;
   test = import ./test.nix {
     inherit pkgs kubernix-server kubernix-worker kubernix-plugin;
