@@ -226,9 +226,17 @@ async fn main() -> Result<()> {
     // directory got there. Everything else in this list only needs an empty
     // directory to mount *onto*, which `rootImg` ships pre-made for exactly
     // that reason; these two need to be writable themselves. `mount_store()`
-    // later bind-mounts a disk-backed directory onto `/nix/var/nix/b`
-    // (Nix's own default `build-dir`) once the tmpfs here has given it
-    // somewhere to attach to.
+    // later bind-mounts disk-backed directories onto `/nix/var/nix/b` (Nix's
+    // own default `build-dir`) and `/nix/var/nix/db` (the path-validity
+    // SQLite database) once the tmpfs here has given them somewhere to
+    // attach to -- without the latter, a path registered before a reboot
+    // would come back "not valid" after one even though its content is
+    // still sitting in the store overlay, since this tmpfs is wiped on every
+    // boot. GC roots and temp roots deliberately stay tmpfs-only, unlike
+    // those two: nothing in this guest's production path creates or depends
+    // on a permanent GC root, and a temp root surviving a reboot would
+    // reference a process that no longer exists -- there should be no roots
+    // in this guest's Nix store at all.
     for (fstype, target) in [
         ("proc", "/proc"),
         ("sysfs", "/sys"),
@@ -639,7 +647,28 @@ async fn mount_store() -> Result<()> {
         .wrap_err("creating /nix/var/nix/b")?;
     run(MOUNT_BIN, &["--bind", &build, "/nix/var/nix/b"])
         .await
-        .wrap_err("bind-mounting the disk-backed build-dir onto /nix/var/nix/b")
+        .wrap_err("bind-mounting the disk-backed build-dir onto /nix/var/nix/b")?;
+
+    // Nix's path-validity SQLite database (`<nixStateDir>/db`, i.e.
+    // `/nix/var/nix/db`) would otherwise live only on the `tmpfs` mounted at
+    // `/nix/var` in `main()` -- wiped on every boot, which silently empties
+    // the validity DB even though `store.img`'s upper overlay dir (above)
+    // and `b` (just above) both persist real content across a reboot. A VM
+    // evicted and rebooted for a tenant (`VmPool::ensure_vm_for`) then
+    // reports every already-present path as invalid, forcing `fetch_inputs`
+    // to redundantly re-download and re-register bytes already sitting in
+    // the overlay. Bind-mounting this onto the same disk-backed device,
+    // same pattern as `build` above, fixes that.
+    let db = format!("{STORE_RAW}/db");
+    tokio::fs::create_dir_all(&db)
+        .await
+        .wrap_err_with(|| format!("creating {db}"))?;
+    tokio::fs::create_dir_all("/nix/var/nix/db")
+        .await
+        .wrap_err("creating /nix/var/nix/db")?;
+    run(MOUNT_BIN, &["--bind", &db, "/nix/var/nix/db"])
+        .await
+        .wrap_err("bind-mounting the disk-backed validity DB onto /nix/var/nix/db")
 }
 
 /// Static point-to-point bring-up of `NET_IFACE` against the `passt` link on
