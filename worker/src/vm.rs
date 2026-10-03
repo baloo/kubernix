@@ -1319,12 +1319,6 @@ pub async fn wipe_orphaned_store_images(state_dir: &Path) -> eyre::Result<()> {
 struct WarmVm {
     tenant: TenantId,
     vm: LaunchedVm,
-    /// Whether *this boot* was a `FRESH` `store.img` creation, as opposed to
-    /// mounting one that already existed — PLAN.md Phase 18's ENOSPC
-    /// recovery only wipes-and-retries on a `REUSE` boot (nothing to gain
-    /// from wiping an already-empty disk), so the job loop needs to know
-    /// which one it got.
-    fresh: bool,
 }
 
 /// One warm VM per worker process, LRU-of-one by tenant identity. No
@@ -1396,7 +1390,22 @@ impl<L: VmLauncher> VmPool<L> {
                     vsock_socket: warm.vm.vsock_socket.clone(),
                     guest_port: NIX_DAEMON_PORT,
                     store_img,
-                    fresh: warm.fresh,
+                    // Always `false`, never the boot's own `fresh` flag:
+                    // `fresh` has to mean "nothing could possibly be
+                    // registered in this store yet" for `fetch_inputs`'s
+                    // `skip_already_valid` gate (`main.rs`) and the ENOSPC
+                    // wipe-and-retry decision (`next_action`) to behave
+                    // correctly, and that is only ever true for the one call
+                    // that actually just created `store.img`. A warm VM
+                    // being reused here has already served at least one
+                    // prior call on this exact store, so whatever it
+                    // reports always has to be `false` -- regardless of
+                    // whether that very first boot happened to be FRESH.
+                    // Reporting the original boot's flag here (as this used
+                    // to) made every job on a reused-but-still-warm VM skip
+                    // the validity check forever, re-importing inputs the
+                    // guest had already registered.
+                    fresh: false,
                 });
             }
             // Either a different tenant, or the same tenant's VM died on its
@@ -1455,7 +1464,6 @@ impl<L: VmLauncher> VmPool<L> {
         self.warm = Some(WarmVm {
             tenant: tenant.clone(),
             vm,
-            fresh,
         });
 
         Ok(VmHandle {
@@ -1845,20 +1853,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_vm_reuse_reports_the_boot_that_actually_happened() {
+    async fn warm_vm_reuse_always_reports_not_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = FakeLauncher::default();
         let mut pool = VmPool::with_launcher(test_config(dir.path()), launcher.clone());
         let tenant = TenantId::from_wire("tenant-a").unwrap();
 
         let first = pool.ensure_vm_for(&tenant).await.unwrap();
-        assert!(first.fresh);
+        assert!(
+            first.fresh,
+            "the boot that actually created store.img is FRESH"
+        );
         let reused = pool.ensure_vm_for(&tenant).await.unwrap();
         assert!(
-            reused.fresh,
-            "reusing a still-warm VM must report the boot that actually happened (FRESH, since \
-             this tenant's very first boot created store.img), not silently flip to REUSE just \
-             because no new boot happened on this call"
+            !reused.fresh,
+            "a warm VM being reused has already served at least one prior call on this exact \
+             store -- reporting the original boot's FRESH flag here (as this used to) made every \
+             later job on a still-warm VM skip fetch_inputs's validity check forever, re-importing \
+             inputs the guest had already registered on an earlier job"
         );
     }
 }
