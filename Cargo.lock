@@ -2799,6 +2799,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2818,6 +2819,7 @@ dependencies = [
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2836,6 +2838,7 @@ dependencies = [
  "postcard-schema",
  "serde",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2845,6 +2848,7 @@ dependencies = [
  "kubernix-guest-protocol",
  "postcard-rpc",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2890,6 +2894,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
  "zstd",
 ]
 
@@ -2904,6 +2909,7 @@ dependencies = [
  "kubernix-types",
  "thiserror 2.0.20",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2915,6 +2921,7 @@ dependencies = [
  "http-body 1.1.0",
  "proptest",
  "thiserror 2.0.20",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2950,6 +2957,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
  "zstd",
 ]
 
@@ -6182,6 +6190,94 @@ dependencies = [
  "ff 0.14.0",
  "group 0.14.0",
  "hybrid-array",
+]
+
+[[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "aead",
+ "aes",
+ "aes-gcm",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "bitflags",
+ "byteorder",
+ "bytes",
+ "chacha20",
+ "cipher",
+ "crc32fast",
+ "crypto-bigint 0.5.5",
+ "crypto-common 0.2.2",
+ "ctutils",
+ "curve25519-dalek 4.1.3",
+ "curve25519-dalek 5.0.0",
+ "der 0.8.1",
+ "digest 0.10.7",
+ "digest 0.11.3",
+ "ed25519 2.2.3",
+ "ed25519 3.0.0",
+ "ed25519-dalek 2.2.0",
+ "ed25519-dalek 3.0.0",
+ "either",
+ "elliptic-curve 0.13.8",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "futures-util",
+ "generic-array 0.14.9",
+ "getrandom 0.2.17",
+ "getrandom 0.4.3",
+ "hashbrown 0.17.1",
+ "hmac 0.12.1",
+ "hybrid-array",
+ "hyper 1.11.0",
+ "hyper-util",
+ "indexmap",
+ "inout",
+ "lazy_static",
+ "libc",
+ "log",
+ "md-5",
+ "miniz_oxide",
+ "nix 0.31.3",
+ "num-integer",
+ "num-traits",
+ "pkcs8 0.11.0",
+ "ppv-lite86",
+ "rand 0.10.2",
+ "regex-automata",
+ "regex-syntax",
+ "rustls 0.23.43",
+ "rustls-webpki 0.103.13",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
+ "signature 2.2.0",
+ "signature 3.0.0",
+ "slab",
+ "smallvec",
+ "spin 0.9.9",
+ "spki 0.8.0",
+ "sqlx-core",
+ "sqlx-postgres",
+ "subtle",
+ "syn 2.0.119",
+ "syn 3.0.3",
+ "sync_wrapper",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-core",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

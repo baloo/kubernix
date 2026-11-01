@@ -17,3 +17,4 @@ path = "src/main.rs"
 kubernix-guest-protocol.workspace = true
 postcard-rpc = { workspace = true, features = ["use-std", "tokio"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+workspace-hack.workspace = true

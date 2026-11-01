@@ -9,3 +9,4 @@ postcard-rpc = { workspace = true, features = ["use-std", "tokio"] }
 postcard-schema = { workspace = true, features = ["use-std"] }
 serde.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
+workspace-hack.workspace = true

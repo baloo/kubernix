@@ -21,7 +21,7 @@ mkShell {
 
     cargo rustc rustfmt clippy
 
-    cargo-watch cargo-expand
+    cargo-watch cargo-expand cargo-hakari
     rust-analyzer
 
     rustfs

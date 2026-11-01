@@ -38,6 +38,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 zstd.workspace = true
+workspace-hack.workspace = true
 
 [build-dependencies]
 capnpc = "0.27"

@@ -9,7 +9,8 @@ members = [
     "server",
     "signing",
     "types",
-    "worker"
+    "worker",
+    "workspace-hack",
 ]
 
 [workspace.dependencies]
@@ -17,6 +18,7 @@ kubernix-daemon-protocol = { version = "0.1.0", path = "./daemon-protocol" }
 kubernix-guest-protocol = { version = "0.1.0", path = "./guest-protocol" }
 kubernix-signing = { version = "0.1.0", path = "./signing" }
 kubernix-types = { version = "0.1.0", path = "./types" }
+workspace-hack = { version = "0.1.0", path = "./workspace-hack" }
 
 async-compression = { version = "0.4", features = ["tokio", "zstd", "xz", "bzip2", "gzip", "brotli", "lz4"] }
 async-nats = "0.50.0"

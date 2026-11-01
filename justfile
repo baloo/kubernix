@@ -70,6 +70,9 @@ test-db port="5433" db_name="kubernix":
 check:
     cargo clippy --workspace --all-targets
     cargo fmt --check
+    cargo hakari generate --diff
+    cargo hakari manage-deps --dry-run
+    cargo hakari verify
 
 # Build the Lix client plugin.
 plugin lix_src=lix_source:

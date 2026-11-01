@@ -11,7 +11,7 @@ let
   # the source is realised once and reused.
   workspaceSource = source.workspace {
     name = "kubernix-src";
-    crates = [ "daemon-protocol" "guest-agent" "guest-init" "guest-protocol" "guest-protocol-test-cli" "server" "signing" "types" "worker" ];
+    crates = [ "daemon-protocol" "guest-agent" "guest-init" "guest-protocol" "guest-protocol-test-cli" "server" "signing" "types" "worker" "workspace-hack" ];
   };
   inherit (source) outputHashes;
 
