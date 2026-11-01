@@ -4,7 +4,7 @@
 # Deliberately minimal, matching PLAN.md's Phase 15 design: the guest never
 # needs a persistent root filesystem, only `/nix/store` does -- as a
 # plain-`dm-crypt` block device unlocked by a key `guest-agent` receives over
-# its control vsock channel (`guest-agent/src/main.rs::handle_control`), not
+# its control vsock channel (`crates/guest-agent/src/main.rs::handle_control`), not
 # as plaintext. Everything else -- `guest-agent`, `nix-daemon`, `cryptsetup`,
 # `mkfs.ext4`/`mount`, and their shared-library closures -- lives in the
 # initrd itself; there is still no separate disk image to boot the guest's
@@ -43,7 +43,7 @@ let
   # rework: vsock/virtio/ext4 stay built in, so `guest-agent` -- itself PID 1,
   # see below -- never has to `modprobe` anything before it can bind AF_VSOCK
   # or mount the store; `dm-crypt` and its dependencies stay modules, loaded
-  # via `modprobe` (`guest-agent/src/main.rs::unlock_and_mount`). Only the
+  # via `modprobe` (`crates/guest-agent/src/main.rs::unlock_and_mount`). Only the
   # base underneath that split has changed.
   kernel = pkgs.linuxPackages.kernel.override {
     defconfig = "tinyconfig";
@@ -89,7 +89,7 @@ let
       FILE_LOCKING = yes;
       # `/dev`, `/proc`, `/sys` -- `guest-agent` mounts all three itself at
       # startup (no udev, no `prepare_namespace()` on this pure-initramfs
-      # boot path -- see `guest-agent/src/main.rs::main`), but the drivers
+      # boot path -- see `crates/guest-agent/src/main.rs::main`), but the drivers
       # for them are `bool` Kconfig symbols, not modularizable either way, so
       # they have to be builtin regardless of the `yes`/`module` split above.
       DEVTMPFS = yes;
@@ -127,7 +127,7 @@ let
       # this: the actual hypervisor driver, needed so a nested
       # `requiredSystemFeatures = "kvm"` build has something to open. Found
       # missing after `nix/guest-vm-test.nix` confirmed `/dev` never grows a
-      # `kvm` node despite `worker/src/vm.rs::boot_probe` reporting non-zero
+      # `kvm` node despite `crates/worker/src/vm.rs::boot_probe` reporting non-zero
       # `vmx`/`svm` CPUID flags -- that probe only proves the flag reaches
       # this guest, never that this kernel turns it into a device node.
       VIRTUALIZATION = yes;
@@ -204,7 +204,7 @@ let
 
       # PLAN.md Phase 18: `guest-agent`'s own eBPF-based resource-exhaustion
       # detection (an `oom:mark_victim` tracepoint, a `mapping_set_error()`
-      # kprobe -- see `guest-agent/src/ebpf.rs`) is a second, independent use
+      # kprobe -- see `crates/guest-agent/src/ebpf.rs`) is a second, independent use
       # of BPF/kprobes from the sandbox's own SECCOMP_FILTER above: this one
       # loads real classic tracing programs from userspace via `bpf(2)`
       # (`aya`), not a seccomp filter installed by the build's own sandbox
@@ -234,7 +234,7 @@ let
       # The cgroup v2 memory controller, for scoping nix-daemon's build
       # children into their own `memory.max`-capped leaf (paired with the
       # OOM tracepoint above for unambiguous kill attribution --
-      # `guest-agent/src/cgroup.rs`). `CGROUPS` above is only
+      # `crates/guest-agent/src/cgroup.rs`). `CGROUPS` above is only
       # `CLONE_NEWCGROUP` namespace support for the sandbox; this is the
       # actual controller and the unified-hierarchy (`cgroup2`) filesystem
       # `guest-agent` mounts at `/sys/fs/cgroup`, neither of which existed
@@ -278,12 +278,12 @@ let
       VSOCKETS = yes;
       VIRTIO_VSOCKETS = yes;
       # The tenant's `store.img` is attached as a virtio-blk device
-      # (`worker/src/vm.rs`'s `--disk path=...`); Steps 1-3 never needed the
+      # (`crates/worker/src/vm.rs`'s `--disk path=...`); Steps 1-3 never needed the
       # *guest* to see it as `/dev/vda` (Step 2's persistence test only
       # touches the raw file host-side), so this was never enabled until
       # Step 4 needed the guest to actually open it.
       VIRTIO_BLK = yes;
-      # Phase 15 Step 5: the `passt`-backed link `worker/src/vm.rs` attaches
+      # Phase 15 Step 5: the `passt`-backed link `crates/worker/src/vm.rs` attaches
       # via `--net vhost_user=...`. `guest-agent`'s `configure_network`
       # brings this up with a fixed static address -- see its doc comment --
       # so no DHCP client is needed here either. `NETDEVICES` gates the whole
@@ -294,7 +294,7 @@ let
       VIRTIO_NET = yes;
       # Plain `dm-crypt` on the tenant's `store.img` (Component 3b of
       # PLAN.md's Phase 15 design): device-mapper core, the crypt target, and
-      # the AES-XTS cipher `cryptsetup_open` (`guest-agent/src/main.rs`)
+      # the AES-XTS cipher `cryptsetup_open` (`crates/guest-agent/src/main.rs`)
       # requests. On the stock default config `BLK_DEV_DM`'s tristate ceiling
       # was gated by `DAX`, forcing these to modules regardless of intent;
       # `DAX` doesn't exist in this from-scratch config at all, but these stay
@@ -306,7 +306,7 @@ let
       CRYPTO_XTS = module;
       # The decrypted device is formatted ext4 and mounted as the writable
       # *upper* layer of an overlayfs whose *lower* layer is `/nix/store` as
-      # the initrd itself baked it in -- see `guest-agent/src/main.rs`'s
+      # the initrd itself baked it in -- see `crates/guest-agent/src/main.rs`'s
       # `unlock_and_mount`. Without this, mounting the tenant's (initially
       # empty) filesystem directly at `/nix/store` shadows the shared
       # libraries `makeInitrdNG` placed there for `nix-daemon` and friends to
@@ -347,7 +347,7 @@ let
   # (PLAN.md's open-risks table): without it, a real `nix-daemon` exits
   # immediately because the `nixbld` group `build-users-group` names does not
   # exist. One build user is enough: the VM design only ever runs one build
-  # at a time (`worker/src/vm.rs`'s one-warm-VM-per-worker model), matching
+  # at a time (`crates/worker/src/vm.rs`'s one-warm-VM-per-worker model), matching
   # the default `max-jobs = 1`.
   passwd = pkgs.writeText "passwd" ''
     root:x:0:0:root:/root:/bin/sh
@@ -359,7 +359,7 @@ let
   '';
 
   # Phase 15 Step 5: a static resolver pointed at `passt`'s own address —
-  # `worker/src/vm.rs`'s `passt_args` pins `passt --dns` to the same fixed
+  # `crates/worker/src/vm.rs`'s `passt_args` pins `passt --dns` to the same fixed
   # `NET_GATEWAY` value, since a statically-configured guest (no DHCP client,
   # see `guest-agent`'s `configure_network`) has no other way to learn a
   # resolver address. Baked in at build time, not written at runtime, for the
@@ -402,7 +402,7 @@ let
         source = "${kubernix-guest-agent}/bin/kubernix-guest-agent";
         target = "/init";
       }
-      # `guest-agent` execs this fixed path (`guest-agent/src/main.rs`'s
+      # `guest-agent` execs this fixed path (`crates/guest-agent/src/main.rs`'s
       # `NIX_DAEMON_BIN`) rather than searching `$PATH` -- there is exactly
       # one binary in this guest it ever spawns.
       {
@@ -468,7 +468,7 @@ let
       # own TLS verification -- without this, every HTTPS fetch inside the
       # sandbox fails "SSL certificate ... unable to get local issuer
       # certificate", confirmed live once the network path itself (`--dns-
-      # forward`/`--dns-host` in `worker/src/vm.rs`) actually started
+      # forward`/`--dns-host` in `crates/worker/src/vm.rs`) actually started
       # working. `guest-agent`'s `spawn_nix_daemon` points `SSL_CERT_FILE`
       # at this same path.
       {

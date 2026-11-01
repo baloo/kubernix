@@ -1,14 +1,14 @@
 # PLAN.md Phase 17: proves the guest side of the `CAPS?` control-port verb
 # for real, against a live cloud-hypervisor VM -- unit tests
-# (`guest-agent/src/main.rs`'s `count_nested_virt_flags_str`/`dispatch_control`
+# (`crates/guest-agent/src/main.rs`'s `count_nested_virt_flags_str`/`dispatch_control`
 # tests) cover the parsing and dispatch logic against fixtures; this covers
 # the actual wire round trip and a real `/proc/cpuinfo` inside the guest,
 # which nothing else exercises without `/dev/kvm`.
 #
 # Drives the same `CONNECT <port>\n` / `OK` vsock handshake
 # `nix/guest-vm-test.nix` uses, then speaks the control-channel protocol
-# `guest-agent/src/main.rs::handle_control` implements via `vm_caps`
-# (`nix/vm-test-lib.nix`) -- `worker/src/vm.rs::boot_probe` is the production
+# `crates/guest-agent/src/main.rs::handle_control` implements via `vm_caps`
+# (`nix/vm-test-lib.nix`) -- `crates/worker/src/vm.rs::boot_probe` is the production
 # client of this same verb -- rather than depending on `kubernix-worker` at
 # all.
 #

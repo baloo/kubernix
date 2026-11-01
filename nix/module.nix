@@ -80,7 +80,7 @@ in {
         itself then reconnects with only its username swapped for
         `kubernix_app`, the low-privilege, row-level-security-restricted
         role the migrations create — see
-        `server/migrations/20260814120000_row_level_security.sql` and
+        `crates/server/migrations/20260814120000_row_level_security.sql` and
         `PostgresStore::connect`'s doc comment. One URL is still all this
         needs; the role split happens entirely on the Rust side.
       '';
@@ -364,7 +364,7 @@ in {
         analogous to a Nix `machines` file's supportedFeatures column — routes
         `requiredSystemFeatures = "big-parallel"` jobs here. "kvm" is not
         settable here: kvm-class routing is gated by the worker's own
-        boot-time nested-virt self-test (`worker/src/vm.rs::boot_probe`),
+        boot-time nested-virt self-test (`crates/worker/src/vm.rs::boot_probe`),
         never by static declaration alone.
       '';
     };

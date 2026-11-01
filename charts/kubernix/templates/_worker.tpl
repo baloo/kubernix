@@ -78,7 +78,7 @@ spec:
               # that `cloud-hypervisor` resets its own umask early in its own
               # startup, unconditionally overriding whatever this process
               # sets beforehand — nothing survives `execve` into it. See
-              # `worker/src/vm.rs`'s doc comment above `drop_privileges` for
+              # `crates/worker/src/vm.rs`'s doc comment above `drop_privileges` for
               # the full account, including the narrower alternative's own
               # side effect (widening `net.sock`'s permissions) found while
               # diagnosing why it didn't work. This capability only widens
@@ -121,12 +121,12 @@ spec:
             {{- if $worker.exclusiveClasses }}
             # This pool only subscribes to its declared classes' NATS
             # subjects, not the plain queue -- see
-            # worker/src/main.rs::worker_subjects_and_consumer.
+            # crates/worker/src/main.rs::worker_subjects_and_consumer.
             - name: KUBERNIX_WORKER_EXCLUSIVE_CLASSES
               value: "1"
             {{- end }}
             # Sizes the shared NATS durable consumer's max_ack_pending, not
-            # just this Deployment's replica count -- see worker/src/main.rs's
+            # just this Deployment's replica count -- see crates/worker/src/main.rs's
             # comment above create_consumer. Must be >= however many replicas
             # could concurrently pull, so it mirrors whichever setting below
             # actually governs that count. When another pool shares this same
@@ -228,7 +228,7 @@ spec:
         account: "$G"
         natsServerMonitoringEndpoint: {{ printf "%s-nats:8222" (include "kubernix.fullname" $ctx) | quote }}
         stream: kubernix_jobs
-        # Must match worker/src/main.rs's durable consumer name exactly --
+        # Must match crates/worker/src/main.rs's durable consumer name exactly --
         # see kubernix.worker.consumer's own doc comment. Unchanged by
         # PLAN.md Phase 17's capability-class routing for the default
         # (non-exclusive) pool: one worker uses one consumer with a

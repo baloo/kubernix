@@ -67,7 +67,7 @@ pool or the pool's key otherwise.
 
 {{/*
 The NATS JetStream durable consumer name a worker pool uses -- must track
-worker/src/main.rs's `worker_subjects_and_consumer` exactly (base
+crates/worker/src/main.rs's `worker_subjects_and_consumer` exactly (base
 `worker-<system_with_underscores>`, with the pool's sorted systemFeatures
 folded in when it declares `exclusiveClasses: true`). Call as
 `include "kubernix.worker.consumer" $worker` with a single pool's values

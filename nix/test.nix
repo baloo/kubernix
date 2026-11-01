@@ -216,7 +216,7 @@ pkgs.testers.nixosTest {
     machine.succeed('mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519')
 
     # Fingerprint in the same `SHA256:<base64>` form `PublicKey::fingerprint`
-    # produces server-side (`server/src/ssh.rs`) -- the second field of
+    # produces server-side (`crates/server/src/ssh.rs`) -- the second field of
     # `ssh-keygen -l`'s default output.
     fingerprint = machine.succeed(
         "ssh-keygen -lf /root/.ssh/id_ed25519.pub | awk '{print $2}'"
@@ -227,11 +227,15 @@ pkgs.testers.nixosTest {
     # key's fingerprint to it. `postgres` is a superuser and bypasses
     # row-level security, same as every other `psql` call in this test that
     # isn't the row-level-security check itself.
+    #
+    # `reject_unverified_pushes` is false so this tenant opts into
+    # quarantining unverifiable pushes (the default refuses them outright);
+    # the quarantine subtest below depends on it.
     tenant_id = "user-testclient-0000000000000000"
     machine.succeed(
         "psql -U postgres -h 127.0.0.1 kubernix -c "
-        "\"INSERT INTO tenants (id, identity, verified) VALUES "
-        f"('{tenant_id}', 'key:{fingerprint}', true) ON CONFLICT (id) DO NOTHING\""
+        "\"INSERT INTO tenants (id, identity, verified, reject_unverified_pushes) VALUES "
+        f"('{tenant_id}', 'key:{fingerprint}', true, false) ON CONFLICT (id) DO NOTHING\""
     )
     machine.succeed(
         "psql -U postgres -h 127.0.0.1 kubernix -c "
@@ -364,7 +368,7 @@ pkgs.testers.nixosTest {
         # proves the *application*'s own `WHERE tenant = $1` isolates
         # tenants. This proves the *database* does too — against the real
         # `kubernix_app` role kubernix-sshd/kubernix-cache actually connect
-        # as after migrating (`server/migrations/20260814120000_row_level_
+        # as after migrating (`crates/server/migrations/20260814120000_row_level_
         # security.sql`), not the `postgres` superuser every other `psql`
         # call in this test uses, which always bypasses row-level security
         # regardless of policy.
@@ -554,7 +558,7 @@ pkgs.testers.nixosTest {
         # A client that asks for an interactive shell instead of exec'ing
         # `<remote-program> --stdio` used to just hang forever -- russh's
         # default `shell_request` silently succeeds and never sends anything
-        # back. `SshHandler::shell_request` (server/src/ssh.rs) now replies
+        # back. `SshHandler::shell_request` (crates/server/src/ssh.rs) now replies
         # and closes the channel, so this must return promptly rather than
         # timing out.
         status, output = ssh_no_check()
@@ -564,7 +568,7 @@ pkgs.testers.nixosTest {
     with subtest("an unsupported exec command is rejected with an explicit message"):
         # Not `--stdio`, so `is_stdio_request` rejects it. The message should
         # spell out what is actually expected instead of just echoing the
-        # command back -- see `exec_request` in server/src/ssh.rs.
+        # command back -- see `exec_request` in crates/server/src/ssh.rs.
         status, output = ssh_no_check(" 'bash -c true'")
         assert status != 124, f"exec of an unsupported command hung:\n{output}"
         assert "unsupported command" in output, f"unexpected output: {output}"

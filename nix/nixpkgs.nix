@@ -8,6 +8,7 @@ let
   lixSource = flakeNodes."${flakeRoots.lix}";
   nixpkgsSource = flakeNodes."${flakeRoots.nixpkgs}";
   rustOverlaySource = flakeNodes."${flakeRoots.rust-overlay}";
+  craneSource = flakeNodes."${flakeRoots.crane}";
 
   fetchRepo = locked: builtins.fetchTarball {
     url = "https://github.com/${locked.owner}/${locked.repo}/archive/${locked.rev}.tar.gz";
@@ -19,8 +20,11 @@ let
   # PLAN.md Phase 18: pinned nightly Rust (rust-src + bpfel-unknown-none) for
   # the guest-agent-ebpf crate; see nix/guest-agent-ebpf.nix.
   rustOverlay = import (fetchRepo rustOverlaySource.locked);
+  crane = fetchRepo craneSource.locked;
 in let
   overlay = self: super: {
+    # Source tree of crane, consumed by `nix/crane.nix`.
+    craneSrc = crane;
     lix = (self.callPackage "${lix}/package.nix" {
       stdenv = self.clangStdenv;
     }).overrideAttrs (old: {
@@ -35,7 +39,7 @@ in let
     #cloud-hypervisor = super.cloud-hypervisor.overrideAttrs (old: {
     #  patches = [ ./patches/cloud-hypervisor-nested-vmx.patch ];
     #});
-  };#
+  };##
 in import nixpkgs ({
   overlays = [
     rustOverlay

@@ -1,9 +1,9 @@
 # Regression test for the guest's `/nix/var/nix/db` persistence fix
-# (`guest-agent/src/main.rs::mount_store`): without that fix, `/nix/var` is
+# (`crates/guest-agent/src/main.rs::mount_store`): without that fix, `/nix/var` is
 # plain tmpfs, so Nix's path-validity SQLite database is wiped on every VM
 # boot even though the store's actual file contents (the overlay upper dir
 # on `store.img`) persist. The worker's own `skip_already_valid` /
-# `vm_ops::path_is_valid` (`worker/src/main.rs`) then re-downloads and
+# `vm_ops::path_is_valid` (`crates/worker/src/main.rs`) then re-downloads and
 # re-registers inputs whose bytes are already on disk, on every reboot for a
 # tenant -- the bug this test exists to catch.
 #
@@ -38,7 +38,7 @@ stdenvNoCC.mkDerivation {
     # serializes any filesystem path, store member or not, so this needs no
     # access to a writable store. The path string itself is never derived
     # from this content (this path registers as input-addressed, `ca =
-    # none`, same trust model `worker/src/vm_ops.rs::register_input` uses
+    # none`, same trust model `crates/worker/src/vm_ops.rs::register_input` uses
     # for worker-fetched inputs) -- only `nar_hash` has to match the bytes
     # actually streamed, which is exactly what's computed below.
     echo -n "kubernix-db-persistence-test-payload" > "$PWD/payload"

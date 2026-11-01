@@ -1607,7 +1607,8 @@ dependencies = [
 [[package]]
 name = "digest-io-async"
 version = "0.1.0"
-source = "git+https://github.com/baloo/utils.git?branch=push-kxltlypsyruw#33ba71ae07bc65736fdd964e7adefc0cf0c37151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb52cda87c97e9e65309ee111be46c8f327d1b8c84a45226fd0cc35fa9d919cd"
 dependencies = [
  "digest 0.11.3",
  "pin-project-lite",

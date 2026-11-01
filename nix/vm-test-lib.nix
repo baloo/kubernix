@@ -54,7 +54,7 @@ writeText "kubernix-vm-test-lib.sh" ''
       --kernel "$kernel" \
       --initramfs "$initrd" \
       --cmdline "console=ttyS0 reboot=t panic=1" \
-      --cpus boot=1 \
+      --cpus boot=1,nested=on \
       --memory size=768M,shared=on \
       --vsock cid=3,socket="$vsock_socket" \
       --console off \
@@ -105,8 +105,8 @@ writeText "kubernix-vm-test-lib.sh" ''
   #
   # Speaks guest-agent's control protocol end to end over one connection: a
   # `guest/key` postcard-rpc call via ${testCli} -- see
-  # `guest-agent/src/control.rs::handle_push_key` for the server side
-  # (`worker/src/vm.rs::push_key` is the production client of this same
+  # `crates/guest-agent/src/control.rs::handle_push_key` for the server side
+  # (`crates/worker/src/vm.rs::push_key` is the production client of this same
   # endpoint). Prints guest-agent's reply in the same `OK`/`ERR ...` textual
   # convention the old line-based protocol used, so every caller's own
   # `[[ == OK* ]]`-style check on the result is unchanged.
@@ -171,7 +171,7 @@ writeText "kubernix-vm-test-lib.sh" ''
   # Speaks the diagnostic-only `guest/debug/trigger-enospc` control-port
   # endpoint (PLAN.md Phase 18) via ${testCli} -- mirroring `vm_caps` above.
   # Blocks until guest-agent's own write-past-capacity loop finishes
-  # (bounded, see `guest-agent/src/diag.rs`) before replying, so the
+  # (bounded, see `crates/guest-agent/src/diag.rs`) before replying, so the
   # caller's `vm_status` poll afterwards has a real chance of already seeing
   # the flag set.
   vm_trigger_enospc() {
@@ -182,7 +182,7 @@ writeText "kubernix-vm-test-lib.sh" ''
   # vm_stream_logs <vsock-socket> [log-port=622]
   #
   # Dials `guest-agent`'s debug log-stream port (`LOG_PORT`,
-  # `guest-agent/src/main.rs`) and relays whatever it sends straight to this
+  # `crates/guest-agent/src/main.rs`) and relays whatever it sends straight to this
   # derivation's own stdout -- separate from, and cleaner than, the shared
   # `--serial tty` console (which also carries raw kernel boot messages and
   # every spawned child's inherited stderr). Backgrounds `socat`; same
@@ -217,7 +217,7 @@ writeText "kubernix-vm-test-lib.sh" ''
   #
   # SIGKILL, not a plain `kill` (SIGTERM): this guest has no ACPI/graceful-
   # shutdown handler -- `guest-agent` is PID 1 with nothing else running (see
-  # `worker/src/vm.rs`'s `CloudHypervisorLauncher::stop` doc comment) -- so
+  # `crates/worker/src/vm.rs`'s `CloudHypervisorLauncher::stop` doc comment) -- so
   # cloud-hypervisor's own SIGTERM handling can sit waiting on a shutdown the
   # guest will never perform, hanging whatever `wait`s on it next. Actually
   # waits for the process to exit before returning, so a caller reusing the

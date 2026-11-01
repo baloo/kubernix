@@ -11,7 +11,7 @@ protocol. **Do not edit** — re-vendor instead.
 | `lix/libutil/logging.capnp` | Lix `lix/libutil/logging.capnp` |
 | `capnp/c++.capnp` | capnproto 1.4.0, so the `$Cxx` annotations resolve without a system include path |
 
-Vendored from Lix rev `2c86e95b2c49826505fadaa453a631dfbaac288f` (2.96.0-dev), matching the
+Vendored from Lix rev `3c4698152e8d6b72cff7b7f52ae68f69a80a4dab` (2.97.0-dev), matching the
 `lix` input pinned in `flake.lock`.
 
 The directory layout must be preserved: the schemas use absolute imports such as

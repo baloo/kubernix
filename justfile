@@ -29,7 +29,7 @@ host_key := env_var_or_default("TMPDIR", "/tmp") / "kubernix_host_ed25519"
 # own bootstrap user. `PostgresStore::connect` uses it twice: once as-is to
 # run migrations (which create the `kubernix_app`/`kubernix_gc` roles and
 # their row-level-security policies -- see
-# `server/migrations/20260814120000_row_level_security.sql`), then again
+# `crates/server/migrations/20260814120000_row_level_security.sql`), then again
 # with only the username swapped, to open the actual serving pool under
 # whichever of those two roles the connecting binary is. `run-db`'s trust
 # auth accepts any role name with no password, so nothing else here needs to
@@ -151,7 +151,7 @@ nix-test-vm-encryption:
 
 # Phase 15 Step 5: boot the guest against a real `passt` vhost-user backend
 # (the same `--net vhost_user=...,vhost_mode=client` wiring
-# `worker/src/vm.rs` drives in production) and confirm guest-agent brings up
+# `crates/worker/src/vm.rs` drives in production) and confirm guest-agent brings up
 # its network interface. Needs /dev/kvm, same as nix-test-guest-vm.
 nix-test-vm-network:
     nix-build nix -A vm-network-test
@@ -370,7 +370,7 @@ run-db db_name="kubernix" port="5433":
     set -euo pipefail
 
     # No schema is applied here: kubernix-sshd runs the migrations in
-    # `server/migrations/` itself on connect, so a fresh deployment needs no
+    # `crates/server/migrations/` itself on connect, so a fresh deployment needs no
     # separate provisioning step and there is only one place the schema lives.
     #
     # TCP rather than a unix socket, so DATABASE_URL is an ordinary URL.

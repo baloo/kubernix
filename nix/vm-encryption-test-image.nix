@@ -51,7 +51,7 @@ let
     key=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
     wrong_key=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 
-    # Bisection knobs, all defaulting to match production (worker/src/vm.rs)
+    # Bisection knobs, all defaulting to match production (crates/worker/src/vm.rs)
     # exactly: SERIAL_MODE=file (vs tty), VSOCK_DIR=shared (vs tmp, i.e.
     # /tmp instead of next to store_img), IMAGE_TYPE=unset (vs raw).
     serial_mode="''${SERIAL_MODE:-file}"

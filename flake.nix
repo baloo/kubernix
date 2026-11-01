@@ -9,6 +9,9 @@
     # `bpfel-unknown-none` -- nixpkgs' own rustc is stable-only, and there's
     # no in-tree way to get a pinned nightly otherwise.
     rust-overlay.url = "github:oxalica/rust-overlay";
+    # Builds the Rust workspace in nix/crane.nix, with dependencies compiled
+    # once and shared between packages.
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs = { self, ... }:

@@ -1,4 +1,4 @@
-# Phase 15 Step 2: proves the one thing `worker/src/vm.rs`'s unit tests
+# Phase 15 Step 2: proves the one thing `crates/worker/src/vm.rs`'s unit tests
 # cannot without `/dev/kvm` -- that a real `store.img` block device survives,
 # byte for byte, across a stop-and-reboot cycle of the VM it's attached to.
 # `vm.rs`'s own tests cover the reuse/evict *decision* against a fake

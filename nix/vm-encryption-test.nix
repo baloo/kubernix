@@ -1,5 +1,5 @@
 # Phase 15 Step 4: proves the guest side of the dm-crypt key handshake for
-# real, against a live cloud-hypervisor VM -- `worker/src/vm.rs`'s
+# real, against a live cloud-hypervisor VM -- `crates/worker/src/vm.rs`'s
 # `key_is_generated_fresh_and_reused_on_reboot`/`warm_vm_reuse_does_not_repush
 # _the_key` tests cover the *worker's* bookkeeping against a fake launcher;
 # this covers `guest-agent`'s actual `cryptsetup open`/`mkfs.ext4`/`mount`
@@ -7,8 +7,8 @@
 #
 # Drives the same `CONNECT <port>\n` / `OK` vsock handshake
 # `nix/guest-vm-test.nix` uses, then speaks the control-channel protocol
-# `guest-agent/src/main.rs::handle_control` implements via `vm_push_key`
-# (`nix/vm-test-lib.nix`) -- `worker/src/vm.rs::push_key` is the production
+# `crates/guest-agent/src/main.rs::handle_control` implements via `vm_push_key`
+# (`nix/vm-test-lib.nix`) -- `crates/worker/src/vm.rs::push_key` is the production
 # client of this same protocol -- rather than depending on `kubernix-worker`
 # at all.
 #

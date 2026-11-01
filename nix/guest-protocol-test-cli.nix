@@ -4,17 +4,12 @@
 # binary `postcard-rpc` protocol rather than a line-based text one that raw
 # shell could hand-construct. Not part of any production image -- see the
 # crate's own `Cargo.toml` header comment.
-{ rustPlatform, workspaceSource, outputHashes }:
+{ buildMember }:
 
-rustPlatform.buildRustPackage {
-  pname = "kubernix-guest-protocol-test-cli";
-  version = "0.1.0";
-
-  src = workspaceSource;
-  buildAndTestSubdir = "guest-protocol-test-cli";
-
-  cargoLock = {
-    lockFile = ../Cargo.lock;
-    inherit outputHashes;
-  };
+buildMember {
+  name = "kubernix-guest-protocol-test-cli";
+  path = ../crates/guest-protocol-test-cli;
+  additionalCrates = [
+    ../crates/guest-protocol
+  ];
 }

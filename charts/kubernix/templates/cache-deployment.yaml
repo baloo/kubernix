@@ -43,7 +43,7 @@ spec:
           volumeMounts:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          # TCP, not an HTTP path probe: every route in server/src/http.rs is
+          # TCP, not an HTTP path probe: every route in crates/server/src/http.rs is
           # nested under `/{tenant}/...` (see its `router()`), so there is no
           # tenant-agnostic path that returns 200 to probe against — the port
           # accepting connections is what "up" means here.
