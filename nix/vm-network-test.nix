@@ -1,6 +1,6 @@
 # Phase 15 Step 5: proves `guest-agent` brings up its virtio-net interface
 # against a real `passt` vhost-user backend, the same wiring
-# `worker/src/vm.rs`'s `CloudHypervisorLauncher` drives in production
+# `crates/worker/src/vm.rs`'s `CloudHypervisorLauncher` drives in production
 # (`passt_args`/`net_arg`) — a real boot exercising the exact CLI
 # invocation PLAN.md flagged as unverified until this landed.
 #
@@ -33,7 +33,7 @@ stdenvNoCC.mkDerivation {
     set -euo pipefail
     source ${vm-test-lib}
 
-    # Mirrors `worker/src/vm.rs`'s `passt_args`/`NET_GUEST_ADDR`/
+    # Mirrors `crates/worker/src/vm.rs`'s `passt_args`/`NET_GUEST_ADDR`/
     # `NET_PREFIX`/`NET_GATEWAY` exactly -- and `guest-agent`'s
     # `GUEST_ADDR`/`GUEST_GATEWAY` on the other end.
     net_socket="$PWD/net.sock"
@@ -53,7 +53,7 @@ stdenvNoCC.mkDerivation {
 
     vsock="$PWD/vsock.sock"; console="$PWD/console.log"
     # `num_queues=2`, not `1`: cloud-hypervisor counts rx/tx as separate
-    # queues and rejects lower (`worker/src/vm.rs`'s `net_arg` doc comment
+    # queues and rejects lower (`crates/worker/src/vm.rs`'s `net_arg` doc comment
     # has the full story -- found by running this exact test).
     vm_boot ${kernel}/bzImage ${initrd}/initrd "$vsock" "$console" \
       --net "vhost_user=true,socket=$net_socket,num_queues=2,vhost_mode=client"
@@ -65,7 +65,7 @@ stdenvNoCC.mkDerivation {
 
     vm_stop "$ch_pid"
 
-    # `guest-agent/src/main.rs`'s own startup log line -- the observable
+    # `crates/guest-agent/src/main.rs`'s own startup log line -- the observable
     # signal that `configure_network` (ip link/addr/route against the
     # passt-backed eth0) actually succeeded, not just that the guest booted.
     if ! grep -q "guest-agent: network configured: eth0 10.42.100.2/24 via 10.42.100.1" "$console"; then

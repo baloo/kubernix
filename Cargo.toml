@@ -1,22 +1,16 @@
 [workspace]
 resolver = "3"
-members = [
-    "daemon-protocol",
-    "guest-agent",
-    "guest-init",
-    "guest-protocol",
-    "guest-protocol-test-cli",
-    "server",
-    "signing",
-    "types",
-    "worker"
-]
+members = ["crates/*"]
+
+metadata.crane.name = "kubernix"
+package.version = "0.1.0"
 
 [workspace.dependencies]
-kubernix-daemon-protocol = { version = "0.1.0", path = "./daemon-protocol" }
-kubernix-guest-protocol = { version = "0.1.0", path = "./guest-protocol" }
-kubernix-signing = { version = "0.1.0", path = "./signing" }
-kubernix-types = { version = "0.1.0", path = "./types" }
+kubernix-daemon-protocol = { version = "0.1.0", path = "./crates/daemon-protocol" }
+kubernix-guest-protocol = { version = "0.1.0", path = "./crates/guest-protocol" }
+kubernix-signing = { version = "0.1.0", path = "./crates/signing" }
+kubernix-types = { version = "0.1.0", path = "./crates/types" }
+workspace-hack = { version = "0.1.0", path = "./crates/workspace-hack" }
 
 async-compression = { version = "0.4", features = ["tokio", "zstd", "xz", "bzip2", "gzip", "brotli", "lz4"] }
 async-nats = "0.50.0"
@@ -26,7 +20,7 @@ aws-sdk-s3 = "1.140"
 bytes = "1"
 capnp = { version = "0.27", features = ["alloc", "std"] }
 color-eyre = "0.6.5"
-digest-io-async = { version = "0.1.0", features = ["tokio"] }
+digest-io-async = "0.1"
 ed25519-dalek = { version = "3", features = ["digest", "rand_core"] }
 eyre = "0.6.14"
 futures-util = "0.3.33"
@@ -43,8 +37,3 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.24.0", features = ["v4", "v7", "serde"] }
 zstd = "0.13.3"
-
-[patch.crates-io]
-# AsyncRead/AsyncWrite support
-# https://github.com/RustCrypto/utils/pull/1518
-digest-io-async = { git = "https://github.com/baloo/utils.git", branch = "push-kxltlypsyruw" }

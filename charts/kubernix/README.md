@@ -118,7 +118,7 @@ helm upgrade kubernix charts/kubernix -n kubernix --set worker.autoscaling.enabl
 ```
 
 This creates a `ScaledObject` that scales the worker Deployment on `kubernix_jobs`' durable
-per-system consumer (`worker/src/main.rs`) — including down to `minReplicaCount: 0` when idle. That
+per-system consumer (`crates/worker/src/main.rs`) — including down to `minReplicaCount: 0` when idle. That
 works because the consumer is *durable*: its pending-message count stays queryable via NATS'
 monitoring API with no worker pod running, which is what lets KEDA scale back up from zero.
 
@@ -131,12 +131,12 @@ non-empty `systemFeatures` (e.g. `["big-parallel"]`) subscribes *only* to that c
 plain queue — useful for a dedicated high-CPU/RAM pool that shouldn't compete with the default
 pool for ordinary jobs. Each pool gets its own Deployment/ScaledObject
 (`<release>-worker-<name>`) and NATS durable consumer, computed to match
-`worker/src/main.rs::worker_subjects_and_consumer` exactly; see the `workers` example in
+`crates/worker/src/main.rs::worker_subjects_and_consumer` exactly; see the `workers` example in
 `values.yaml` for the full shape.
 
 ### Provisioning tenants (`kubernix-admin`)
 
-Tenants and their auth credentials (`server/src/admin.rs`) are managed with `kubernix-admin`, which
+Tenants and their auth credentials (`crates/server/src/admin.rs`) are managed with `kubernix-admin`, which
 ships in the same image as `kubernix-sshd`/`kubernix-cache`/`kubernix-gc`. There's no dedicated
 subcommand-taking Job for it — its arguments (a tenant id, an SSH public key) are decided per
 invocation, not at `helm install` time — so `admin.enabled: true` instead brings up an idle toolbox

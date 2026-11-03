@@ -6,32 +6,30 @@
 let
   capnproto = pkgs.capnproto;
 
-  source = pkgs.callPackage ./source.nix { };
-  # One tree for both Rust packages: same crates, same shared `protocol`, so
-  # the source is realised once and reused.
-  workspaceSource = source.workspace {
-    name = "kubernix-src";
-    crates = [ "daemon-protocol" "guest-agent" "guest-init" "guest-protocol" "guest-protocol-test-cli" "server" "signing" "types" "worker" ];
-  };
-  inherit (source) outputHashes;
+  # Shared dependency build for every glibc crate; see crane.nix.
+  craneFor = import ./crane.nix;
+  crane = craneFor { inherit pkgs; };
+  inherit (crane) buildMember;
 
-  kubernix-server = pkgs.callPackage ./server.nix { inherit workspaceSource outputHashes; };
-  kubernix-worker = pkgs.callPackage ./worker.nix { inherit workspaceSource outputHashes; };
+  kubernix-server = pkgs.callPackage ./server.nix { inherit buildMember; };
+  kubernix-worker = pkgs.callPackage ./worker.nix { inherit buildMember; };
   kubernix-plugin = pkgs.callPackage ./plugin.nix { };
   # PLAN.md Phase 18, Step 0: kernel-side eBPF bytecode, built with its own
   # pinned nightly toolchain (see the file's own header comment) -- distinct
   # from `kubernix-guest-agent` below, which embeds this via `include_bytes!`.
   kubernix-guest-agent-ebpf = pkgs.callPackage ./guest-agent-ebpf.nix { };
   kubernix-guest-agent = pkgs.callPackage ./guest-agent.nix {
-    inherit workspaceSource outputHashes kubernix-guest-agent-ebpf;
+    inherit buildMember kubernix-guest-agent-ebpf;
   };
-  kubernix-guest-init = pkgs.pkgsStatic.callPackage ./guest-init.nix { inherit workspaceSource outputHashes; };
+  kubernix-guest-init = pkgs.callPackage ./guest-init.nix {
+    crane = craneFor;
+  };
   # A tiny binary `vm-test-lib.nix`'s shell helpers shell out to for the
   # control-channel calls that raw shell + `socat` could no longer
   # hand-construct once that protocol became binary `postcard-rpc` -- see its
   # own file header.
   kubernix-guest-protocol-test-cli = pkgs.callPackage ./guest-protocol-test-cli.nix {
-    inherit workspaceSource outputHashes;
+    inherit buildMember;
   };
   # Shared shell helpers the guest-VM boot tests below all `source` -- see
   # `vm-test-lib.nix`'s own header for why.
@@ -94,6 +92,7 @@ let
 in {
   inherit kubernix-server kubernix-worker kubernix-plugin kubernix-guest-agent kubernix-guest-init;
   inherit kubernix-guest-agent-ebpf kubernix-guest-protocol-test-cli;
+  kubernix-tests = crane.tests;
   inherit (images) kubernix-server-image kubernix-worker-image;
   inherit kubernix-client-image;
   inherit vm-encryption-test-image;

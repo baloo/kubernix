@@ -2,7 +2,7 @@
 
 # PLAN.md Phase 18, Step 0: builds the `guest-agent-ebpf` crate's kernel-side
 # bytecode. This is its own Cargo workspace (see the comment atop
-# `guest-agent/guest-agent-ebpf/Cargo.toml`), built with a pinned nightly
+# `crates/guest-agent/guest-agent-ebpf/Cargo.toml`), built with a pinned nightly
 # toolchain (`rust-src` + `bpfel-unknown-none`, via the `rust-overlay` flake
 # input added for this phase) and `-Z build-std=core`, entirely separate from
 # the stable-toolchain `rustPlatform` every other crate in this repo uses.
@@ -37,14 +37,14 @@ rustPlatformNightly.buildRustPackage {
 
   # A crate of its own, entirely self-contained (no `build.rs` reaching for
   # `../protocol` the way `server`/`worker` do) -- unlike `workspaceSource`
-  # (see `nix/source.nix`), it needs no sibling directories alongside it.
+  # (see `nix/crane.nix`), it needs no sibling directories alongside it.
   src = lib.fileset.toSource {
-    root = ../guest-agent/guest-agent-ebpf;
-    fileset = ../guest-agent/guest-agent-ebpf;
+    root = ../crates/guest-agent/guest-agent-ebpf;
+    fileset = ../crates/guest-agent/guest-agent-ebpf;
   };
 
   cargoLock = {
-    lockFile = ../guest-agent/guest-agent-ebpf/Cargo.lock;
+    lockFile = ../crates/guest-agent/guest-agent-ebpf/Cargo.lock;
   };
 
   nativeBuildInputs = [ pkgs.bpf-linker ];

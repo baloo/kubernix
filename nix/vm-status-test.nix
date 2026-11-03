@@ -1,6 +1,6 @@
 # PLAN.md Phase 18: proves the STATUS?/RESET control-port verbs round-trip
 # for real against a live cloud-hypervisor VM -- unit tests
-# (`guest-agent/src/main.rs`'s `dispatch_control`/`format_status` tests)
+# (`crates/guest-agent/src/main.rs`'s `dispatch_control`/`format_status` tests)
 # cover dispatch against a fake `DetectionState`-less path; this is what
 # actually confirms the real `aya`-loaded eBPF programs attach cleanly at
 # boot (a guest whose `DetectionState::setup()` failed answers `ERR eBPF

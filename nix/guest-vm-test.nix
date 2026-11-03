@@ -41,7 +41,7 @@ stdenvNoCC.mkDerivation {
     # why that check failed as for anything else.
     vm_wait_for_socket "$vsock_socket" && { vm_stream_logs "$vsock_socket"; log_pid=$!; }
 
-    # `guest-agent`'s NIX_DAEMON_PORT (guest-agent/src/main.rs).
+    # `guest-agent`'s NIX_DAEMON_PORT (crates/guest-agent/src/main.rs).
     port=620
     ok=0
     vm_wait_for_vsock "$vsock_socket" "$port" && ok=1
@@ -68,7 +68,7 @@ stdenvNoCC.mkDerivation {
     # PLAN.md Phase 17 kvm investigation: does the guest's own /dev, as
     # logged by guest-agent's `log_dev_contents()` right after mounting
     # devtmpfs, actually contain a `kvm` node? The worker's boot-time
-    # nested-virt probe (`worker/src/vm.rs::boot_probe`) only ever checks
+    # nested-virt probe (`crates/worker/src/vm.rs::boot_probe`) only ever checks
     # `vmx`/`svm` CPUID flags reaching the guest via the `guest/caps`
     # control-port endpoint -- it never asks whether `/dev/kvm` itself
     # exists in here, which is a separate question gated on the guest

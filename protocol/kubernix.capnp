@@ -21,7 +21,7 @@ enum FailureKind {
   # The guest VM stopped responding mid-build (control-port PING heartbeat
   # missed `KUBERNIX_WORKER_GUEST_PING_THRESHOLD` times running) and the
   # worker's one wipe-and-retry attempt either wasn't available or also
-  # timed out. See worker/src/main.rs::guest_ping_monitor.
+  # timed out. See crates/worker/src/main.rs::guest_ping_monitor.
   guestHang   @3;
 }
 
@@ -74,7 +74,7 @@ struct BuildRequest {
   # (logging/debugging), never trusted: see `token` below.
   tenant         @6 :Text;
   # The signed capability token for this job -- a JWT's UTF-8 bytes, HMAC'd by
-  # the frontend (`server/src/capability.rs`). The worker carries this opaquely
+  # the frontend (`crates/server/src/capability.rs`). The worker carries this opaquely
   # and hands it back with every upload/download URL request; it never needs
   # to parse it. PLAN.md Phase 14.
   token          @7 :Data;
@@ -83,10 +83,10 @@ struct BuildRequest {
   # *known* tags to pick the subject this was published to; this is what lets
   # a worker that can't actually satisfy every declared feature (e.g. it
   # subscribed to the kvm subject but wasn't deployed with big-parallel too)
-  # Nak the message instead of building it -- see `worker/src/main.rs`.
+  # Nak the message instead of building it -- see `crates/worker/src/main.rs`.
   # PLAN.md Phase 17.
   requiredFeatures @8 :List(Text);
-  # This tenant's configured trusted substituters (server/src/substitute.rs),
+  # This tenant's configured trusted substituters (crates/server/src/substitute.rs),
   # baked into the build VM's guest nix.conf so its own nix-daemon substitutes
   # only through kubernix -- never directly from an external URL -- and
   # therefore always ends up correctly tiered (Built vs Substituted) rather

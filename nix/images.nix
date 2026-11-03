@@ -97,7 +97,7 @@
         "KUBERNIX_NIX_STORE=local?root=/var/lib/kubernix-worker/store"
         # Per-tenant `cloud-hypervisor` VM isolation (PLAN.md Phase 15) is
         # the only mode this worker runs jobs in — these two make
-        # `worker/src/vm.rs::VmConfig::from_env` construct a `VmPool`
+        # `crates/worker/src/vm.rs::VmConfig::from_env` construct a `VmPool`
         # unconditionally, rather than being a deployment-time opt-in (see
         # `nix/module.nix`'s `vmKernel`/`vmInitrd`, which stay optional for
         # the NixOS module's own dev/test uses). `KUBERNIX_NIX_STORE` above
@@ -114,7 +114,7 @@
         # extra isolation, not privilege, since the worker's chroot store
         # and non-root uid still hold.
         #
-        # `experimental-features = nix-command`: worker/src/upload.rs shells
+        # `experimental-features = nix-command`: crates/worker/src/upload.rs shells
         # out to `nix store dump-path` (deliberately, over the legacy
         # `nix-store --dump` — see its own comment) to stream a NAR for
         # upload, and that subcommand lives behind this still-experimental

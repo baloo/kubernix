@@ -86,13 +86,13 @@ let
         trusted_public_keys=""
 
         # Ask kubernix-sshd for this tenant's own id/key and its configured
-        # trusted substituters (server/src/ssh.rs's `kubernix-whoami` exec) --
+        # trusted substituters (crates/server/src/ssh.rs's `kubernix-whoami` exec) --
         # a plain SSH request, no Lix/capnp involved, run *before* nix.conf
         # is even written. This is what lets a client automatically benefit
-        # from server-side `trusted_substituters` (server/src/substitute.rs)
+        # from server-side `trusted_substituters` (crates/server/src/substitute.rs)
         # -- those live in kubernix's own database, invisible to any client-
         # side config, and are served from their own `/<tenant>/upstream/
-        # <slug>/…` mirror route (server/src/http.rs), never the tenant's own
+        # <slug>/…` mirror route (crates/server/src/http.rs), never the tenant's own
         # narinfo namespace. Best-effort: a client that cannot reach this (a
         # firewalled host, an older server without this exec, or simply no
         # pinned host key to authenticate the request non-interactively)

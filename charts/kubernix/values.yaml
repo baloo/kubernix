@@ -207,7 +207,7 @@ jobs:
 
 # Seeded into every tenant's trusted substituters on first creation
 # (kubernix-sshd's `KUBERNIX_DEFAULT_SUBSTITUTER_URL`/`_KEY`) -- see
-# `server/src/substitute.rs`. Both empty means new tenants get no default at
+# `crates/server/src/substitute.rs`. Both empty means new tenants get no default at
 # all; an operator can still add one later via `kubernix-admin
 # add-substituter`. A real per-cluster override (an internal mirror, say)
 # belongs in values.local.yaml, same as other private deployment details.
@@ -215,14 +215,14 @@ substituters:
   defaultUrl: "https://cache.nixos.org"
   defaultPublicKey: "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
   # How long a trusted substituter's "not found" answer is cached before
-  # being re-checked (server/migrations/20260921000000_trusted_substituters.sql).
+  # being re-checked (crates/server/migrations/20260921000000_trusted_substituters.sql).
   negativeCacheTtl: 600 # 10m
   # This deployment's own externally-reachable HTTP cache hostname -- the
   # same one an external client is told to set as `KUBERNIX_HTTP_HOST`
   # (nix/client-image.nix). Read by kubernix-sshd
   # (`daemon_rpc::kubernix_http_host`) to build the `/<tenant>/upstream/
   # <slug>` mirror URLs a build VM's own guest nix.conf gets configured
-  # with (`server/src/jobs.rs`'s `BuildJob.trusted_substituters`) -- without
+  # with (`crates/server/src/jobs.rs`'s `BuildJob.trusted_substituters`) -- without
   # this set, a build VM has no substituters at all, and any input a
   # client's own local substitution already resolved (but did not upload,
   # since `builders-use-substitutes = true` tells it not to) will be
@@ -235,7 +235,7 @@ sshd:
   replicas: 1
   listen: "0.0.0.0:2222"
   # Which SSH keys resolve to a tenant is controlled entirely by the
-  # `tenant_auth_bindings` table (server/migrations/), provisioned by hand —
+  # `tenant_auth_bindings` table (crates/server/migrations/), provisioned by hand —
   # there is no per-deployment auth setting here any more.
   service:
     type: LoadBalancer
@@ -293,7 +293,7 @@ rotate:
   affinity: {}
 
 admin:
-  # An idle toolbox Deployment (server/src/bin/kubernix-admin.rs) an
+  # An idle toolbox Deployment (crates/server/src/bin/kubernix-admin.rs) an
   # operator `kubectl exec`s into to list/add tenants and their
   # credentials — see admin-deployment.yaml's own comment for why this is
   # a Deployment rather than a Job. Off by default: it's a live path to a
@@ -314,7 +314,7 @@ admin:
 # Set `exclusiveClasses: true` together with a non-empty `systemFeatures`
 # (e.g. ["big-parallel"]) to make a pool subscribe ONLY to that class's jobs
 # instead of also pulling from the plain queue like the default pool does --
-# see worker/src/main.rs's KUBERNIX_WORKER_EXCLUSIVE_CLASSES and
+# see crates/worker/src/main.rs's KUBERNIX_WORKER_EXCLUSIVE_CLASSES and
 # worker_subjects_and_consumer. This is what gets you e.g. a dedicated
 # high-CPU/RAM pool that only serves `requiredSystemFeatures = "big-parallel"`
 # jobs, alongside a cheaper default pool serving everything else. The chart
@@ -392,14 +392,14 @@ worker:
   # `requiredSystemFeatures = "big-parallel"` jobs to workers deployed with
   # `big-parallel` listed here. "kvm" is NOT settable here: kvm-class
   # routing is gated by each worker's own boot-time nested-virt self-test
-  # (worker/src/vm.rs::boot_probe), never by static declaration alone —
+  # (crates/worker/src/vm.rs::boot_probe), never by static declaration alone —
   # /dev/kvm's presence (what kvmResourceName above grants access to) does
   # not by itself prove nested virt actually works on that node.
   #
   # example: systemFeatures: ["big-parallel"]
   systemFeatures: []
   # KEDA scaling (PLAN.md Phase 13 / Phase 15 Step 7) on kubernix_jobs'
-  # per-system durable consumer (worker/src/main.rs, `worker-<system>` with
+  # per-system durable consumer (crates/worker/src/main.rs, `worker-<system>` with
   # dashes replaced by underscores — must track that naming exactly). Left
   # disabled by default: enabling it needs the `keda` dependency's CRDs
   # already registered on the cluster first (see the README's Quickstart) —

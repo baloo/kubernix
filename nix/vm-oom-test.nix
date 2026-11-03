@@ -2,7 +2,7 @@
 # attach (`nix/vm-status-test.nix` already proved that) but actually
 # *fires correctly* against a real cgroup-scoped memory-exhaustion kill on a
 # real booted guest -- `guest-agent`'s diagnostic-only `TRIGGER_OOM` control
-# verb (`guest-agent/src/diag.rs::oom_victim`) re-execs itself as a child
+# verb (`crates/guest-agent/src/diag.rs::oom_victim`) re-execs itself as a child
 # process, moves it into the build cgroup exactly the way a real
 # `nix-daemon` instance is scoped, and lets it allocate memory until the
 # kernel's OOM killer takes it out. This confirms the `oom:mark_victim`

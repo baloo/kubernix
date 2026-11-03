@@ -1,7 +1,7 @@
 # PLAN.md Phase 18: proves the eBPF ENOSPC-detection mechanism actually
 # fires against a real disk-exhaustion failure on a real booted guest --
 # `guest-agent`'s diagnostic-only `TRIGGER_ENOSPC` control verb
-# (`guest-agent/src/diag.rs::fill_store`) writes to a file under
+# (`crates/guest-agent/src/diag.rs::fill_store`) writes to a file under
 # `/nix/store` past `store.img`'s available capacity, in a loop, and never
 # calls `fsync`/`fdatasync` before the file closes.
 #

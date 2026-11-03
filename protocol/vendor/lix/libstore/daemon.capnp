@@ -133,14 +133,13 @@ interface LegacyProtocol $T.throws(T.v1Errors) {
         inputRejected @4;
         outputRejected @5;
         transientFailure @6; # possibly transient
-        cachedFailure @7; # no longer used
-        timedOut @8;
-        miscFailure @9;
-        dependencyFailed @10;
-        logLimitExceeded @11;
-        notDeterministic @12;
-        resolvesToAlreadyValid @13;
-        noSubstituters @14;
+        timedOut @7;
+        miscFailure @8;
+        dependencyFailed @9;
+        logLimitExceeded @10;
+        notDeterministic @11;
+        resolvesToAlreadyValid @12;
+        noSubstituters @13;
     }
 
     status @0 :Status;
@@ -173,7 +172,8 @@ interface LegacyProtocol $T.throws(T.v1Errors) {
   addTempRoot @10 (path :Libstore.StorePath);
   addToStore @9 (
     name :T.String,
-    contentAddressMethod :T.String,
+    contentAddressMethod :ContentAddressMethod,
+    hashType :HashType,
     references :List(Libstore.StorePath),
     repair :Bool
   ) -> (result :AddToStoreStream);
@@ -221,17 +221,6 @@ interface LegacyProtocol $T.throws(T.v1Errors) {
   queryMissing @19 (targets :List(DerivedPath)) -> (result :QueryMissingResult);
   queryPathFromHashPart @8 (hashPart :T.String) -> (result :T.Option(Libstore.StorePath));
   queryPathInfo @15 (path :Libstore.StorePath) -> (result :T.Option(ValidPathInfo));
-  setOptions @14 (
-    keepFailed :Bool,
-    keepGoing :Bool,
-    tryFallback :Bool,
-    verbosity :T.Verbosity,
-    maxBuildJobs :UInt32,
-    maxSilentTime :UInt64,
-    verboseBuild :Bool,
-    buildCores :UInt32,
-    useSubstitutes :Bool,
-    settingsOverrides :T.Settings
-  );
+  setOptions @14 (verbosity :T.Verbosity, settingsOverrides :T.Settings);
   verifyStore @16 (checkContents :Bool, repair :Bool) -> (result :Bool);
 }

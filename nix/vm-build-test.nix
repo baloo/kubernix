@@ -1,6 +1,6 @@
 # Phase 15 Step 3: proves `kubernix_daemon_protocol` actually works against a
 # real `nix-daemon --stdio`, not just the in-memory fakes its own unit tests
-# (`daemon-protocol/src/connection.rs`) drive.
+# (`crates/daemon-protocol/src/connection.rs`) drive.
 #
 # `nix-daemon` has no store to open at all without a mounted `/nix/store` --
 # there is no plain/unencrypted mount path (`guest-agent` only ever mounts
@@ -12,7 +12,7 @@
 # against the real vsock socket instead of `socat` -- so this is the one
 # place the actual handshake/`SetOptions`/`QueryPathInfo` wire bytes this
 # client sends are checked against real Lix, not a mock. See
-# `worker/src/bin/vm-smoke.rs`'s own doc comment for why this stops at one op
+# `crates/worker/src/bin/vm-smoke.rs`'s own doc comment for why this stops at one op
 # rather than a full build: the current guest initrd has no shell/coreutils
 # for a builder to run at all (`nix/guest-vm.nix`), and getting
 # `BuildDerivation`/`AddToStoreNar` byte-exact against real Nix's own path
@@ -60,7 +60,7 @@ stdenvNoCC.mkDerivation {
       echo "FRESH key push failed: $reply"; vm_stop "$ch_pid"; cat "$console_log"; exit 1
     fi
 
-    # `guest-agent`'s NIX_DAEMON_PORT (guest-agent/src/main.rs).
+    # `guest-agent`'s NIX_DAEMON_PORT (crates/guest-agent/src/main.rs).
     port=620
 
     # `guest-agent` accepts the vsock connection immediately and only then

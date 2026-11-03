@@ -1,16 +1,10 @@
-{ rustPlatform, capnproto, workspaceSource, outputHashes }:
+{ buildMember }:
 
-rustPlatform.buildRustPackage {
-  pname = "kubernix-worker";
-  version = "0.1.0";
-
-  src = workspaceSource;
-  buildAndTestSubdir = "worker";
-
-  cargoLock = {
-    lockFile = ../Cargo.lock;
-    inherit outputHashes;
-  };
-
-  nativeBuildInputs = [ capnproto ];
+buildMember {
+  name = "kubernix-worker";
+  path = ../crates/worker;
+  additionalCrates = [
+    ../crates/daemon-protocol
+    ../crates/guest-protocol
+  ];
 }

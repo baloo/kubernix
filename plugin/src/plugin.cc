@@ -396,7 +396,8 @@ public:
     try {
         auto req = rpc->legacyProtocol.addToStoreRequest();
         RPC_FILL(req, setName, name);
-        RPC_FILL(req, setContentAddressMethod, caMethod.render(hashType));
+        req.setContentAddressMethod(rpc::daemon::to(caMethod));
+        req.setHashType(rpc::daemon::to(hashType));
         RPC_FILL(req, initReferences, references, *this);
         RPC_FILL(req, setRepair, repair);
 
@@ -622,7 +623,9 @@ protected:
         rpc::daemon::LegacyProtocol::Client legacyProtocol;
     };
 
-    kj::Promise<Result<void>> init();
+    kj::Promise<Result<std::shared_ptr<RemoteStore::Connection>>> openConnection();
+
+    kj::Promise<Result<std::shared_ptr<RemoteStore::Connection>>> reconnect() override { return openConnection(); }
 
     kj::Promise<Result<void>> setOptions(RemoteStore::Connection & conn) override
     {
@@ -636,7 +639,7 @@ protected:
     std::shared_ptr<RpcState> rpc;
 };
 
-kj::Promise<Result<void>> KubernixStore::init()
+kj::Promise<Result<std::shared_ptr<RemoteStore::Connection>>> KubernixStore::openConnection()
 try {
     /* Start the remote end. The client half of the socketpair is dup'd onto both
        stdin and stdout of the remote command, so from here it is a single
@@ -714,8 +717,7 @@ try {
        the pipe to report why setup failed. */
     conn->logHandlerPromise = conn->logHandler(getUri());
 
-    *(co_await connection.lock()) = conn;
-    co_return result::success();
+    co_return conn;
 } catch (...) {
     co_return result::current_exception();
 }
