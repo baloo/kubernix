@@ -25,20 +25,21 @@ bytes = { version = "1", features = ["serde"] }
 chacha20 = { version = "0.10", default-features = false, features = ["legacy", "rng", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["block-padding", "rand_core", "stream-wrapper"] }
 crc32fast = { version = "1" }
-crypto-bigint = { version = "0.5", features = ["generic-array", "zeroize"] }
+crypto-bigint = { version = "0.7", features = ["alloc", "getrandom", "hybrid-array", "subtle", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom"] }
 ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
 curve25519-dalek-164d15cefe24d7eb = { package = "curve25519-dalek", version = "4", default-features = false, features = ["alloc", "digest", "precomputed-tables", "zeroize"] }
 curve25519-dalek-cdf1610d3e1514e9 = { package = "curve25519-dalek", version = "5", features = ["rand_core"] }
-der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
+der = { version = "0.7", default-features = false, features = ["oid", "pem", "std"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid", "rand_core"] }
+ecdsa = { version = "0.17", features = ["algorithm", "getrandom", "pem", "std"] }
 ed25519-7b89eefb6aaa9bf3 = { package = "ed25519", version = "3", default-features = false, features = ["alloc", "pkcs8"] }
 ed25519-dalek-7b89eefb6aaa9bf3 = { package = "ed25519-dalek", version = "3", features = ["alloc", "digest", "pkcs8", "rand_core"] }
 ed25519-dalek-f595c2ba2a3f28df = { package = "ed25519-dalek", version = "2", features = ["digest", "pkcs8"] }
 ed25519-f595c2ba2a3f28df = { package = "ed25519", version = "2", default-features = false, features = ["alloc", "pkcs8", "std"] }
 either = { version = "1", features = ["serde"] }
-elliptic-curve = { version = "0.13", default-features = false, features = ["ecdh", "hazmat", "pem", "std"] }
+elliptic-curve = { version = "0.14", features = ["ecdh", "getrandom", "pem", "std"] }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
@@ -48,8 +49,8 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng", "wasm_js"] }
-hashbrown = { version = "0.17", default-features = false, features = ["default-hasher", "equivalent"] }
-hmac = { version = "0.12", default-features = false, features = ["reset"] }
+ghash = { version = "0.6", default-features = false, features = ["zeroize"] }
+hashbrown = { version = "0.17", default-features = false, features = ["default-hasher", "equivalent", "inline-more"] }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "subtle", "zeroize"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1", "http2", "server", "service"] }
@@ -62,8 +63,10 @@ md-5 = { version = "0.11" }
 nix = { version = "0.31", features = ["ioctl", "process", "socket", "user"] }
 num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
-pkcs8 = { version = "0.11", default-features = false, features = ["encryption", "pem", "std"] }
-ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
+p256 = { version = "0.14", features = ["ecdh"] }
+pkcs8-93f6ce9d446188ac = { package = "pkcs8", version = "0.10", default-features = false, features = ["pem", "std"] }
+pkcs8-a6292c17cd707f01 = { package = "pkcs8", version = "0.11", default-features = false, features = ["encryption", "pem", "std"] }
+polyval = { version = "0.7", default-features = false, features = ["hazmat", "zeroize"] }
 rand = { version = "0.10" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -78,7 +81,7 @@ signature-7b89eefb6aaa9bf3 = { package = "signature", version = "3", default-fea
 signature-f595c2ba2a3f28df = { package = "signature", version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
-spki = { version = "0.8", default-features = false, features = ["pem", "std"] }
+spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.9", default-features = false, features = ["any", "migrate", "offline", "uuid"] }
 subtle = { version = "2", features = ["const-generics"] }
@@ -114,7 +117,7 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng", "wasm_js"] }
-hashbrown = { version = "0.17", default-features = false, features = ["default-hasher", "equivalent"] }
+hashbrown = { version = "0.17", default-features = false, features = ["default-hasher", "equivalent", "inline-more"] }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "subtle", "zeroize"] }
 indexmap = { version = "2" }
 inout = { version = "0.2", default-features = false, features = ["block-padding"] }
@@ -134,8 +137,8 @@ smallvec = { version = "1", default-features = false, features = ["const_new", "
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.9", default-features = false, features = ["any", "migrate", "offline", "uuid"] }
 subtle = { version = "2", features = ["const-generics"] }
-syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["full", "visit-mut"] }
-syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "sync"] }
@@ -147,7 +150,7 @@ zeroize = { version = "1", features = ["derive"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
+miniz_oxide = { version = "0.9", features = ["simd"] }
 nix = { version = "0.31", default-features = false, features = ["mman"] }
 spin = { version = "0.9" }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
@@ -158,7 +161,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
+miniz_oxide = { version = "0.9", features = ["simd"] }
 nix = { version = "0.31", default-features = false, features = ["mman"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 
