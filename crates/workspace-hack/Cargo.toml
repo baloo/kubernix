@@ -18,7 +18,7 @@ publish = false
 aead = { version = "0.6", default-features = false, features = ["rand_core"] }
 aes = { version = "0.9", default-features = false, features = ["zeroize"] }
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "zeroize"] }
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
+aws-lc-rs = { version = "1", default-features = false, features = ["alloc", "aws-lc-sys", "prebuilt-nasm"] }
 base64 = { version = "0.22" }
 byteorder = { version = "1" }
 bytes = { version = "1", features = ["serde"] }
@@ -98,7 +98,7 @@ uuid = { version = "1", features = ["serde", "v4", "v7"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
+aws-lc-rs = { version = "1", default-features = false, features = ["alloc", "aws-lc-sys", "prebuilt-nasm"] }
 base64 = { version = "0.22" }
 byteorder = { version = "1" }
 bytes = { version = "1", features = ["serde"] }
