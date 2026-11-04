@@ -62,7 +62,7 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
 nix = { version = "0.31", features = ["ioctl", "process", "socket", "user"] }
 num-integer = { version = "0.1", features = ["i128"] }
-num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
+num-traits = { version = "0.2", features = ["i128", "libm"] }
 p256 = { version = "0.14", features = ["ecdh"] }
 pkcs8-93f6ce9d446188ac = { package = "pkcs8", version = "0.10", default-features = false, features = ["pem", "std"] }
 pkcs8-a6292c17cd707f01 = { package = "pkcs8", version = "0.11", default-features = false, features = ["encryption", "pem", "std"] }
@@ -87,6 +87,7 @@ sqlx-postgres = { version = "0.9", default-features = false, features = ["any", 
 subtle = { version = "2", features = ["const-generics"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 thiserror = { version = "2" }
+time = { version = "0.3", features = ["macros", "serde-well-known"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "compat", "io"] }
@@ -107,6 +108,7 @@ crypto-common = { version = "0.2", default-features = false, features = ["getran
 ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid", "rand_core"] }
+displaydoc = { version = "0.2" }
 either = { version = "1", features = ["serde"] }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -123,7 +125,7 @@ indexmap = { version = "2" }
 inout = { version = "0.2", default-features = false, features = ["block-padding"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
-num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
+num-traits = { version = "0.2", features = ["i128", "libm"] }
 rand = { version = "0.10" }
 rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }

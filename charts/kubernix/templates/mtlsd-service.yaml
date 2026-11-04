@@ -1,0 +1,22 @@
+{{- if .Values.mtlsd.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-mtlsd" (include "kubernix.fullname" .) }}
+  labels:
+    {{- include "kubernix.labels" . | nindent 4 }}
+  {{- with .Values.mtlsd.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Raw TCP (TLS terminated by the pod itself, since the client certificate
+  # must reach it), so LoadBalancer/NodePort rather than an Ingress.
+  type: {{ .Values.mtlsd.service.type }}
+  selector:
+    {{- include "kubernix.selectorLabels" (dict "context" $ "component" "mtlsd") | nindent 4 }}
+  ports:
+    - name: mtls
+      port: {{ .Values.mtlsd.service.port }}
+      targetPort: mtls
+{{- end }}

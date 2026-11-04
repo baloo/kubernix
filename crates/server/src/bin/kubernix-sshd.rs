@@ -49,31 +49,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::Context as _;
-use kubernix_server::daemon_rpc::Config as RpcConfig;
-use kubernix_server::postgres_store::{PostgresStore, ServingRole};
 use kubernix_server::ssh::{AuthPolicy, SshServer};
 use russh::server::Server as _;
 
 use russh::keys::{Algorithm, PrivateKey};
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-/// Parse a seconds-valued env var, falling back to `default` if it's unset
-/// or unparseable. Mirrors `kubernix-gc`'s own copy of this — small enough,
-/// and specific enough to each binary's own env var names, that a shared
-/// helper isn't worth it.
-fn env_secs(name: &str, default: Duration) -> Duration {
-    match std::env::var(name) {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(secs) => Duration::from_secs(secs),
-            Err(e) => {
-                tracing::warn!(%name, value = %v, error = %e, "unparseable, using the default");
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
 
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
@@ -112,83 +93,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         ..Default::default()
     });
 
-    let mut rpc_config = RpcConfig::default();
-    if let Ok(store_dir) = std::env::var("KUBERNIX_STORE_DIR") {
-        rpc_config.store_dir = store_dir;
-    }
-
-    // Without a database the frontend still works, but every path it knows is
-    // forgotten on restart — which strands objects a worker already uploaded.
-    // Refusing to start would be worse for development, so this warns loudly
-    // instead.
-    match std::env::var("DATABASE_URL") {
-        Ok(url) => match PostgresStore::connect(&url, ServingRole::App).await {
-            Ok(store) => {
-                // Seeded into every tenant this process creates from here on
-                // (`PostgresStore::ensure_tenant`) — unset means new tenants
-                // get no default substituter, not that seeding silently
-                // no-ops in a surprising way.
-                if let (Ok(url), Ok(key)) = (
-                    std::env::var("KUBERNIX_DEFAULT_SUBSTITUTER_URL"),
-                    std::env::var("KUBERNIX_DEFAULT_SUBSTITUTER_KEY"),
-                ) {
-                    store.set_default_substituter(url, key);
-                }
-                store.set_negative_cache_ttl(env_secs(
-                    "KUBERNIX_SUBSTITUTER_NEGATIVE_CACHE_TTL",
-                    Duration::from_secs(600),
-                ));
-                rpc_config.store = store;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "could not reach PostgreSQL");
-                return Err(e.into());
-            }
-        },
-        Err(_) => tracing::warn!(
-            "DATABASE_URL unset - using the in-memory store; every path is lost on restart"
-        ),
-    }
-
-    if let Ok(nats_url) = std::env::var("NATS_URL") {
-        let results_retention = env_secs(
-            "KUBERNIX_JOB_RESULTS_RETENTION",
-            Duration::from_secs(24 * 3600),
-        );
-        match kubernix_server::jobs::JobQueue::connect(&nats_url, results_retention).await {
-            Ok(queue) => {
-                // Serve pre-signed upload URLs. This process is the only holder
-                // of S3 credentials; workers receive per-object capabilities.
-                match kubernix_server::uploads::UploadSigner::from_env().await {
-                    Ok(signer) => {
-                        let signer = std::sync::Arc::new(signer);
-                        // Same signer both ways: it writes inputs directly and
-                        // pre-signs the URLs workers use for outputs.
-                        rpc_config.uploader = Some(signer.clone());
-                        let client = queue.client();
-                        let serving = signer.clone();
-                        let serving_store = rpc_config.store.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = (*serving).clone().serve(client, serving_store).await {
-                                tracing::error!(error = %e, "upload url service stopped");
-                            }
-                        });
-                    }
-                    Err(e) => tracing::error!(
-                        error = %e,
-                        "no S3 configuration; workers will be unable to upload artifacts"
-                    ),
-                }
-                rpc_config.queue = Some(std::sync::Arc::new(queue));
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "could not reach NATS; builds will be refused");
-            }
-        }
-    } else {
-        tracing::warn!("NATS_URL unset - builds will be refused");
-    }
-
+    let rpc_config = kubernix_server::rpc_env::rpc_config_from_env().await?;
     let mut server = SshServer::new(rpc_config, auth);
 
     tracing::info!(%listen, "kubernix sshd listening");

@@ -45,10 +45,14 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 zstd.workspace = true
 workspace-hack.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+x509-parser = "0.18.1"
 
 [build-dependencies]
 capnpc = "0.27"
 
 [dev-dependencies]
 proptest = "1.11.0"
+rcgen = "0.14.10"
 serial_test = "4.0.1"

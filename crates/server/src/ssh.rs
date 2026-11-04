@@ -13,8 +13,7 @@ use russh::keys::PublicKey;
 use russh::server::{Auth, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId};
 
-use crate::daemon_capnp::bootstrap;
-use crate::daemon_rpc::{BootstrapImpl, Config as RpcConfig};
+use crate::daemon_rpc::{Config as RpcConfig, spawn_rpc_thread};
 use crate::store::Store;
 use crate::tenant::{KeyType, Tenant, TenantId};
 
@@ -325,62 +324,15 @@ impl Handler for SshHandler {
         let stream = channel.into_stream();
 
         // capnp-rpc capabilities are !Send, so the RPC system cannot run on the
-        // multi-threaded runtime driving russh. Hand the stream to a dedicated
-        // thread with its own current-thread runtime and LocalSet. The stream
-        // itself is Send, which is what makes this bridge possible.
-        std::thread::spawn(move || {
-            tracing::debug!(?channel_id, "rpc thread starting");
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build RPC runtime");
-                    return;
-                }
-            };
-
-            tracing::debug!(?channel_id, "rpc runtime built, entering event loop");
-            let local = tokio::task::LocalSet::new();
-            let result = local.block_on(&runtime, serve_rpc(stream, rpc_config));
-            tracing::debug!(?channel_id, ?result, "rpc event loop returned");
-
-            match result {
-                Ok(()) => tracing::info!("rpc session ended"),
-                Err(e) => tracing::warn!(error = %e, "rpc session ended with error"),
-            }
-
+        // multi-threaded runtime driving russh; it gets its own thread.
+        spawn_rpc_thread(stream, rpc_config, move || async move {
             // The client is done when the RPC system finishes.
-            let _ = runtime.block_on(async {
-                let _ = handle.exit_status_request(channel_id, 0).await;
-                handle.close(channel_id).await
-            });
+            let _ = handle.exit_status_request(channel_id, 0).await;
+            let _ = handle.close(channel_id).await;
         });
 
         Ok(())
     }
-}
-
-/// Serve the daemon protocol over one bidirectional stream.
-async fn serve_rpc<S>(stream: S, config: RpcConfig) -> eyre::Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
-{
-    use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-
-    let (reader, writer) = tokio::io::split(stream);
-    let network = twoparty::VatNetwork::new(
-        reader.compat(),
-        writer.compat_write(),
-        rpc_twoparty_capnp::Side::Server,
-        Default::default(),
-    );
-
-    let bootstrap: bootstrap::Client = capnp_rpc::new_client(BootstrapImpl::new(config));
-    RpcSystem::new(Box::new(network), Some(bootstrap.client)).await?;
-    Ok(())
 }
 
 /// Lix sends `<remote-program> --stdio`, optionally followed by

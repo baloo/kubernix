@@ -33,6 +33,8 @@ pub enum AdminError {
     CredentialExists { key_type: KeyType, key_id: String },
     #[error("parsing the SSH public key: {0}")]
     InvalidSshKey(String),
+    #[error("parsing the CA certificate: {0}")]
+    InvalidCertificate(String),
     #[error("tenant {tenant:?} already has substituter {url:?} configured")]
     SubstituterExists { tenant: TenantId, url: String },
 }
@@ -237,28 +239,30 @@ pub async fn list_credentials(
 
 /// Bind a new credential to `tenant`.
 ///
-/// `key_type` decides how `material` is read; today that is only
-/// [`KeyType::Ssh`], an OpenSSH public-key line (`ssh-ed25519 AAAA...
-/// comment`), the same shape `~/.ssh/authorized_keys` uses. Taking
-/// `key_type` as a parameter now — rather than assuming SSH — means the
-/// signature here doesn't need to change once `KeyType` grows a `Tls`
-/// variant alongside the mTLS API that would actually issue that credential
-/// type (see `crate::tenant::KeyType`'s doc comment): that lands as a new
-/// match arm, not a new function.
+/// `key_type` decides how `material` is read: for [`KeyType::Ssh`] an OpenSSH
+/// public-key line (`ssh-ed25519 AAAA... comment`, the shape
+/// `~/.ssh/authorized_keys` uses); for [`KeyType::Tls`] a PEM-encoded CA
+/// certificate with a Subject Key Identifier.
 pub async fn add_credential(
     store: &PostgresStore,
     tenant: &TenantId,
     key_type: KeyType,
     material: &str,
 ) -> Result<()> {
-    let (key_id, key_value) = {
-        let key = russh::keys::PublicKey::from_openssh(material)
-            .map_err(|e| AdminError::InvalidSshKey(e.to_string()))?;
-        let fingerprint = key.fingerprint(Default::default()).to_string();
-        let blob = key
-            .to_bytes()
-            .map_err(|e| AdminError::InvalidSshKey(e.to_string()))?;
-        (fingerprint, blob)
+    let (key_id, key_value) = match key_type {
+        KeyType::Ssh => {
+            let key = russh::keys::PublicKey::from_openssh(material)
+                .map_err(|e| AdminError::InvalidSshKey(e.to_string()))?;
+            let fingerprint = key.fingerprint(Default::default()).to_string();
+            let blob = key
+                .to_bytes()
+                .map_err(|e| AdminError::InvalidSshKey(e.to_string()))?;
+            (fingerprint, blob)
+        }
+        // `material` is a PEM CA certificate; the binding is keyed by its SKI.
+        KeyType::Tls => {
+            crate::tls::ca_from_pem(material).map_err(AdminError::InvalidCertificate)?
+        }
     };
 
     let result = sqlx::query(

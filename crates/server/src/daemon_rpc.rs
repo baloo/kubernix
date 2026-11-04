@@ -55,6 +55,68 @@ use uuid::Uuid;
 /// configurable so a fix does not strand us.
 pub const DEFAULT_PROTOCOL_ID: &str = "lix/legacy/kubernix";
 
+/// Serve the daemon protocol over one bidirectional stream.
+///
+/// Transport-agnostic: the SSH channel and the mTLS stream both come through
+/// here.
+pub async fn serve_rpc<S>(stream: S, config: Config) -> eyre::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    let (reader, writer) = tokio::io::split(stream);
+    let network = twoparty::VatNetwork::new(
+        reader.compat(),
+        writer.compat_write(),
+        rpc_twoparty_capnp::Side::Server,
+        Default::default(),
+    );
+
+    let bootstrap: bootstrap::Client = capnp_rpc::new_client(BootstrapImpl::new(config));
+    RpcSystem::new(Box::new(network), Some(bootstrap.client)).await?;
+    Ok(())
+}
+
+/// Run [`serve_rpc`] on a dedicated thread, returning once the session ends.
+///
+/// capnp-rpc capabilities are `!Send`, so the RPC system cannot run on a
+/// multi-threaded runtime. The stream itself is `Send`, which is what makes
+/// handing it to a thread with its own current-thread runtime and `LocalSet`
+/// possible. `on_done` runs on that thread's runtime after the session ends.
+pub fn spawn_rpc_thread<S, F, Fut>(stream: S, config: Config, on_done: F)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()>,
+{
+    std::thread::spawn(move || {
+        tracing::debug!("rpc thread starting");
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build RPC runtime");
+                return;
+            }
+        };
+
+        let local = tokio::task::LocalSet::new();
+        let result = local.block_on(&runtime, serve_rpc(stream, config));
+        tracing::debug!(?result, "rpc event loop returned");
+
+        match result {
+            Ok(()) => tracing::info!("rpc session ended"),
+            Err(e) => tracing::warn!(error = %e, "rpc session ended with error"),
+        }
+
+        runtime.block_on(on_done());
+    });
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub protocol_id: String,
