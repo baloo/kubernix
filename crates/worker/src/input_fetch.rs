@@ -114,7 +114,7 @@ pub async fn download_to_spool(
 #[cfg(test)]
 mod tests {
     use async_compression::tokio::write::ZstdEncoder;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     use super::*;

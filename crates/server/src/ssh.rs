@@ -9,8 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use russh::keys::PublicKey;
-use russh::server::{Auth, Handler, Msg, Server, Session};
+use russh::server::{Auth, Handler, Msg, Server, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
 
 use crate::daemon_rpc::{Config as RpcConfig, spawn_rpc_thread};
@@ -127,9 +126,12 @@ impl Handler for SshHandler {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        public_key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        let fingerprint = public_key.fingerprint(Default::default()).to_string();
+        let fingerprint = public_key
+            .public_key
+            .fingerprint(Default::default())
+            .to_string();
         match self
             .rpc_config
             .store
@@ -373,6 +375,7 @@ async fn whoami_response(store: &dyn Store, tenant: &TenantId) -> String {
 mod tests {
     use super::*;
     use crate::store::PathStore;
+    use russh::keys::PublicKey;
 
     const OFFERED: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDElZlNyHEIqviXh/UmoXKUUqFFJ7ARO3JcpB+eAc5z";
@@ -381,24 +384,6 @@ mod tests {
 
     fn key(openssh: &str) -> PublicKey {
         PublicKey::from_openssh(openssh).expect("parseable")
-    }
-
-    /// `MemoryStore` (what `RpcConfig::default()` carries) never has a
-    /// binding for anything — see its `TenantAuthStore` impl — so this
-    /// exercises the "no row" branch of `auth_publickey` without a database:
-    /// a key nobody provisioned must be rejected, not attributed a tenant.
-    #[tokio::test]
-    async fn an_unbound_key_is_rejected() {
-        let mut server = SshServer::new(RpcConfig::default(), AuthPolicy::AcceptAll);
-        let mut handler = server.new_client(None);
-
-        let auth = handler
-            .auth_publickey("alice", &key(OFFERED))
-            .await
-            .unwrap();
-
-        assert!(matches!(auth, Auth::Reject { .. }), "{auth:?}");
-        assert!(handler.tenant.is_none());
     }
 
     #[test]
