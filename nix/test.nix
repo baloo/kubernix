@@ -81,6 +81,57 @@ let
       args = [ "-c" "echo DEDUP-BUILDING; sleep 5; echo built once > $out" ];
     }
   '';
+  # A leaf build used only by the mutual-TLS subtests. Not `example`: that
+  # output is reserved for the GC subtest at the end.
+  viaTls = pkgs.writeText "via-tls.nix" ''
+    derivation {
+      name = "kubernix-via-tls";
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      args = [ "-c" "echo BUILDING-VIA-TLS; echo built over mtls > $out" ];
+    }
+  '';
+
+  # Two independent CAs: `good` is bound to the test tenant, `rogue` to nothing
+  # (until the hot-add subtest). Generated at build time so kubernix-mtlsd can
+  # start at boot with its server certificate already in place.
+  #
+  # Every CA carries a Subject Key Identifier and every leaf an Authority Key
+  # Identifier, because that pair is how the frontend attributes a client.
+  certs = pkgs.runCommand "kubernix-test-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir $out
+    cd $out
+
+    mkca() {
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+        -keyout $1-ca.key -out $1-ca.pem -subj "/CN=kubernix-test-$1-ca" \
+        -addext basicConstraints=critical,CA:TRUE \
+        -addext keyUsage=critical,keyCertSign,cRLSign \
+        -addext subjectKeyIdentifier=hash
+    }
+
+    # leaf <ca> <name> <extendedKeyUsage> [extra extension]
+    leaf() {
+      openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+        -keyout $2.key -out $2.csr -subj "/CN=$2"
+      printf '%s\n' basicConstraints=CA:FALSE keyUsage=digitalSignature \
+        extendedKeyUsage=$3 subjectKeyIdentifier=hash authorityKeyIdentifier=keyid \
+        $4 > $2.ext
+      openssl x509 -req -in $2.csr -CA $1-ca.pem -CAkey $1-ca.key -CAcreateserial \
+        -days 3650 -extfile $2.ext -out $2.pem
+    }
+
+    mkca good
+    mkca rogue
+    leaf good server serverAuth "subjectAltName=DNS:localhost,IP:127.0.0.1"
+    leaf good client clientAuth
+    leaf rogue rogue-client clientAuth
+
+    # The frontend reads the tenant off the LAST certificate sent.
+    cat client.pem good-ca.pem > client-chain.pem
+    cat rogue-client.pem rogue-ca.pem > rogue-chain.pem
+  '';
+
 in
 pkgs.testers.nixosTest {
   name = "kubernix-end-to-end";
@@ -104,6 +155,7 @@ pkgs.testers.nixosTest {
       pkgs.curl
       pkgs.openssh
       pkgs.jq
+      pkgs.openssl
     ];
 
     nix.settings.experimental-features = [ "nix-command" ];
@@ -142,6 +194,15 @@ pkgs.testers.nixosTest {
       enable = true;
       package = kubernix-server;
       listen = "127.0.0.1:2222";
+      databaseUrl = "postgres://postgres@127.0.0.1:5432/kubernix";
+    };
+
+    services.kubernix-mtlsd = {
+      enable = true;
+      package = kubernix-server;
+      listen = "127.0.0.1:2224";
+      certFile = "${certs}/server.pem";
+      keyFile = "${certs}/server.key";
       databaseUrl = "postgres://postgres@127.0.0.1:5432/kubernix";
     };
 
@@ -199,11 +260,13 @@ pkgs.testers.nixosTest {
     machine.wait_for_open_port(9000)
 
     machine.wait_for_unit("kubernix-sshd.service")
+    machine.wait_for_unit("kubernix-mtlsd.service")
     machine.wait_for_unit("kubernix-cache.service")
     machine.wait_for_unit("kubernix-worker.service")
     machine.wait_for_unit("kubernix-gc.service")
     machine.wait_for_unit("kubernix-rotate-capability-secret.service")
     machine.wait_for_open_port(2222)
+    machine.wait_for_open_port(2224)
     machine.wait_for_open_port(3000)
 
     # An ssh key for the client. `AuthPolicy::RequireKey` is the frontend's
@@ -612,5 +675,85 @@ pkgs.testers.nixosTest {
             f"http://127.0.0.1:3000/{tenant}/{hash_part}.narinfo"
         ).strip()
         assert status == "404", f"a collected path should not be served, got {status}"
+
+    # ---- mutual TLS -------------------------------------------------------
+    #
+    # The same tenant as the SSH key above, reached a second way: a CA is bound
+    # to it (`kubernix-admin add-credential --type tls`), and any client
+    # certificate chaining to that CA is attributed to it.
+    admin = "DATABASE_URL=postgres://postgres@127.0.0.1:5432/kubernix ${kubernix-server}/bin/kubernix-admin"
+
+    def tls_uri(chain="client-chain", key="client", ca="good-ca"):
+        return (
+            f"kubernix-tls://localhost:2224?tls-cert=${certs}/{chain}.pem"
+            f"&tls-key=${certs}/{key}.key&tls-ca=${certs}/{ca}.pem"
+        )
+
+    def tls_ping(**kw):
+        return f"nix --plugin-files {plugin} store ping --store '{tls_uri(**kw)}' 2>&1"
+
+    def ski(ca):
+        out = machine.succeed(
+            f"openssl x509 -noout -ext subjectKeyIdentifier -in ${certs}/{ca}-ca.pem | tail -1"
+        )
+        return out.strip().replace(":", "").lower()
+
+    with subtest("a CA bound with kubernix-admin is stored keyed by its SKI"):
+        machine.succeed(f"{admin} add-credential --type tls {tenant_id} ${certs}/good-ca.pem")
+        key_id = machine.succeed(
+            "psql -U postgres -h 127.0.0.1 kubernix -tAc "
+            f"\"SELECT key_id FROM tenant_auth_bindings WHERE key_type = 'tls' AND tenant = '{tenant_id}'\""
+        ).strip()
+        assert key_id == ski("good"), f"binding key_id {key_id} != CA SKI {ski('good')}"
+
+    with subtest("a build over mutual TLS reaches the worker and comes back"):
+        # The binding is read every 30s; wait for the first connection to work
+        # rather than racing the refresh.
+        machine.wait_until_succeeds(tls_ping(), timeout=90)
+        result = machine.succeed(
+            f"nix -L --plugin-files {plugin} build "
+            f"--store 'local?root=/tmp/tls-client' --max-jobs 0 "
+            f"--builders '{tls_uri()} x86_64-linux' "
+            f"-f ${viaTls} --no-link --print-out-paths 2>&1"
+        )
+        assert "BUILDING-VIA-TLS" in result, f"build log did not stream back:\n{result}"
+        tls_out = [l for l in result.splitlines() if l.startswith("/nix/store/")][-1].strip()
+        tls_content = machine.succeed(f"cat /tmp/tls-client{tls_out}")
+        assert "built over mtls" in tls_content, f"unexpected output: {tls_content}"
+
+    with subtest("the mutual-TLS connection is attributed to the CA's tenant"):
+        journal = machine.succeed("journalctl -u kubernix-mtlsd --no-pager")
+        assert f"tls:{ski('good')}" in journal, f"no tls identity in the frontend journal:\n{journal}"
+        # No tenant was minted from the certificate: attribution only, via the binding.
+        minted = machine.succeed(
+            "psql -U postgres -h 127.0.0.1 kubernix -tAc "
+            "\"SELECT count(*) FROM tenants WHERE identity LIKE 'tls:%'\""
+        ).strip()
+        assert minted == "0", f"a tenant was minted from a certificate: {minted}"
+        jobs = machine.succeed(
+            "psql -U postgres -h 127.0.0.1 kubernix -tAc "
+            f"\"SELECT count(*) FROM jobs WHERE tenant = '{tenant_id}' AND derivation_path LIKE '%kubernix-via-tls.drv'\""
+        ).strip()
+        assert jobs == "1", f"expected one job for {tenant_id}, found {jobs}"
+
+    with subtest("a client that omits the CA from its chain is still attributed"):
+        # Leaf only: the last certificate sent is the leaf, whose Authority Key
+        # Identifier names the bound CA.
+        machine.succeed(tls_ping(chain="client"))
+
+    with subtest("a client certificate from an unbound CA is rejected"):
+        machine.fail(tls_ping(chain="rogue-chain", key="rogue-client"))
+        journal = machine.succeed("journalctl -u kubernix-mtlsd --no-pager")
+        assert "connection rejected" in journal, f"rejection not logged:\n{journal}"
+
+    with subtest("a server certificate from an untrusted CA is rejected by the client"):
+        machine.fail(tls_ping(ca="rogue-ca"))
+
+    with subtest("a CA bound while the frontend runs takes effect without a restart"):
+        machine.succeed(f"{admin} add-credential --type tls {tenant_id} ${certs}/rogue-ca.pem")
+        machine.wait_until_succeeds(
+            tls_ping(chain="rogue-chain", key="rogue-client"), timeout=90
+        )
+
   '';
 }

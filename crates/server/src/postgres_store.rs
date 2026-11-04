@@ -1414,6 +1414,18 @@ impl PostgresStore {
         Some(secret)
     }
 
+    async fn trusted_client_roots_db(&self) -> Result<Vec<Vec<u8>>> {
+        let rows = sqlx::query(
+            "SELECT key_value FROM tenant_auth_bindings \
+             WHERE key_type = $1 AND key_value IS NOT NULL ORDER BY key_id",
+        )
+        .bind(KeyType::Tls.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.iter().map(|r| r.get("key_value")).collect())
+    }
+
     async fn find_tenant_by_binding_db(
         &self,
         key_type: KeyType,
@@ -1622,6 +1634,9 @@ enum DbRequest {
         key_id: String,
         reply: oneshot::Sender<Result<Option<TenantId>>>,
     },
+    TrustedClientRoots {
+        reply: oneshot::Sender<Result<Vec<Vec<u8>>>>,
+    },
 }
 
 impl DbRequest {
@@ -1818,6 +1833,9 @@ impl DbRequest {
                 reply,
             } => {
                 let _ = reply.send(store.find_tenant_by_binding_db(key_type, &key_id).await);
+            }
+            DbRequest::TrustedClientRoots { reply } => {
+                let _ = reply.send(store.trusted_client_roots_db().await);
             }
         }
     }
@@ -2204,6 +2222,12 @@ impl TenantAuthStore for PostgresStore {
         })
         .await
         .unwrap_or_else(|| Err(StoreError::Other("db request actor unavailable".into())))
+    }
+
+    async fn trusted_client_roots(&self) -> Result<Vec<Vec<u8>>> {
+        self.call(|reply| DbRequest::TrustedClientRoots { reply })
+            .await
+            .unwrap_or_else(|| Err(StoreError::Other("db request actor unavailable".into())))
     }
 }
 
@@ -3190,6 +3214,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found, Some(t));
+    }
+
+    #[tokio::test]
+    async fn trusted_client_roots_returns_only_tls_binding_material() {
+        let Some(store) = db().await else { return };
+        let Ok(url) = std::env::var("KUBERNIX_TEST_DATABASE_URL") else {
+            return;
+        };
+        let t = tenant("tls-roots");
+        provision_binding(&url, &t, "SHA256:not-a-ca").await;
+        let privileged = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tenant_auth_bindings (key_type, key_id, tenant, key_value)
+             VALUES ('tls', 'aabbcc', `    #[tokio::test]
+    async fn find_tenant_by_binding_is_none_for_an_unprovisioned_key, `)
+             ON CONFLICT (key_type, key_id) DO NOTHING",
+        )
+        .bind(t.as_str())
+        .bind(b"der-bytes".as_slice())
+        .execute(&privileged)
+        .await
+        .unwrap();
+
+        let roots = store.trusted_client_roots().await.unwrap();
+        assert!(roots.contains(&b"der-bytes".to_vec()));
+        assert!(!roots.iter().any(|r| r.is_empty()));
     }
 
     #[tokio::test]

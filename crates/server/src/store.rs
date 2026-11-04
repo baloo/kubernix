@@ -506,6 +506,10 @@ pub trait TenantAuthStore: Send + Sync {
         key_type: KeyType,
         key_id: &str,
     ) -> Result<Option<TenantId>>;
+
+    /// DER-encoded CA certificates of every `tls` binding, i.e. the trust
+    /// anchors `kubernix-mtlsd` validates client certificates against.
+    async fn trusted_client_roots(&self) -> Result<Vec<Vec<u8>>>;
 }
 
 /// Everything a full connection needs — the union of [`PathStore`],
@@ -987,6 +991,10 @@ impl TenantAuthStore for MemoryStore {
         _key_id: &str,
     ) -> Result<Option<TenantId>> {
         Ok(None)
+    }
+
+    async fn trusted_client_roots(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(Vec::new())
     }
 }
 

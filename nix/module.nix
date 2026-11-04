@@ -4,6 +4,7 @@ with lib;
 
 let
   cfg_sshd = config.services.kubernix-sshd;
+  cfg_mtlsd = config.services.kubernix-mtlsd;
   cfg_cache = config.services.kubernix-cache;
   cfg_worker = config.services.kubernix-worker;
   cfg_gc = config.services.kubernix-gc;
@@ -105,6 +106,52 @@ in {
         stream once, on whichever of the two processes creates it first, and
         a mismatch would silently pick one side's value rather than error.
       '';
+    };
+  } // s3Options;
+
+  # The mutual-TLS frontend: the same daemon protocol as the SSH frontend, with
+  # clients authenticated by a certificate chaining to a CA bound to a tenant
+  # (`kubernix-admin add-credential --type tls`).
+  options.services.kubernix-mtlsd = {
+    enable = mkEnableOption "Kubernix mutual-TLS frontend";
+
+    package = mkOption {
+      type = types.package;
+      description = "The kubernix-server package (provides kubernix-mtlsd).";
+    };
+
+    listen = mkOption {
+      type = types.str;
+      default = "0.0.0.0:2224";
+      description = "Address to serve the daemon protocol on.";
+    };
+
+    certFile = mkOption {
+      type = types.path;
+      description = "PEM server certificate chain. Loaded once at startup.";
+    };
+
+    keyFile = mkOption {
+      type = types.path;
+      description = "PEM private key for `certFile`.";
+    };
+
+    databaseUrl = mkOption {
+      type = types.str;
+      default = "postgres://postgres@localhost:5432/kubernix";
+      description = "PostgreSQL connection string; see `services.kubernix-sshd.databaseUrl`.";
+    };
+
+    natsUrl = mkOption {
+      type = types.str;
+      default = "nats://localhost:4222";
+      description = "NATS connection string. Without it, builds are refused.";
+    };
+
+    jobResultsRetention = mkOption {
+      type = types.ints.positive;
+      default = 24 * 3600;
+      description = "Must match `services.kubernix-sshd.jobResultsRetention` and the worker's.";
     };
   } // s3Options;
 
@@ -392,6 +439,36 @@ in {
           DynamicUser = true;
           # For the generated host key, which must outlive a restart.
           StateDirectory = "kubernix-sshd";
+        };
+      };
+    })
+
+    (mkIf cfg_mtlsd.enable {
+      systemd.services.kubernix-mtlsd = {
+        description = "Kubernix mutual-TLS frontend";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" "postgresql.service" "nats.service" "rustfs.service" ];
+
+        environment = {
+          DATABASE_URL = cfg_mtlsd.databaseUrl;
+          NATS_URL = cfg_mtlsd.natsUrl;
+          KUBERNIX_JOB_RESULTS_RETENTION = toString cfg_mtlsd.jobResultsRetention;
+          KUBERNIX_TLS_LISTEN = cfg_mtlsd.listen;
+          # Credentials are copied into a private directory readable by the
+          # dynamic user, wherever the source files live.
+          KUBERNIX_TLS_CERT = "/run/credentials/kubernix-mtlsd.service/cert";
+          KUBERNIX_TLS_KEY = "/run/credentials/kubernix-mtlsd.service/key";
+          RUST_LOG = "debug";
+        } // s3Env cfg_mtlsd;
+
+        serviceConfig = {
+          ExecStart = "${cfg_mtlsd.package}/bin/kubernix-mtlsd";
+          Restart = "always";
+          DynamicUser = true;
+          LoadCredential = [
+            "cert:${cfg_mtlsd.certFile}"
+            "key:${cfg_mtlsd.keyFile}"
+          ];
         };
       };
     })

@@ -17,6 +17,7 @@ lix_store = dependency('lix-store')
 lix_util = dependency('lix-util')
 capnp_dep = dependency('capnp')
 capnp_rpc_dep = dependency('capnp-rpc')
+kj_tls_dep = dependency('kj-tls')
 
 # Three workarounds used to live here, all for Lix packaging bugs that have since
 # been fixed upstream (NOTES.md items 1-3):
@@ -35,7 +36,7 @@ capnp_rpc_dep = dependency('capnp-rpc')
 
 shared_module('kubernix',
   'src/plugin.cc',
-  dependencies : [lix_main, lix_store, lix_util, capnp_dep, capnp_rpc_dep],
+  dependencies : [lix_main, lix_store, lix_util, capnp_dep, capnp_rpc_dep, kj_tls_dep],
   install : true,
   install_dir : get_option('libdir') / 'lix' / 'plugins',
   name_prefix : '',

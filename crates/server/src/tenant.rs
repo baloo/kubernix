@@ -23,18 +23,20 @@ pub use kubernix_types::TenantId;
 
 /// A binding's credential type — `key_type` in `tenant_auth_bindings`.
 ///
-/// Only one variant today, deliberately: `KeyType::Tls` and the CHECK
-/// constraint that allows it both land together with the mTLS API that would
-/// actually issue a TLS-bound credential, not ahead of it.
+/// `Ssh` bindings identify one client key; `Tls` bindings identify a trusted
+/// CA certificate, keyed by its Subject Key Identifier, and attribute every
+/// client certificate chaining to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyType {
     Ssh,
+    Tls,
 }
 
 impl KeyType {
     pub fn as_str(self) -> &'static str {
         match self {
             KeyType::Ssh => "ssh",
+            KeyType::Tls => "tls",
         }
     }
 }

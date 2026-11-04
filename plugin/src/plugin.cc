@@ -1,7 +1,11 @@
 // Kubernix client plugin.
 //
-// Registers a `kubernix://` store scheme that connects to the Kubernix frontend
-// over SSH and speaks the Lix daemon protocol as Cap'n Proto RPC.
+// Registers two store schemes that connect to the Kubernix frontend and speak the
+// Lix daemon protocol as Cap'n Proto RPC:
+//
+//   kubernix://[user@]host        over SSH (kubernix-sshd)
+//   kubernix-tls://host[:port]    over mutual TLS (kubernix-mtlsd), the client
+//                                 authenticating with a certificate chain
 //
 // This exists because `ssh-ng://` does *not* speak Cap'n Proto: SSHStore::init
 // calls RemoteStore::initConnection, which performs the legacy worker-protocol
@@ -26,12 +30,14 @@
 #include <lix/libstore/store-api.hh>
 #include <lix/libutil/async.hh>
 #include <lix/libutil/file-descriptor.hh>
+#include <lix/libutil/file-system.hh>
 #include <lix/libutil/logging.hh>
 #include <lix/libutil/logging-rpc.hh>
 #include <lix/libutil/result.hh>
 #include <lix/libutil/strings.hh>
 
 #include <capnp/rpc-twoparty.h>
+#include <kj/compat/tls.h>
 
 namespace nix {
 
@@ -47,12 +53,37 @@ struct KubernixStoreConfig : virtual RemoteStoreConfig, virtual CommonSSHStoreCo
         "so the connection can be pointed at a test harness."
     };
 
+    /* Only meaningful for `kubernix-tls://`. */
+    const Setting<Path> tlsCert{
+        this, "", "tls-cert",
+        "PEM file holding the client certificate chain, leaf first. The frontend "
+        "attributes the connection to a tenant from the LAST certificate sent, so the "
+        "chain must end with the CA registered for the tenant (or a certificate that CA "
+        "issued directly)."
+    };
+
+    const Setting<Path> tlsKey{
+        this, "", "tls-key", "PEM file holding the private key for `tls-cert`."
+    };
+
+    const Setting<Path> tlsCa{
+        this, "", "tls-ca",
+        "PEM bundle of CAs trusted to have issued the frontend's server certificate. "
+        "Empty means the system trust store."
+    };
+
+    const Setting<std::string> tlsServerName{
+        this, "", "tls-server-name",
+        "Name to verify the server certificate against. Defaults to the host in the URI."
+    };
+
     const std::string name() override { return "Kubernix Store"; }
 
     std::string doc() override
     {
-        return "Kubernix distributed remote builder. Connects over SSH and speaks "
-               "the daemon protocol as Cap'n Proto RPC.";
+        return "Kubernix distributed remote builder. Connects over SSH "
+               "(kubernix://) or mutual TLS (kubernix-tls://) and speaks the daemon "
+               "protocol as Cap'n Proto RPC.";
     }
 };
 
@@ -73,9 +104,19 @@ public:
         : Store(config)
         , RemoteStore(w, config)
         , config_(std::move(config))
+        , scheme_(scheme)
         , host(host)
-        , ssh(host, config_.port, config_.sshKey, config_.sshPublicHostKey, config_.compress)
     {
+        if (useTls()) {
+            if (host.find('@') != std::string::npos) {
+                throw Error("kubernix-tls:// takes no user: the tenant comes from the client certificate");
+            }
+            if (config_.tlsCert.get().empty() || config_.tlsKey.get().empty()) {
+                throw UsageError("kubernix-tls:// requires the tls-cert and tls-key settings");
+            }
+        } else {
+            ssh.emplace(host, config_.port, config_.sshKey, config_.sshPublicHostKey, config_.compress);
+        }
     }
 
     static kj::Promise<Result<std::optional<ref<Store>>>>
@@ -93,9 +134,12 @@ public:
     KubernixStoreConfig & config() override { return config_; }
     const KubernixStoreConfig & config() const override { return config_; }
 
-    static inline const std::string scheme = "kubernix";
+    static inline const std::string sshScheme = "kubernix";
+    static inline const std::string tlsScheme = "kubernix-tls";
 
-    std::string getUri() override { return scheme + "://" + host; }
+    bool useTls() const { return scheme_ == tlsScheme; }
+
+    std::string getUri() override { return scheme_ + "://" + host; }
 
     kj::Promise<Result<std::optional<std::string>>> getBuildLogExact(const StorePath & path) override
     try {
@@ -617,11 +661,17 @@ protected:
 
     struct RpcState
     {
+        // Declared before rpcStream so it is destroyed after it: a wrapped TLS
+        // stream refers to its context.
+        std::unique_ptr<kj::TlsContext> tls;
         kj::Own<kj::AsyncIoStream> rpcStream;
         std::unique_ptr<capnp::TwoPartyClient> client;
         Activity loggerActivity;
         rpc::daemon::LegacyProtocol::Client legacyProtocol;
     };
+
+    /* Dial the frontend and run the TLS handshake, presenting the client chain. */
+    kj::Promise<std::tuple<kj::Own<kj::AsyncIoStream>, std::unique_ptr<kj::TlsContext>>> connectTls();
 
     kj::Promise<Result<std::shared_ptr<RemoteStore::Connection>>> openConnection();
 
@@ -634,24 +684,32 @@ protected:
         return {result::success()};
     }
 
+    std::string scheme_;
     std::string host;
-    SSH ssh;
+    std::optional<SSH> ssh;
     std::shared_ptr<RpcState> rpc;
 };
 
 kj::Promise<Result<std::shared_ptr<RemoteStore::Connection>>> KubernixStore::openConnection()
 try {
-    /* Start the remote end. The client half of the socketpair is dup'd onto both
-       stdin and stdout of the remote command, so from here it is a single
-       bidirectional stream. */
-    std::string command = config_.remoteProgram.get() + " --stdio";
-
     auto conn = std::make_shared<Connection>();
-    conn->sshConn = ssh.startCommand(command);
+    kj::Own<kj::AsyncIoStream> rpcStream;
+    std::unique_ptr<kj::TlsContext> tlsContext;
 
-    auto fd = conn->sshConn->socket.get();
-    auto rpcStream = AIO().lowLevelProvider.wrapSocketFd(fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
-    conn->sshConn->socket.release();
+    if (useTls()) {
+        std::tie(rpcStream, tlsContext) = co_await connectTls();
+    } else {
+        /* Start the remote end. The client half of the socketpair is dup'd onto both
+           stdin and stdout of the remote command, so from here it is a single
+           bidirectional stream. */
+        std::string command = config_.remoteProgram.get() + " --stdio";
+
+        conn->sshConn = ssh->startCommand(command);
+
+        auto fd = conn->sshConn->socket.get();
+        rpcStream = AIO().lowLevelProvider.wrapSocketFd(fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+        conn->sshConn->socket.release();
+    }
 
     auto client = std::make_unique<capnp::TwoPartyClient>(*rpcStream);
 
@@ -663,6 +721,7 @@ try {
        client the first time the frontend pushes a log event. Own it first, then
        hand out a reference to the stable location. */
     rpc = std::make_shared<RpcState>(RpcState{
+        .tls = std::move(tlsContext),
         .rpcStream = std::move(rpcStream),
         .client = std::move(client),
         .loggerActivity = logger->startActivity(lvlDebug, actUnknown, "kubernix connection"),
@@ -715,16 +774,76 @@ try {
 
     /* Start draining stderr only now: until this point connectErrorInfo() needs
        the pipe to report why setup failed. */
-    conn->logHandlerPromise = conn->logHandler(getUri());
+    if (conn->sshConn) {
+        conn->logHandlerPromise = conn->logHandler(getUri());
+    }
 
     co_return conn;
 } catch (...) {
     co_return result::current_exception();
 }
 
+/* Split `host[:port]`, including `[v6]:port`. */
+static std::pair<std::string, std::optional<std::string>> splitHostPort(const std::string & authority)
+{
+    if (authority.starts_with('[')) {
+        auto end = authority.find(']');
+        if (end == std::string::npos) {
+            throw Error("malformed host '%s'", authority);
+        }
+        auto name = authority.substr(1, end - 1);
+        if (authority.size() > end + 1 && authority[end + 1] == ':') {
+            return {name, authority.substr(end + 2)};
+        }
+        return {name, std::nullopt};
+    }
+    if (auto colon = authority.rfind(':'); colon != std::string::npos) {
+        return {authority.substr(0, colon), authority.substr(colon + 1)};
+    }
+    return {authority, std::nullopt};
+}
+
+kj::Promise<std::tuple<kj::Own<kj::AsyncIoStream>, std::unique_ptr<kj::TlsContext>>>
+KubernixStore::connectTls()
+{
+    constexpr uint16_t DEFAULT_TLS_PORT = 2224;
+
+    auto [hostname, port] = splitHostPort(host);
+    auto serverName = config_.tlsServerName.get().empty() ? hostname : config_.tlsServerName.get();
+
+    /* The key and the chain are read here rather than at store construction so a
+       rotated file is picked up on reconnect. */
+    kj::TlsPrivateKey key(readFile(config_.tlsKey.get()).c_str());
+    kj::TlsCertificate chain(readFile(config_.tlsCert.get()).c_str());
+    kj::TlsKeypair keypair{kj::mv(key), kj::mv(chain)};
+
+    std::vector<kj::TlsCertificate> trusted;
+    kj::TlsContext::Options options;
+    if (config_.tlsCa.get().empty()) {
+        options.useSystemTrustStore = true;
+    } else {
+        options.useSystemTrustStore = false;
+        trusted.emplace_back(readFile(config_.tlsCa.get()).c_str());
+    }
+    options.trustedCertificates = kj::ArrayPtr<const kj::TlsCertificate>(trusted.data(), trusted.size());
+    options.defaultKeypair = keypair;
+    options.minVersion = kj::TlsVersion::TLS_1_2;
+
+    auto context = std::make_unique<kj::TlsContext>(kj::mv(options));
+
+    auto authority = port ? hostname + ":" + *port : hostname;
+    auto address = co_await AIO().provider.getNetwork().parseAddress(authority, DEFAULT_TLS_PORT);
+    auto raw = co_await address->connect();
+    auto stream = co_await context->wrapClient(kj::mv(raw), serverName);
+
+    co_return std::make_tuple(kj::mv(stream), kj::mv(context));
+}
+
 static void kubernixInit()
 {
-    StoreImplementations::add<KubernixStore, KubernixStoreConfig>({KubernixStore::scheme});
+    StoreImplementations::add<KubernixStore, KubernixStoreConfig>(
+        {KubernixStore::sshScheme, KubernixStore::tlsScheme}
+    );
 }
 
 static struct RegisterKubernix

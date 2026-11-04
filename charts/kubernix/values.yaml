@@ -246,6 +246,32 @@ sshd:
   tolerations: []
   affinity: {}
 
+# Mutual-TLS frontend (`kubernix-mtlsd`): the same daemon protocol as sshd, with
+# clients authenticated by a certificate chaining to a CA bound via
+# `kubernix-admin add-credential --type tls`. Off by default: the server
+# certificate comes from cert-manager, whose CRDs must already be installed
+# (install with `certManager.enabled` first, then enable this), and the chart
+# ships no Issuer - point `certManager.issuerRef` at one you provide.
+mtlsd:
+  enabled: false
+  replicas: 1
+  listen: "0.0.0.0:2224"
+  service:
+    type: LoadBalancer
+    port: 2224
+    annotations: {}
+  certManager:
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+      group: cert-manager.io
+    # External hostnames clients connect to.
+    dnsNames: []
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 cache:
   replicas: 2
   listen: "0.0.0.0:3000"

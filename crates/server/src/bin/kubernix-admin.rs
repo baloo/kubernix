@@ -39,12 +39,11 @@ enum Command {
     /// Bind a new credential to a tenant.
     AddCredential {
         tenant: TenantIdArg,
-        /// Credential type. Only `ssh` is supported today — `KeyType`
-        /// (`crate::tenant::KeyType`) has no `Tls`/x509 variant yet.
+        /// Credential type: `ssh` (one client key) or `tls` (a trusted client CA).
         #[arg(long, value_enum)]
         r#type: CliKeyType,
-        /// An OpenSSH public-key line (`ssh-ed25519 AAAA... comment`), the
-        /// same shape `~/.ssh/authorized_keys` uses.
+        /// For `ssh`, an OpenSSH public-key line (`ssh-ed25519 AAAA... comment`).
+        /// For `tls`, the path of a PEM-encoded CA certificate.
         material: String,
     },
     /// Remove a credential binding.
@@ -73,12 +72,14 @@ enum Command {
 #[derive(Clone, Copy, ValueEnum)]
 enum CliKeyType {
     Ssh,
+    Tls,
 }
 
 impl From<CliKeyType> for KeyType {
     fn from(value: CliKeyType) -> Self {
         match value {
             CliKeyType::Ssh => KeyType::Ssh,
+            CliKeyType::Tls => KeyType::Tls,
         }
     }
 }
@@ -196,6 +197,14 @@ async fn add_credential(
     key_type: KeyType,
     material: &str,
 ) -> eyre::Result<()> {
+    let pem;
+    let material = if key_type == KeyType::Tls {
+        pem = std::fs::read_to_string(material)
+            .map_err(|e| eyre::eyre!("reading {material}: {e}"))?;
+        pem.as_str()
+    } else {
+        material
+    };
     admin::add_credential(store, tenant, key_type, material).await?;
     println!("added credential for tenant {tenant}");
     Ok(())
